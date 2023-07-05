@@ -1,0 +1,61 @@
+/**
+* Test the functionality of self relative pointers.
+*/
+internal proc test_self_relative_pointers() {
+  test_self_relative_pointers_simple();
+  test_self_relative_pointers_nested();
+}
+
+private proc test_self_relative_pointers_simple() {
+  i := 123;
+  p := &i;
+
+  sp: ~*int = null;
+  assert(sp == null);
+  
+  sp = p;
+  value := *sp;
+  assert(value == 123);
+
+  *sp = 17;
+  assert(*sp == 17);
+
+  sp2: ~*int = sp;
+  assert(*sp2 == 17);
+
+  sp_small: ~(i8)*int;
+  assert(size_of(sp_small) == 1);
+
+  regular_pointer := cast(*int) sp_small;
+  assert(regular_pointer == null);
+
+  assert(*global_self_relative_pointer == 65);
+}
+
+private proc test_self_relative_pointers_nested() {
+  s := Struct_Containing_Relative_Pointer{13, null};
+  s.p = &s.i;
+  assert(*s.p == 13);
+
+  s2 := s;
+  s2.i = 123;
+  assert(*s2.p == 13);
+
+  i := 76;
+  tuple: (~*int, ~*int) = {&i, &i};
+  t1, t2 := tuple;
+  assert(*t1 == 76);
+  assert(*t2 == 76);
+
+  array: [2]~*int = {&i, &i};
+  assert(*array[0] == 76);
+  assert(*array[1] == 76);
+}
+
+private global global_self_relative_pointer: ~*int = &global_self_relative_value;
+private global global_self_relative_value: int = 65;
+
+private struct Struct_Containing_Relative_Pointer {
+  i: int,
+  p: ~*int,
+}

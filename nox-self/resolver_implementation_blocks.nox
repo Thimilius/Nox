@@ -1,0 +1,273 @@
+import "std:strings"
+
+/**
+* Represents an unresolved implementation block.
+*/
+internal struct Unresolved_Implementation {
+  package_file: *Package_File, // The package file the implementation block is declared in.
+  declaration: *Declaration,   // The declaration of the implementation block.
+}
+
+/**
+* Represent a resolved implementation block key.
+*/
+internal struct Resolved_Implementation_Key {
+  interface_type: *Type,      // The interface that gets implemented (can be empty for simple implementation blocks).
+  implementation_type: *Type, // The type of the implementation.
+}
+
+/**
+* Represents a resolved implementation block.
+*/
+internal struct Resolved_Implementation {
+  symbols: map[string]*Symbol, // The symbols of the resolved implementation block.
+}
+
+/**
+* Represents a method to implement for interface implementation blocks.
+*/
+private struct Method_To_Implement {
+  access_modifier: Access_Modifier, // The access modifier of the method.
+  type: *Type,                      // The type of the method.
+  is_implemented: bool,             // Whether or not the method is implemented.
+}
+
+implement Resolver {
+
+  /**
+  * Adds a global implementation block.
+  *
+  * @param package_file The package file the implementation block belongs to.
+  * @param declaration  The declaration of the implementation block.
+  */
+  internal proc add_global_implementation(package_file: *Package_File, declaration: *Declaration) {
+    assert(declaration.kind == .Implementation);
+
+    array_aosoa_add(&self.unresolved_implementations, {package_file, declaration});
+  }
+
+  /**
+  * Resolves all implementation blocks.
+  */
+  internal proc resolve_implementations() {
+    foreach (unresolved_implementation in self.unresolved_implementations) {
+      previous_package := package_enter(unresolved_implementation.package_file.package);
+      self.resolve_implementation(*unresolved_implementation);
+      package_leave(previous_package);
+    }
+  }
+
+  /**
+  * Resolves an implementation block.
+  *
+  * @param implementation The implementation block to resolve.
+  */
+  private proc resolve_implementation(implementation: Unresolved_Implementation) {
+    declaration := cast(*Declaration_Implementation) implementation.declaration;
+
+    implementation_type := self.resolve_type_specification(cast(*Type_Specification) declaration.implementation_type);
+    if (implementation_type.is_interface()) {
+      report_error_fatal(declaration.implementation_type.position, "Implementation block cannot implement the interface '%'", implementation_type.name);
+    }
+    // The resolving marks the type as reachable but it actually is not as we are just setting up the implementations.
+    if (implementation_type.symbol != null) {
+      implementation_type.symbol.state = .Resolved_But_Not_Reachable;
+      remove_flag(&implementation_type.symbol.flags, .Reachable);
+    }
+
+    if (declaration.interface_type == null) {
+      self.resolve_implementation_regular(implementation, implementation_type);
+    } else {
+      self.resolve_implementation_interface(implementation, implementation_type);
+    }
+  }
+
+  /**
+  * Resolves a regular implementation block.
+  *
+  * @param implementation      The implementation block to resolve.
+  * @param implementation_type The type that the implementation block refers to.
+  */
+  private proc resolve_implementation_regular(implementation: Unresolved_Implementation, implementation_type: *Type) {
+    declaration := cast(*Declaration_Implementation) implementation.declaration;
+
+    symbols: map[string]*Symbol;
+
+    key := Resolved_Implementation_Key{null, implementation_type};
+    implementations, _ := map_get(&self.output.resolved_implementations, key);
+
+    package_file := implementation.package_file;
+    foreach (declaration_method in declaration.methods) {
+      name := declaration_method.name;
+
+      self.implementation_check_for_method_name_clash(declaration_method.position, implementation_type, name);
+
+      symbol_name := self.make_formatted_symbol_name("%.%", implementation_type.name, name);
+      method_symbol := self.resolve_implementation_method_symbol(declaration_method, implementation_type, package_file, symbol_name);
+
+      if (implementation_type.symbol != null) {
+        if (method_symbol.access_modifier > implementation_type.symbol.access_modifier)  {
+          report_error_fatal(declaration_method.position, "Method '%' has a higher access modifier than '%'", declaration_method.name, implementation_type.name);
+        }
+      }
+
+      map_set(&symbols, name, method_symbol);
+      array_aosoa_add(&implementation_type.methods, {
+        declaration_method.access_modifier,
+        package_file.package,
+        declaration_method.position.file,
+        name,
+        method_symbol.type,
+      });
+    }
+
+    array_add(&implementations, {symbols});
+    map_set(&self.output.resolved_implementations, key, implementations);
+  }
+
+  /**
+  * Resolves an interface implementation block.
+  *
+  * @param implementation      The implementation block to resolve.
+  * @param implementation_type The type that the implementation block refers to.
+  */
+  private proc resolve_implementation_interface(implementation: Unresolved_Implementation, implementation_type: *Type) {
+    declaration := cast(*Declaration_Implementation) implementation.declaration;
+
+    interface_type := self.resolve_type_specification(cast(*Type_Specification) declaration.interface_type);
+    if (!interface_type.is_interface()) {
+      report_error_fatal(declaration.interface_type.position, "Implementation block needs an interface type to implement. Got '%'", interface_type.name);
+    }
+    // The resolving marks the type as reachable but it actually is not as we are just setting up the implementations.
+    if (interface_type.symbol != null) {
+      interface_type.symbol.state = .Resolved_But_Not_Reachable;
+      remove_flag(&interface_type.symbol.flags, .Reachable);
+    }
+
+    foreach (implemented_interface in implementation_type.interfaces) {
+      if (implemented_interface == interface_type) {
+        report_error_fatal(declaration.position, "Interface '%' is already implemented for type '%'", interface_type.name, implementation_type.name);
+      }
+    }
+
+    methods_to_implement := map_make!(string, Method_To_Implement)(context.temporary_allocator);
+    foreach (method in interface_type.methods) {
+      map_set(&methods_to_implement, method.name, {method.access_modifier, method.type, false});
+    }
+
+    package_file := implementation.package_file;
+    symbols: map[string]*Symbol;
+    foreach (declaration_method in declaration.methods) {
+      name := declaration_method.name;
+
+      method_to_implement, found_matching_interface_method := map_get(&methods_to_implement,name);
+      if (!found_matching_interface_method) {
+        report_error_fatal(declaration_method.position, "Interface '%' does not define a method with the name '%'", interface_type.name, name);
+      }
+
+      self.implementation_check_for_method_name_clash(declaration_method.position, implementation_type, name);
+
+      symbol_name := self.make_formatted_symbol_name("%.%.%", interface_type.name, implementation_type.name, name);
+      method_symbol := self.resolve_implementation_method_symbol(declaration_method, implementation_type, package_file, symbol_name);
+      if (method_symbol.type != method_to_implement.type) {
+        report_error_fatal(
+          declaration_method.position,
+          "Signature of method '%' does not match with interface definition. Expected '%' got '%'",
+          name,
+          method_to_implement.type.name,
+          method_symbol.type.name,
+        );
+      }
+
+      if (method_symbol.access_modifier != method_to_implement.access_modifier) {
+        report_error_fatal(
+          declaration_method.position,
+          "Mismatch in access modifier for implemented interface method '%'. Expected '%' got '%'",
+          name,
+          method_to_implement.access_modifier,
+          method_symbol.access_modifier
+        );
+      }
+
+      method_to_implement.is_implemented = true;
+      map_set(&methods_to_implement, name, method_to_implement);
+
+      map_set(&symbols, name, method_symbol);
+    }
+
+    has_missing_methods := false;
+    missing_methods_builder := strings.builder_make(context.temporary_allocator);
+    foreach (method_name, method_to_implement in methods_to_implement) {
+      if (!method_to_implement.is_implemented) {
+        if (has_missing_methods) {
+          missing_methods_builder.write_string("\n");
+        }
+        has_missing_methods = true;
+
+        missing_methods_builder.write_string("    ");
+        missing_methods_builder.write_type_name_routine(method_to_implement.type, method_name);
+      }
+    }
+    if (has_missing_methods) {
+      missing_methods := missing_methods_builder.to_string();
+      report_error_fatal(declaration.position, "Missing interface methods in implementation:\n%", missing_methods);
+    }
+
+    key := Resolved_Implementation_Key{interface_type, implementation_type};
+    implementations, _ := map_get(&self.output.resolved_implementations, key);
+    array_add(&implementations, {symbols});
+    map_set(&self.output.resolved_implementations, key, implementations);
+
+    types_implementing_interface, _ := map_get(&self.types_implementing_interface, interface_type);
+    array_add(&types_implementing_interface, implementation_type);
+    map_set(&self.types_implementing_interface, interface_type, types_implementing_interface);
+
+    array_add(&implementation_type.interfaces, interface_type);
+  }
+
+  /**
+  * Resolves an interface implementation block.
+  *
+  * @param declaration_method  The declaration of the method.
+  * @param implementation_type The type that the method belongs to.
+  * @param package_file        The package file the method symbol belongs to.
+  * @param symbol_name         The name of the method symbol.
+  * @return The resolved method symbol.
+  */
+  private proc resolve_implementation_method_symbol(
+    declaration_method: *Declaration,
+    implementation_type: *Type,
+    package_file: *Package_File,
+    symbol_name: string
+  ) -> *Symbol {
+    // Methods are special in that they are sort of resolved manually and not part of the general recursive sorting alogrithm.
+
+    method_symbol := symbol_make_declaration(self, package_file, declaration_method);
+    method_symbol.name = symbol_name; // We overwrite the name manually.
+    method_symbol.value = implementation_type; // We associate the implemented type with the symbol.
+    set_flag(&method_symbol.flags, .Routine_Method_Implemented);
+    // We resolve the type of the routine here directly.
+    method_symbol.type = self.resolve_symbol_routine(declaration_method, method_symbol);
+    method_symbol.state = .Resolved_But_Not_Reachable; // This is the special state for methods that denotes that we resolved the type but are not yet reachable.
+
+    map_set(&self.unreachable_symbols, method_symbol, {});
+
+    return method_symbol;
+  }
+
+  /**
+  * Resolves an interface implementation block.
+  *
+  * @param position            The position of the method.
+  * @param implementation_type The type whose methods to check.
+  * @param name                The name of the method.
+  */
+  private proc implementation_check_for_method_name_clash(position: Source_Position, implementation_type: *Type, name: string) {
+    type_name := implementation_type.name;
+    self.check_for_method_name_clash(position, implementation_type.methods, name, type_name);
+    foreach (inter in implementation_type.interfaces) {
+      self.check_for_method_name_clash(position, inter.methods, name, type_name);
+    }
+  }
+
+}

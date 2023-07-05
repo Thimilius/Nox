@@ -1,0 +1,14 @@
+/**
+* Test the functionality of 'char' type.
+*/
+internal proc test_characters() {
+  c := 'a';
+  assert(c == 'a');
+
+  c2: char = c;
+  i: int = cast(int) c2;
+  assert(i == 97);
+
+  c3: char = cast(char) i;
+  assert(c3 == 'a');
+}

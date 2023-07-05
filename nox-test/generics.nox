@@ -1,0 +1,50 @@
+/**
+* Test the functionality of generics.
+*/
+internal proc test_generics() {
+  test_generic_types();
+  test_generic_procedures();
+}
+
+private proc test_generic_types() {
+  foo: Generic_Foo!(int);
+  foo.t = 23;
+  assert(foo.t == 23);
+  consume_generic_foo(foo);
+
+  foo.b.i = 18;
+  assert(foo.b.i == 18);
+
+  foo_nested: Generic_Foo!(Generic_Foo!(int));
+  foo_nested.t.t = 15;
+  assert(foo_nested.t.t == 15);
+}
+
+private struct Generic_Bar!(T1, T2) {
+  b: T1,
+  i: T2,
+}
+
+private struct Generic_Foo!(T) {
+  t: T,
+  b: Generic_Bar!(T, int),
+}
+
+private proc consume_generic_foo(a: Generic_Foo!(int)) {
+  assert(a.t == 23);
+}
+
+private proc test_generic_procedures() {
+  assert(sum(1, 1) == 2);
+
+  f := foo!(Generic_Foo!(i32))({13, {}});
+  assert(f.t == 13);
+}
+
+proc sum!(T)(a: T, b: T) -> T {
+  return foo(a) + foo(b);
+}
+
+proc foo!(T)(a: T) -> T {
+  return a;
+}

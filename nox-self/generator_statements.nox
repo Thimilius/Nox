@@ -1,0 +1,1208 @@
+implement Generator {
+
+  /**
+  * Emit a statement.
+  * 
+  * @param routine_context   The context of the routine.
+  * @param statement         The statement to emit.
+  * @param is_last_statement Is the statement the last in the current block?
+  * @return 1. True if the statement returns otherwise false; 2. True if the statement leaves otherwise false.
+  */
+  internal proc emit_statement(routine_context: *Routine_Context, statement: *Statement, is_last_statement: bool) -> (bool, bool) {
+    self.debug_emit_location(routine_context, statement.position);
+
+    switch (statement.kind) {
+      case .Return: self.emit_statement_return(routine_context, statement); return {true, false};
+      case .Break: self.emit_statement_break(routine_context); return {false, true};
+      case .Continue: self.emit_statement_continue(routine_context); return {false, true};
+      case .Fallthrough: self.emit_statement_fallthrough(routine_context); return {false, true};
+      case .Defer: self.emit_statement_defer(routine_context, statement); return {false, false};
+      case .Push_Context: return self.emit_statement_push_context(routine_context, statement);
+      
+      case .Scope: return self.emit_statement_block(routine_context, (cast(*Statement_Scope) statement).block, .New_Scope);
+      case .If: return self.emit_statement_if(routine_context, statement, is_last_statement);
+      case .Static_If: return self.emit_statement_static_if(routine_context, statement);
+      case .For: self.emit_statement_for(routine_context, statement); return {false, false};
+      case .Foreach: self.emit_statement_foreach(routine_context, statement); return {false, false};
+      case .Switch: return self.emit_statement_switch(routine_context, statement, is_last_statement);
+
+      case .Assign: self.emit_statement_assign(routine_context, statement); return {false, false};
+      case .Initialize: self.emit_statement_initialize(routine_context, statement); return {false, false};
+      case .Expression: {
+        statement := cast(*Statement_Expression) statement;
+        self.emit_expression(routine_context, cast(*Expression) statement.expression, null); return {false, false};
+      }
+
+      case .None: fallthrough;
+      case: assert(false);
+    }
+
+    return {false, false};
+  }
+
+  /**
+  * Emit a return statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_return(routine_context: *Routine_Context, statement: *Statement) {
+    return_expression := cast(*Expression) (cast(*Statement_Return) statement).expression;
+
+    if (return_expression == null) {
+      self.emit_deferred_statements_all(routine_context);
+      LLVMBuildRetVoid(self.builder);
+      return;
+    }
+
+    return_type := routine_context.return_type;
+    
+    return_expression_type := return_type;
+    if (return_expression_type.is_union()) {
+      return_expression_type = self.get_resolved_overwrite_type(return_expression);
+    }
+    needs_to_load_address := self.type_requires_loading_address(return_type, return_expression_type);
+    previous_loading_mode := self.enter_loading_mode(routine_context, needs_to_load_address ? .Load_Address : .Load_Value);
+    llvm_return_value := self.emit_expression(routine_context, return_expression, return_expression_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+    
+    // Deferred statements are executed AFTER the return expression.
+    // That way the return expression may for example refer to things which are then being deleted/freed in a deferred statement.
+    self.emit_deferred_statements_all(routine_context);
+
+    // Structs or unions which are being returned by value are handled as an out-parameter.
+    if (self.type_is_passed_as_pointer(return_type)) {
+      // This assumes the return parameter will always be the first one.
+      llvm_return_parameter := LLVMGetFirstParam(routine_context.llvm_symbol);
+      routine_context.is_storing_byval_or_sret = true;
+      self.emit_store(routine_context, return_type, llvm_return_parameter, llvm_return_value, return_expression);
+      routine_context.is_storing_byval_or_sret = false;
+      LLVMBuildRetVoid(self.builder);
+    } else {
+      LLVMBuildRet(self.builder, llvm_return_value);
+    }
+  }
+
+  /**
+  * Emit a break statement.
+  * 
+  * @param routine_context The context of the routine.
+  */
+  private proc emit_statement_break(routine_context: *Routine_Context) {
+    self.emit_deferred_statements_until_control(routine_context);
+
+    assert(routine_context.last_break_block != null);
+    LLVMBuildBr(self.builder, routine_context.last_break_block);
+  }
+
+  /**
+  * Emit a continue statement.
+  * 
+  * @param routine_context The context of the routine.
+  */
+  private proc emit_statement_continue(routine_context: *Routine_Context) {
+    self.emit_deferred_statements_until_control(routine_context);
+    
+    assert(routine_context.last_continue_block != null);
+    LLVMBuildBr(self.builder, routine_context.last_continue_block);
+  }
+
+  /**
+  * Emit a fallthrough statement.
+  * 
+  * @param routine_context The context of the routine.
+  */
+  private proc emit_statement_fallthrough(routine_context: *Routine_Context) {
+    self.emit_deferred_statements_until_control(routine_context);
+
+    assert(routine_context.next_fallthrough_block != null);
+    LLVMBuildBr(self.builder, routine_context.next_fallthrough_block);
+  }
+
+  /**
+  * Emit a defer statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_defer(routine_context: *Routine_Context, statement: *Statement) {
+    statement := cast(*Statement_Defer) statement;
+
+    array_add(&routine_context.local_scope.deferred_statements, cast(*Statement) statement.statement);
+  }
+
+  /**
+  * Emit a push context statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  * @return 1. True if the statement returns otherwise false; 2. True if the statement leaves otherwise false.
+  */
+  private proc emit_statement_push_context(routine_context: *Routine_Context, statement: *Statement) -> (bool, bool) {
+    statement := cast(*Statement_Push_Context) statement;
+    
+    context_type := context.storage.cached_runtime_types.context_struct;
+
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_new_context_to_push := self.emit_expression(routine_context, cast(*Expression) statement.expression, context_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    self.enter_local_scope(routine_context, .Block, statement.position);
+    
+    context_pointer_type := context.storage.get_or_make_type_pointer(context_type);
+    llvm_new_context := self.emit_local(routine_context, statement.position, context_pointer_type, SPECIAL_NAME_CONTEXT);
+    self.emit_store_raw(llvm_new_context, llvm_new_context_to_push);
+
+    returns, leaves := self.emit_statement_block(routine_context, statement.block, .Keep_Scope);
+
+    self.leave_local_scope(routine_context, returns, leaves);
+
+    return {returns, leaves};
+  }
+
+  /**
+  * Emit a statement block.
+  * 
+  * @param routine_context The context of the routine.
+  * @param block           The statement block to emit.
+  * @param scope_kind      The kind of the scope.
+  * @return 1. True if the statement block returns otherwise false; 2. True if the statement block leaves otherwise false.
+  */
+  internal proc emit_statement_block(routine_context: *Routine_Context, block: Statement_Block, scope_kind: Scope_Kind) -> (bool, bool) {
+    if (scope_kind == .New_Scope) {
+      self.enter_local_scope(routine_context, .Block, block.start_position);
+    }
+
+    returns := false;
+    leaves := false;
+    foreach (statement, i in block.statements) {
+      is_last_statement := i == length(block.statements) - 1;
+      returns, leaves = self.emit_statement(routine_context, statement, is_last_statement);
+    }
+
+    if (scope_kind == .New_Scope) {
+      self.leave_local_scope(routine_context, returns, leaves);
+    }
+
+    return {returns, leaves};
+  }
+
+  /**
+  * Emit an if statement.
+  * 
+  * @param routine_context   The context of the routine.
+  * @param statement         The statement to emit.
+  * @param is_last_statement Is the statement the last in the current block?
+  * @return 1. True if the statement returns otherwise false; 2. True if the statement leaves otherwise false.
+  */
+  private proc emit_statement_if(routine_context: *Routine_Context, statement: *Statement, is_last_statement: bool) -> (bool, bool) {
+    statement := cast(*Statement_If) statement;
+    
+    has_else := length(statement.else_block.statements) > 0;
+    has_else_ifs := length(statement.else_ifs) > 0;
+    needs_else_block := has_else || has_else_ifs;
+    // There are two cases where we need an 'after' block.
+    //   1. We are not the last statement in the block -> quite obvious
+    //   2. We might be the last statement if we are returning void.
+    needs_after_block := !is_last_statement || routine_context.needs_after_block;
+
+    returns := false;
+
+    // First append all the blocks we will need.
+
+    // This block is always needed.
+    then_block := self.append_block(routine_context);
+
+    else_block: LLVMBasicBlockRef;
+    if (needs_else_block) {
+      else_block = self.append_block(routine_context);
+    }
+
+    previous_next_block := routine_context.last_next_block;
+    after_block := routine_context.last_next_block;
+    if (needs_after_block) {
+      after_block = self.append_block(routine_context);
+      routine_context.last_next_block = after_block;
+      if (!needs_else_block) {
+        else_block = after_block;
+      }
+    } else if (!needs_else_block) {
+      else_block = routine_context.last_next_block;
+    }
+
+    // Generate the conditional branch.
+    condition_value := self.emit_boolean_truncation(routine_context, cast(*Expression) statement.condition, context.storage.type_bool);
+    LLVMBuildCondBr(self.builder, condition_value, then_block, else_block);
+
+    {
+      previous_block := self.enter_llvm_block(routine_context, then_block);
+      then_returns, then_leaves := self.emit_statement_block(routine_context, statement.then_block, .New_Scope);
+      if (!then_returns && !then_leaves) {
+        llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+        if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+          LLVMBuildBr(self.builder, after_block);
+        }
+      }
+      returns = then_returns;
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+
+    if (needs_else_block) {
+      previous_block := self.enter_llvm_block(routine_context, else_block);
+
+      // Every 'else if' we have needs to be converted into a regular 'if/else' statement.
+      else_if_else_block: LLVMBasicBlockRef = null;
+      foreach (else_if, i in statement.else_ifs) {
+        is_last_else_if := i == length(statement.else_ifs) - 1;
+
+        // Prepare the next else block (if we need one).
+        if (is_last_else_if) {
+          if (has_else) {
+            else_if_else_block = self.append_block(routine_context);
+          } else {
+            else_if_else_block = after_block;
+          }
+        } else {
+          else_if_else_block = self.append_block(routine_context);
+        }
+
+        else_if_returns := self.emit_statement_if_else_if(routine_context, *else_if, else_if_else_block, after_block);
+        returns = else_if_returns && returns;
+
+        self.enter_llvm_block(routine_context, else_if_else_block);
+      }
+
+      if (has_else) {
+        else_returns, else_leaves := self.emit_statement_block(routine_context, statement.else_block, .New_Scope);
+        if (!else_returns && !else_leaves) {
+          llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+          if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+            LLVMBuildBr(self.builder, after_block);
+          }
+        }
+        returns = else_returns && returns;
+      }
+
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+
+    if (needs_after_block) {
+      // If we fully return that means that we don't need the after block anymore (as it will never be reached and is never referenced).
+      // But this is only the case when we don't have an additional else block.
+      // Because then we reference the after block in our branch condition and can't delete it.
+      previous_block := self.enter_llvm_block(routine_context, after_block);
+      if (returns && is_last_statement) {
+        if (else_block == after_block) {
+          if (previous_next_block == null) {
+            LLVMBuildRetVoid(self.builder);
+          } else {
+            LLVMBuildBr(self.builder, previous_next_block);
+          }
+        } else {
+          LLVMDeleteBasicBlock(after_block);
+        }
+        self.leave_llvm_block(routine_context, previous_block);
+      }
+    }
+
+    routine_context.last_next_block = previous_next_block;
+
+    return {returns, false};
+  }
+
+  /**
+  * Emit an else if block of an if statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param else_if         The else if block to emit.
+  * @param else_block      The LLVM else block of the if statement.
+  * @param after_block     The LLVM after block of the if statement.
+  * @return 1. True if the else if block returns otherwise false; 2. True if the else if block leaves otherwise false.
+  */
+  private proc emit_statement_if_else_if(
+    routine_context: *Routine_Context,
+    else_if: Statement_If_Else,
+    else_block: LLVMBasicBlockRef,
+    after_block: LLVMBasicBlockRef,
+  ) -> bool {
+    then_block := self.append_block(routine_context);
+
+    condition_value := self.emit_boolean_truncation(routine_context, else_if.condition, context.storage.type_bool);
+    LLVMBuildCondBr(self.builder, condition_value, then_block, else_block);
+
+    previous_block := self.enter_llvm_block(routine_context, then_block);
+    else_if_returns, else_if_leaves := self.emit_statement_block(routine_context, else_if.block, .New_Scope);
+    if (!else_if_returns && !else_if_leaves) {
+      llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+      if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+        LLVMBuildBr(self.builder, after_block);
+      }
+    }
+    self.leave_llvm_block(routine_context, previous_block);
+
+    return else_if_returns;
+  }
+
+  /**
+  * Emit a static if statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  * @return 1. True if the statement returns otherwise false; 2. True if the statement leaves otherwise false.
+  */
+  private proc emit_statement_static_if(routine_context: *Routine_Context, statement: *Statement) -> (bool, bool) {
+    statement := cast(*Statement_If) statement;
+
+    condition, _ := self.get_resolved_constant(cast(*Expression) statement.condition);
+    if (condition.value.(bool)) {
+      return self.emit_statement_block(routine_context, statement.then_block, .Keep_Scope);
+    } else {
+      foreach (else_if in statement.else_ifs) {
+        else_if_condition, _ := self.get_resolved_constant(else_if.condition);
+        if (else_if_condition.value.(bool)) {
+          return self.emit_statement_block(routine_context, else_if.block, .Keep_Scope);
+        }
+      }
+
+      return self.emit_statement_block(routine_context, statement.else_block, .Keep_Scope);
+    }
+  }
+
+  /**
+  * Emit a for statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_for(routine_context: *Routine_Context, statement: *Statement) {
+    statement := cast(*Statement_For) statement;
+
+    has_next := statement.next != null;
+    has_condition := statement.condition != null;
+
+    loop_block := self.append_block(routine_context);
+    previous_continue_block := routine_context.last_continue_block;
+    routine_context.last_continue_block = loop_block;
+
+    // A for loop will always have a block after it.
+    after_block := self.append_block(routine_context);
+    previous_next_block := routine_context.last_next_block;
+    routine_context.last_next_block = loop_block;
+    previous_break_block := routine_context.last_break_block;
+    routine_context.last_break_block = after_block;
+
+    // Loops handle their own scope.
+    self.enter_local_scope(routine_context, .Control_Block, statement.position);
+
+    if (statement.initializer != null) {
+      self.emit_statement(routine_context, cast(*Statement) statement.initializer, false);
+    }
+    
+    condition_block: LLVMBasicBlockRef;
+    if (has_condition) {
+      condition_block = self.append_block(routine_context);
+      routine_context.last_next_block = condition_block;
+      routine_context.last_continue_block = condition_block;
+      LLVMBuildBr(self.builder, condition_block);
+
+      previous_block := self.enter_llvm_block(routine_context, condition_block);
+
+      LLVMPositionBuilderAtEnd(self.builder, condition_block);
+      condition_value := self.emit_boolean_truncation(routine_context, cast(*Expression) statement.condition, context.storage.type_bool);
+      LLVMBuildCondBr(self.builder, condition_value, loop_block, after_block);
+
+      self.leave_llvm_block(routine_context, previous_block);
+    } else {
+      LLVMBuildBr(self.builder, loop_block);
+    }
+
+    next_block: LLVMBasicBlockRef;
+    if (has_next) {
+      next_block = self.append_block(routine_context);
+      routine_context.last_next_block = next_block;
+      routine_context.last_continue_block = next_block;
+      previous_block := self.enter_llvm_block(routine_context, next_block);
+
+      self.emit_statement(routine_context, cast(*Statement) statement.next, false);
+      if (has_condition) {
+        LLVMBuildBr(self.builder, condition_block);
+      } else {
+        LLVMBuildBr(self.builder, loop_block);
+      }
+
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+
+    {
+      previous_block := self.enter_llvm_block(routine_context, loop_block);
+      block_returns, block_leaves := self.emit_statement_block(routine_context, statement.block, .Keep_Scope);
+
+      // We leave the scope before building the branches, so that defer statements can be properly generated.
+      self.leave_local_scope(routine_context, block_returns, block_leaves);
+
+      if (!block_returns && !block_leaves) {
+        llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+        if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+          if (has_next) {
+            LLVMBuildBr(self.builder, next_block);
+          } else if (has_condition) {
+            LLVMBuildBr(self.builder, condition_block);
+          } else {
+            LLVMBuildBr(self.builder, loop_block);
+          }
+        }
+      }
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+
+    self.enter_llvm_block(routine_context, after_block);
+
+    routine_context.last_next_block = previous_next_block;
+    routine_context.last_break_block = previous_break_block;
+    routine_context.last_continue_block = previous_continue_block;
+  }
+
+  /**
+  * Emit a foreach statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_foreach(routine_context: *Routine_Context, statement: *Statement) {
+    statement := cast(*Statement_Foreach) statement;
+
+    llvm_loop_block := self.append_block(routine_context);
+    llvm_loop_next_block := self.append_block(routine_context);
+    
+    previous_continue_block := routine_context.last_continue_block;
+    routine_context.last_continue_block = llvm_loop_next_block;
+
+    // A foreach loop will always have a block after it.
+    llvm_after_block := self.append_block(routine_context);
+    previous_next_block := routine_context.last_next_block;
+    routine_context.last_next_block = llvm_loop_next_block;
+    previous_break_block := routine_context.last_break_block;
+    routine_context.last_break_block = llvm_after_block;
+
+    collection_expression := cast(*Expression) statement.collection;
+    collection_type := self.get_resolved_type(collection_expression);
+    
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_collection := self.emit_expression(routine_context, collection_expression, collection_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+    llvm_collection = self.emit_possible_pointer_dereference(routine_context, collection_expression, llvm_collection);
+    if (collection_type.is_absolute_pointer() || collection_type.is_self_relative_pointer()) {
+      collection_type = collection_type.base;
+    }
+
+    if (collection_type.is_map()) {
+      self.emit_statement_foreach_map(routine_context, statement, collection_type, llvm_collection, llvm_loop_block, llvm_loop_next_block, llvm_after_block);
+    } else {
+      self.emit_statement_foreach_regular(routine_context, statement, collection_type, llvm_collection, llvm_loop_block, llvm_loop_next_block, llvm_after_block);
+    }
+
+    self.enter_llvm_block(routine_context, llvm_after_block);
+
+    routine_context.last_next_block = previous_next_block;
+    routine_context.last_break_block = previous_break_block;
+    routine_context.last_continue_block = previous_continue_block;
+  }
+
+  /**
+  * Emit a regular foreach statement.
+  * 
+  * @param routine_context      The context of the routine.
+  * @param statement            The statement to emit.
+  * @param collection_type      The type of the collection.
+  * @param llvm_collection      The LLVM type of the collection.
+  * @param llvm_loop_block      The LLVM loop block.
+  * @param llvm_loop_next_block The LLVM loop next block.
+  * @param llvm_after_block     The LLVM after block of the statement.
+  */
+  private proc emit_statement_foreach_regular(
+    routine_context: *Routine_Context,
+    statement: *Statement_Foreach,
+    collection_type: *Type,
+    llvm_collection: LLVMValueRef,
+    llvm_loop_block: LLVMBasicBlockRef,
+    llvm_loop_next_block: LLVMBasicBlockRef,
+    llvm_after_block: LLVMBasicBlockRef,
+  ) {
+    storage := context.storage;
+
+    llvm_collection_type := self.type_to_llvm(collection_type);
+    is_iterating_layout_collection := collection_type.is_soa_or_aosoa();
+    element_type := collection_type.base;
+    if (collection_type.is_soa()) {
+      element_type = context.storage.get_or_make_type_soa_pointer(collection_type);
+    } else if (collection_type.is_aosoa()) {
+      element_type = context.storage.get_or_make_type_aosoa_pointer(collection_type);
+    }
+    llvm_element_type := self.type_to_llvm(element_type);
+
+    // Loops handle their own scope.
+    self.enter_local_scope(routine_context, .Control_Block, statement.position);
+    llvm_element := self.emit_local(routine_context, statement.position, element_type, statement.element_name);
+    llvm_index: LLVMValueRef;
+    if (statement.index_name == "") {
+      llvm_index = self.emit_temporary(routine_context, storage.type_int, make_temp_name(routine_context));
+    } else {
+      llvm_index = self.emit_local(routine_context, statement.position, storage.type_int, statement.index_name);
+    }
+    self.emit_store_raw(llvm_index, LLVMConstInt(LLVMInt64Type(), 0, false));
+
+    // We get the length outside the loop. That way it is not subject to change, should the collection be modified.
+    // The same goes for the data pointer. Adding elements to a dynamic array is undefined as it might reallocate and invalidate the data pointer.
+    llvm_length: LLVMValueRef;
+    llvm_data_pointer: LLVMValueRef;
+    if (collection_type.is_array()) {
+      llvm_length = LLVMConstInt(LLVMInt64Type(), cast(u64) (cast(*Type_Array) collection_type).number_of_elements, false);
+      llvm_data_pointer = llvm_collection;
+    } else {
+      llvm_length_pointer: LLVMValueRef;
+      if (is_iterating_layout_collection) {
+        llvm_length_pointer = self.emit_gep_layout_collection_length(self.builder, routine_context, collection_type, llvm_collection_type, llvm_collection);
+      } else {
+        llvm_length_pointer = self.emit_gep_value_length(self.builder, routine_context, llvm_collection_type, llvm_collection);
+        llvm_data_pointer_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_collection_type, llvm_collection);
+        llvm_data_pointer = self.emit_load(routine_context, storage.type_rawptr, llvm_data_pointer_pointer);
+      }
+      llvm_length = self.emit_load(routine_context, storage.type_int, llvm_length_pointer);
+    }
+
+    if (is_iterating_layout_collection) {
+      llvm_data_pointer_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_collection_type, llvm_collection);
+      llvm_layout_pointer_data_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_element_type, llvm_element);
+      self.emit_store_raw(llvm_layout_pointer_data_pointer, llvm_data_pointer_pointer);
+    }
+    
+    llvm_initial_condition := LLVMBuildICmp(self.builder, .EQ, llvm_length, LLVMConstInt(LLVMInt64Type(), 0, false), make_value_name(routine_context));
+    LLVMBuildCondBr(self.builder, llvm_initial_condition, llvm_after_block, llvm_loop_block);
+
+    {
+      previous_block := self.enter_llvm_block(routine_context, llvm_loop_block);
+      
+      llvm_index_value := self.emit_load(routine_context, storage.type_int, llvm_index);
+
+      if (is_iterating_layout_collection) {
+        llvm_layout_pointer_index_pointer := self.emit_gep_value_length(self.builder, routine_context, llvm_element_type, llvm_element);
+        self.emit_store_raw(llvm_layout_pointer_index_pointer, llvm_index_value);
+      } else {
+        llvm_element_pointer := self.emit_gep_pointer(self.builder, routine_context, llvm_element_type, llvm_data_pointer, llvm_index_value);
+
+        llvm_element_temporary: LLVMValueRef;
+        if (self.type_requires_loading_address(element_type, element_type)) {
+          llvm_element_temporary = llvm_element_pointer;
+        } else {
+          llvm_element_temporary = self.emit_load(routine_context, element_type, llvm_element_pointer);
+        }
+        self.emit_store(routine_context, element_type, llvm_element, llvm_element_temporary, null);
+      }
+
+      block_returns, block_leaves := self.emit_statement_block(routine_context, statement.block, .Keep_Scope);
+
+      // We leave the scope before building the branches, so that defer statements can be properly generated.
+      self.leave_local_scope(routine_context, block_returns, block_leaves);
+
+      if (!block_returns && !block_leaves) {
+        llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+        if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+          LLVMBuildBr(self.builder, llvm_loop_next_block);
+        }
+      }
+      self.leave_llvm_block(routine_context, previous_block);
+
+      previous_block = self.enter_llvm_block(routine_context, llvm_loop_next_block);
+      llvm_index_incremented := LLVMBuildAdd(self.builder, llvm_index_value, LLVMConstInt(LLVMInt64Type(), 1, false), make_value_name(routine_context));
+      self.emit_store_raw(llvm_index, llvm_index_incremented);
+      llvm_loop_condition := LLVMBuildICmp(self.builder, .SLT, llvm_index_incremented, llvm_length, make_value_name(routine_context));
+      LLVMBuildCondBr(self.builder, llvm_loop_condition, llvm_loop_block, llvm_after_block);
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+  }
+
+  /**
+  * Emit a map foreach statement.
+  * 
+  * @param routine_context      The context of the routine.
+  * @param statement            The statement to emit.
+  * @param collection_type      The type of the collection.
+  * @param llvm_collection      The LLVM type of the collection.
+  * @param llvm_loop_block      The LLVM loop block.
+  * @param llvm_loop_next_block The LLVM loop next block.
+  * @param llvm_after_block     The LLVM after block of the statement.
+  */
+  private proc emit_statement_foreach_map(
+    routine_context: *Routine_Context,
+    statement: *Statement_Foreach,
+    collection_type: *Type,
+    llvm_collection: LLVMValueRef,
+    llvm_loop_block: LLVMBasicBlockRef,
+    llvm_loop_next_block: LLVMBasicBlockRef,
+    llvm_after_block: LLVMBasicBlockRef,
+  ) {
+    llvm_loop_capacity_check_block := llvm_loop_next_block; // The capacity check is the 'next' block for a foreach.
+    llvm_get_next_entry_block := self.append_block(routine_context);
+    llvm_setup_entry_block := self.append_block(routine_context);
+
+    type_map := cast(*Type_Map) collection_type;
+    key_type := type_map.key;
+    value_type := type_map.value;
+    llvm_collection_type := self.type_to_llvm(collection_type);
+
+    // Loops handle their own scope.
+    self.enter_local_scope(routine_context, .Control_Block, statement.position);
+    llvm_key := self.emit_local(routine_context, statement.position, key_type, statement.element_name);
+    llvm_value: LLVMValueRef;
+    if (statement.index_name != "") {
+      llvm_value = self.emit_local(routine_context, statement.position, value_type, statement.index_name);
+    }
+    llvm_iterator_pointer := self.emit_temporary_and_store_raw(
+      routine_context,
+      context.storage.type_int,
+      LLVMConstInt(LLVMInt64Type(), 0, false),
+      make_temp_name(routine_context),
+    );
+
+    llvm_data_pointer_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_collection_type, llvm_collection);
+    llvm_capacity_pointer := self.emit_gep_value_capacity(self.builder, routine_context, llvm_collection_type, llvm_collection);
+
+    LLVMBuildBr(self.builder, llvm_loop_capacity_check_block);
+    // This block checks if we reached the end of the loop (aka iterator < capacity).
+    previous_block := self.enter_llvm_block(routine_context, llvm_loop_capacity_check_block);
+    {
+      llvm_iterator := self.emit_load(routine_context,  context.storage.type_int, llvm_iterator_pointer);
+      llvm_capacity := self.emit_load(routine_context, context.storage.type_int, llvm_capacity_pointer);
+      llvm_capacity_condition := LLVMBuildICmp(self.builder, .SGE, llvm_iterator, llvm_capacity, make_value_name(routine_context));
+      LLVMBuildCondBr(self.builder, llvm_capacity_condition, llvm_after_block, llvm_get_next_entry_block);
+    }
+    self.leave_llvm_block(routine_context, previous_block);
+
+    // This corresponds to 'Map_Entry<K, V> { key: K, value: V, is_occupied: bool }'.
+    llvm_key_type := self.type_to_llvm(key_type);
+    llvm_value_type := self.type_to_llvm(value_type);
+    llvm_map_entry_struct_elements: []LLVMTypeRef = {llvm_key_type, llvm_value_type, self.type_to_llvm(context.storage.type_bool)};
+    llvm_map_entry_type := LLVMStructType(data(llvm_map_entry_struct_elements), cast(u32) length(llvm_map_entry_struct_elements), false);
+
+    // This block gets the pointer to the next entry that is occupied.
+    llvm_entry_pointer: LLVMValueRef;
+    previous_block = self.enter_llvm_block(routine_context, llvm_get_next_entry_block);
+    {
+      llvm_iterator := self.emit_load(routine_context,  context.storage.type_int, llvm_iterator_pointer);
+      llvm_data_pointer := self.emit_load(routine_context, context.storage.type_rawptr, llvm_data_pointer_pointer);
+      llvm_entry_pointer = self.emit_gep_pointer(self.builder, routine_context, llvm_map_entry_type, llvm_data_pointer, llvm_iterator);
+      llvm_is_occupied_pointer := self.emit_gep_value_capacity(self.builder, routine_context, llvm_map_entry_type, llvm_entry_pointer);
+      llvm_is_occupied := self.emit_load(routine_context, context.storage.type_bool, llvm_is_occupied_pointer);
+      llvm_iterator_incremented := LLVMBuildAdd(self.builder, llvm_iterator, LLVMConstInt(LLVMInt64Type(), 1, false), make_value_name(routine_context));
+      self.emit_store_raw(llvm_iterator_pointer, llvm_iterator_incremented);
+      LLVMBuildCondBr(self.builder, llvm_is_occupied, llvm_setup_entry_block, llvm_loop_capacity_check_block);
+    }
+    self.leave_llvm_block(routine_context, previous_block);
+
+    // This block setups the the entry (meaning the actual key and value variables).
+    previous_block = self.enter_llvm_block(routine_context, llvm_setup_entry_block);
+    {
+      // Store value in key variable.
+      llvm_key_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_map_entry_type, llvm_entry_pointer);
+      llvm_key_temporary: LLVMValueRef;
+      if (self.type_requires_loading_address(key_type, key_type)) {
+        llvm_key_temporary = llvm_key_pointer;
+      } else {
+        llvm_key_temporary = self.emit_load(routine_context, key_type, llvm_key_pointer);
+      }
+      self.emit_store(routine_context, key_type, llvm_key, llvm_key_temporary, null);
+
+      // Store value in value variable (if present).
+      if (llvm_value != null) {
+        llvm_value_pointer := self.emit_gep_value_length(self.builder, routine_context, llvm_map_entry_type, llvm_entry_pointer);
+        llvm_value_temporary: LLVMValueRef;
+        if (self.type_requires_loading_address(value_type, value_type)) {
+          llvm_value_temporary = llvm_value_pointer;
+        } else {
+          llvm_value_temporary = self.emit_load(routine_context, value_type, llvm_value_pointer);
+        }
+        self.emit_store(routine_context, value_type, llvm_value, llvm_value_temporary, null);
+      }
+
+      LLVMBuildBr(self.builder, llvm_loop_block);
+    }
+    self.leave_llvm_block(routine_context, previous_block);
+
+    previous_block = self.enter_llvm_block(routine_context, llvm_loop_block);
+    {
+      block_returns, block_leaves := self.emit_statement_block(routine_context, statement.block, .Keep_Scope);
+      // We leave the scope before building the branches, so that defer statements can be properly generated.
+      self.leave_local_scope(routine_context, block_returns, block_leaves);
+      if (!block_returns && !block_leaves) {
+        llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+        if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+          LLVMBuildBr(self.builder, llvm_loop_capacity_check_block);
+        }
+      }
+    }
+    self.leave_llvm_block(routine_context, previous_block);
+  }
+  
+  /**
+  * Emit a switch statement.
+  * 
+  * @param routine_context   The context of the routine.
+  * @param statement         The statement to emit.
+  * @param is_last_statement Is the statement the last in the current block?
+  * @return 1. True if the statement returns otherwise false; 2. True if the statement leaves otherwise false.
+  */
+  private proc emit_statement_switch(routine_context: *Routine_Context, statement: *Statement, is_last_statement: bool) -> (bool, bool) {
+    statement := cast(*Statement_Switch) statement;
+
+    // The same conditions apply here as with an if statement.
+    needs_after_block := !is_last_statement || routine_context.needs_after_block;
+
+    previous_next_block := routine_context.last_next_block;
+    previous_break_block := routine_context.last_break_block;
+    after_block := previous_next_block;
+    if (needs_after_block) {
+      after_block = self.append_block(routine_context);
+      routine_context.last_next_block = after_block;
+      routine_context.last_break_block = after_block;
+    }
+
+    has_default_case := false;
+    number_of_individual_cases := 0;
+    foreach (switch_case in statement.cases) {
+      pattern_count := length(switch_case.patterns);
+      if (pattern_count == 0) {
+        has_default_case = true;
+      }
+      number_of_individual_cases += pattern_count;
+    }
+
+    default_block: LLVMBasicBlockRef;
+    if (has_default_case) {
+      default_block = self.append_block(routine_context);
+    } else {
+      default_block = routine_context.last_next_block;
+    }
+
+    llvm_switch_value := self.emit_expression(routine_context, cast(*Expression) statement.expression, null);
+    llvm_switch := LLVMBuildSwitch(self.builder, llvm_switch_value, default_block, cast(u32) number_of_individual_cases);
+
+    // Prepare all case blocks.
+    case_blocks := array_make!(LLVMBasicBlockRef)(0, number_of_individual_cases, context.temporary_allocator);
+    foreach (switch_case in statement.cases) {
+      case_block: LLVMBasicBlockRef;
+      if (length(switch_case.patterns) == 0) {
+        case_block = default_block;
+      } else {
+        case_block = self.append_block(routine_context);
+        foreach (pattern in switch_case.patterns) {
+          llvm_case_value := self.emit_expression(routine_context, pattern, null);
+          LLVMAddCase(llvm_switch, llvm_case_value, case_block);
+        }
+      }
+
+      array_add(&case_blocks, case_block);
+    }
+
+    returns := true;
+    leaves := false;
+
+    // Do generation for all case blocks.
+    for (i := 0; i < length(statement.cases); i++) {
+      case_block := case_blocks[i];
+      
+      // We need to properly set the next fallthrough block.
+      if (i + 1 < length(statement.cases)) {
+        routine_context.next_fallthrough_block = case_blocks[i + 1];
+      } else {
+        routine_context.next_fallthrough_block = after_block;
+      }
+
+      previous_block := self.enter_llvm_block(routine_context, case_block);
+      {
+        switch_case_block := statement.cases[i].block;
+        self.enter_local_scope(routine_context, .Control_Block, switch_case_block.start_position);
+        block_returns, block_leaves := self.emit_statement_block(routine_context, switch_case_block, .Keep_Scope);
+        self.leave_local_scope(routine_context, block_returns, block_leaves);
+        if (!block_returns && !block_leaves) {
+          // We have an automatic break from a switch case.
+          llvm_last_instruction := LLVMGetLastInstruction(routine_context.current_block);
+          if (llvm_last_instruction == null || LLVMIsATerminatorInst(llvm_last_instruction) == null) {
+            LLVMBuildBr(self.builder, after_block);
+          }
+        }
+        returns = block_returns && returns;
+        // We also set if we leave because our last case might have a break or fallthrough statment.
+        leaves = block_leaves;
+      }
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+
+    if (needs_after_block) {
+      previous_block := self.enter_llvm_block(routine_context, after_block);
+      // If we fully return that means that we don't need the after block anymore (as it will never be reached and is never referenced).
+      if (returns && is_last_statement) {
+        if (default_block == after_block) {
+          if (previous_next_block == null) {
+            LLVMBuildRetVoid(self.builder);
+          } else {
+            LLVMBuildBr(self.builder, previous_next_block);
+          }
+        } else {
+          LLVMDeleteBasicBlock(after_block);
+        }
+        self.leave_llvm_block(routine_context, previous_block);
+      }
+    }
+
+    routine_context.last_next_block = previous_next_block;
+    routine_context.last_break_block = previous_break_block;
+
+    return {returns, leaves};
+  }
+
+  /**
+  * Emit an assign statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_assign(routine_context: *Routine_Context, statement: *Statement) {
+    statement := cast(*Statement_Assign) statement;
+
+    if (length(statement.left_expressions) == 1) {
+      // We explicitly check for assignment of single SoA/AoSoA elements as that needs to be handled as a special case (just like tuples).
+      left_expression := statement.left_expressions[0];
+      if (self.member_is_soa_or_aosoa_access(left_expression)) {
+        self.emit_statement_assign_layout_member(routine_context, statement, left_expression);
+      } else if (left_expression.kind == .Unary && self.get_resolved_type(cast(*Expression) (cast(*Expression_Unary) left_expression).expression).is_layout_pointer()) {
+        self.emit_statement_assign_layout_pointer(routine_context, statement, left_expression);
+      } else {
+        self.emit_statement_assign_simple(routine_context, statement, left_expression);
+      }
+    } else {
+      tuple_type := self.get_resolved_type(cast(*Expression) statement.right_expression);
+      self.emit_statement_assign_tuple(routine_context, statement, tuple_type);
+    }
+  }
+
+  /** 
+  * Emit an assign statement for simple expressions.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The assign statement to emit.
+  * @param left_expression The left expression of the assignment.
+  */
+  private proc emit_statement_assign_simple(routine_context: *Routine_Context, statement: *Statement_Assign, left_expression: *Expression) {
+    resolved_type := self.get_resolved_type(left_expression);
+
+    llvm_value_to_assign_to := self.emit_statement_assign_value_to_assign_to(routine_context, left_expression, resolved_type);
+
+    right_expression := cast(*Expression) statement.right_expression;
+    overwrite_type := self.get_resolved_overwrite_type(right_expression);
+    if (overwrite_type == null) {
+      overwrite_type = resolved_type;
+    }
+    needs_to_load_address := self.type_requires_loading_address(resolved_type, overwrite_type);
+    previous_loading_mode := self.enter_loading_mode(routine_context, needs_to_load_address ? .Load_Address : .Load_Value);
+    llvm_value_right := self.emit_expression(routine_context, right_expression, overwrite_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+    
+    // Emit the binary operation for non-standard assignment operators.
+    llvm_value_to_assign := llvm_value_right;
+    if (statement.operator != .Assign) {
+      operator := ASSIGN_TOKEN_TO_BINARY_TOKEN[statement.operator];
+
+      previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Value);
+      llvm_value_left := self.emit_expression(routine_context, left_expression, null);
+      self.leave_loading_mode(routine_context, previous_loading_mode);
+
+      left_type := resolved_type;
+      right_type := self.get_resolved_type(right_expression);
+      llvm_value_to_assign = self.emit_expression_binary_arithmetic_operation(routine_context, operator, left_type, llvm_value_left, right_type, llvm_value_right);
+    }
+
+    self.emit_store(routine_context, resolved_type, llvm_value_to_assign_to, llvm_value_to_assign, right_expression);
+  }
+
+  /**
+  * Emit an assign statement for tuple.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The assign statement to emit.
+  * @param tuple_type      The type of the tuple.
+  */
+  private proc emit_statement_assign_tuple(routine_context: *Routine_Context, statement: *Statement_Assign, tuple_type: *Type) {
+    llvm_tuple_type := self.type_to_llvm(tuple_type);
+
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_tuple_pointer := self.emit_expression(routine_context, cast(*Expression) statement.right_expression, tuple_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    type_tuple := cast(*Type_Tuple) tuple_type;
+    assert(length(type_tuple.elements) == length(statement.left_expressions));
+
+    foreach (element, i in type_tuple.elements) {
+      element_type := element.type;
+
+      left_expression := statement.left_expressions[i];
+      resolved_type := self.get_resolved_type(left_expression);
+
+      llvm_value_to_assign_to := self.emit_statement_assign_value_to_assign_to(routine_context, left_expression, resolved_type);
+
+      llvm_element_pointer := self.emit_gep_field(self.builder, routine_context, llvm_tuple_type, llvm_tuple_pointer, i);
+      llvm_element_value: LLVMValueRef;
+      needs_to_load_address := self.type_requires_loading_address(element_type, element_type);
+      if (needs_to_load_address) {
+        llvm_element_value = llvm_element_pointer;
+      } else {
+        llvm_element_value = self.emit_load(routine_context, element_type, llvm_element_pointer);
+      }
+
+      self.emit_store(routine_context, element_type, llvm_value_to_assign_to, llvm_element_value, null);
+    }
+  }
+
+  /**
+  * Emit an assign statement for a member in a layout collection.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The assign statement to emit.
+  * @param left_expression The left expression of the statement.
+  */
+  private proc emit_statement_assign_layout_member(routine_context: *Routine_Context, statement: *Statement_Assign, left_expression: *Expression) {
+    assert(left_expression.kind == .Index);
+    left_expression_index := cast(*Expression_Index) left_expression;
+
+    index_expression := cast(*Expression) left_expression_index.expression;
+
+    layout_collection_type := self.get_resolved_type(index_expression);
+    needs_to_dereference_pointer := layout_collection_type.is_absolute_pointer() || layout_collection_type.is_self_relative_pointer();
+    if (needs_to_dereference_pointer) {
+      layout_collection_type = layout_collection_type.base;
+    }
+    assert(layout_collection_type.is_soa_or_aosoa());
+    assert(layout_collection_type.base.is_struct());
+
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Value);
+    llvm_index := self.emit_expression(routine_context, cast(*Expression) left_expression_index.index, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    previous_loading_mode = self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_layout_collection := self.emit_expression(routine_context, index_expression, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+    llvm_layout_collection = self.emit_possible_pointer_dereference(routine_context, index_expression, llvm_layout_collection);
+
+    self.emit_statement_assign_layout_fields(
+      routine_context,
+      cast(*Expression) statement.right_expression,
+      layout_collection_type,
+      llvm_layout_collection,
+      llvm_index,
+    );
+  }
+
+  /**
+  * Emit an assign statement for a layout pointer.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The assign statement to emit.
+  * @param left_expression The left expression of the statement.
+  */
+  private proc emit_statement_assign_layout_pointer(routine_context: *Routine_Context, statement: *Statement_Assign, left_expression: *Expression) {
+    assert(left_expression.kind == .Unary);
+
+    unary_expression := cast(*Expression_Unary) left_expression;
+    expression_unary := cast(*Expression) unary_expression.expression;
+
+    layout_pointer_type := self.get_resolved_type(expression_unary);
+    llvm_layout_pointer_type := self.type_to_llvm(layout_pointer_type);
+
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_layout_pointer := self.emit_expression(routine_context, expression_unary, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    llvm_layout_pointer_data_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_layout_pointer_type, llvm_layout_pointer);
+    llvm_layout_pointer_data := self.emit_load(routine_context, context.storage.type_rawptr, llvm_layout_pointer_data_pointer);
+    llvm_layout_pointer_index_pointer := self.emit_gep_value_length(self.builder, routine_context, llvm_layout_pointer_type, llvm_layout_pointer);
+    llvm_layout_pointer_index := self.emit_load(routine_context, context.storage.type_int, llvm_layout_pointer_index_pointer);
+
+    self.emit_statement_assign_layout_fields(
+      routine_context,
+      cast(*Expression) statement.right_expression,
+      layout_pointer_type.base,
+      llvm_layout_pointer_data,
+      llvm_layout_pointer_index,
+    );
+  }
+
+  /**
+  * Emit an assign statement for the fields in a layout collection.
+  * 
+  * @param routine_context        The context of the routine.
+  * @param right_expression       The right expression of the statement.
+  * @param layout_collection_type The type of the layout collection.
+  * @param llvm_layout_collection The LLVM layout collection.
+  * @param llvm_index             The LLVM index into the layout collection.
+  */
+  private proc emit_statement_assign_layout_fields(
+    routine_context: *Routine_Context,
+    right_expression: *Expression,
+    layout_collection_type: *Type,
+    llvm_layout_collection: LLVMValueRef,
+    llvm_index: LLVMValueRef,
+  ) {
+    element_type := layout_collection_type.base.base;
+    type_struct := cast(*Type_Struct) element_type;
+    
+    llvm_collection_type := self.type_to_llvm(layout_collection_type);
+    llvm_element_type := self.type_to_llvm(element_type);
+
+    is_aosoa := layout_collection_type.is_aosoa();
+
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_element_pointer := self.emit_expression(routine_context, right_expression, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    foreach (field, i in type_struct.fields) {
+      llvm_element_field_pointer := self.emit_gep_field(self.builder, routine_context, llvm_element_type, llvm_element_pointer, i);
+      llvm_field_value: LLVMValueRef;
+      if (self.type_requires_loading_address(field.type, field.type)) {
+        llvm_field_value = llvm_element_field_pointer;
+      } else {
+        llvm_field_value = self.emit_load(routine_context, field.type, llvm_element_field_pointer);
+      }
+
+      llvm_data_pointer: LLVMValueRef;
+      if (is_aosoa) {
+        llvm_data_pointer = llvm_layout_collection;
+      } else {
+        llvm_data_pointer = self.emit_gep_field(self.builder, routine_context, llvm_collection_type, llvm_layout_collection, i);
+      }
+      // If we are a dynamic array or a slice we have to load the field data pointer first.
+      if (!layout_collection_type.is_array()) {
+        llvm_data_pointer = self.emit_load(routine_context, context.storage.type_rawptr, llvm_data_pointer);
+      }
+
+      llvm_field_type := self.type_to_llvm(field.type);
+
+      llvm_layout_element_pointer: LLVMValueRef;
+      if (is_aosoa) {
+        llvm_layout_element_pointer = self.emit_aosoa_element_field_pointer(
+          routine_context,
+          layout_collection_type,
+          llvm_data_pointer,
+          llvm_field_type,
+          llvm_index,
+          {i, {}, field.type},
+        );
+      } else {
+        llvm_layout_element_pointer = self.emit_gep_pointer(self.builder, routine_context, llvm_field_type, llvm_data_pointer, llvm_index);
+      }
+      
+      self.emit_store(routine_context, field.type, llvm_layout_element_pointer, llvm_field_value, null);
+    }
+  }
+
+  /**
+  * Emit the value to assign to in an assign statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param left_expression The left expression of the statement.
+  * @param resolved_type   The resolved type of the assignment.
+  * @return The LLVM value to assign to.
+  */
+  private proc emit_statement_assign_value_to_assign_to(routine_context: *Routine_Context, left_expression: *Expression, resolved_type: *Type) -> LLVMValueRef {
+    // The value we load here has to be carefully generated to allow for storing into it.
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_value_to_assign_to: LLVMValueRef;
+    if (left_expression.kind == .Name) {
+      // Parameters can never be assigned to and therefore 'self.name_to_llvm' does not check them.
+      llvm_type: LLVMTypeRef;
+      llvm_value_to_assign_to, llvm_type = self.name_to_llvm(routine_context, left_expression, (cast(*Expression_Name) left_expression).name);
+    } else if (left_expression.kind == .Unary) {
+      expression_unary := cast(*Expression_Unary) left_expression;
+      unary_expression := cast(*Expression) expression_unary.expression;
+      llvm_value_to_assign_to = self.emit_expression(routine_context, unary_expression, null);
+      unary_expression_type := self.get_resolved_type(unary_expression);
+      if (unary_expression_type.is_self_relative_pointer()) {
+        llvm_value_to_assign_to = self.emit_self_relative_pointer_to_absolute(routine_context, unary_expression_type, llvm_value_to_assign_to);
+      } else if (!routine_context.last_resolved_symbol_was_parameter) {
+        // We explicitly request the pointer type that we need to here in order to store into it.
+        // Execept for parameters as they are already passed by value.
+        pointer_type := context.storage.get_or_make_type_pointer(resolved_type);
+        llvm_value_to_assign_to = self.emit_load(routine_context, pointer_type, llvm_value_to_assign_to);
+      }
+    } else {
+      llvm_value_to_assign_to = self.emit_expression(routine_context, left_expression, null);
+    }
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    return llvm_value_to_assign_to;
+  }
+
+  /**
+  * Emit an initialize statement.
+  * 
+  * @param routine_context The context of the routine.
+  * @param statement       The statement to emit.
+  */
+  private proc emit_statement_initialize(routine_context: *Routine_Context, statement: *Statement) {
+    statement := cast(*Statement_Initialize) statement;
+
+    is_deconstructing_tuple := length(statement.names) > 1;
+
+    expression := cast(*Expression) statement.expression;
+
+    resolved_type: *Type;
+    if (statement.type == null) {
+      resolved_type = self.get_resolved_type(expression);
+    } else {
+      resolved_type = self.get_resolved_type(cast(*Type_Specification) statement.type);
+    }
+    
+    llvm_initializer_value: LLVMValueRef;
+    if (expression != null) {
+      overwrite_type := self.get_resolved_overwrite_type(expression);
+      if (overwrite_type == null) {
+        overwrite_type = resolved_type;
+      }
+
+      needs_to_load_address := is_deconstructing_tuple || self.type_requires_loading_address(resolved_type, overwrite_type);
+      previous_loading_mode := self.enter_loading_mode(routine_context, needs_to_load_address ? .Load_Address : .Load_Value);
+      llvm_initializer_value = self.emit_expression(routine_context, expression, overwrite_type);
+      self.leave_loading_mode(routine_context, previous_loading_mode);
+    }
+
+    // We emit the local after evaluating the initializer as it may refer to parameters with the same name as our local here.
+    if (is_deconstructing_tuple) {
+      assert(resolved_type.is_tuple());
+      
+      type_tuple := cast(*Type_Tuple) resolved_type;
+      
+      foreach (element, i in type_tuple.elements) {
+        element_type := element.type;
+
+        llvm_local := self.emit_local(routine_context, statement.position, element_type, statement.names[i]);
+        llvm_element_pointer := self.emit_gep_field(self.builder, routine_context, self.type_to_llvm(resolved_type), llvm_initializer_value, i);
+        
+        llvm_element_initializer: LLVMValueRef;
+        needs_to_load_address := self.type_requires_loading_address(element_type, element_type);
+        if (needs_to_load_address) {
+          llvm_element_initializer = llvm_element_pointer;
+        } else {
+          llvm_element_initializer = self.emit_load(routine_context, element_type, llvm_element_pointer);
+        }
+        
+        self.emit_store(routine_context, element_type, llvm_local, llvm_element_initializer, null);
+      }
+    } else {
+      llvm_local := self.emit_local(routine_context, statement.position, resolved_type, statement.names[0]);
+
+      // We can skip storing a 'default value' as that got already handled by emitting the local.
+      if (llvm_initializer_value != null) {
+        self.emit_store(routine_context, resolved_type, llvm_local, llvm_initializer_value, expression);
+      }
+    }
+  }
+
+}

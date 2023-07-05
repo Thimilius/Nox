@@ -1,0 +1,345 @@
+/**
+* Represents a generic context for the instantiation of an AST.
+*/ 
+internal struct Instantiation_Context {
+  generic_type_names: [dynamic]string,         // The generic type names that need to be instantiated.
+  generic_types: [dynamic]*Type_Specification, // The generic types that are used for the instantiation corresponding to type name.
+}
+
+/**
+* Instantiates the AST of a routine declaration.
+*
+* @param declaration           The routine declaration to instantiate.
+* @param instantiation_context The generic instantiation context to use in the process.
+* @param allocator             The allocator to use in the process.
+*/
+internal proc ast_instantiate_declaration_routine(declaration: *Declaration, instantiation_context: Instantiation_Context, allocator: Allocator) {
+  assert(declaration.kind == .Procedure || declaration.kind == .Function);
+  assert(length(instantiation_context.generic_type_names) == length(instantiation_context.generic_types));
+
+  declaration := cast(*Declaration_Routine) declaration;
+
+  new_context := *context;
+  new_context.allocator = allocator;
+  push_context (new_context) {
+    new_parameters: aosoa[dynamic]Declaration_Routine_Parameter;
+    foreach (parameter in declaration.parameters) {
+      new_parameter := *parameter;
+      new_parameter.type = ast_instantiate_type_specification(new_parameter.type, instantiation_context);
+      ast_instantiate_expression(new_parameter.initializer, instantiation_context);
+      array_aosoa_add(&new_parameters, new_parameter);
+    }
+    declaration.parameters = new_parameters;
+    declaration.return_type = ast_instantiate_type_specification(cast(*Type_Specification) declaration.return_type, instantiation_context);
+
+    new_generic_constraints: aosoa[dynamic]Declaration_Routine_Generic_Constraint;
+    foreach (generic_constraint in declaration.generic_constraints) {
+      new_generic_constraint := *generic_constraint;
+      switch (new_generic_constraint.kind) {
+        case .Expression: {
+          generic_constraint_expression := new_generic_constraint.value.(Declaration_Routine_Generic_Constraint_Expression);
+          ast_instantiate_expression(generic_constraint_expression.expression, instantiation_context);
+        }
+        case .Interface: {
+          generic_constraint_interface := new_generic_constraint.value.(Declaration_Routine_Generic_Constraint_Interface);
+          generic_constraint_interface.type = ast_instantiate_type_specification(generic_constraint_interface.type, instantiation_context);
+          new_generic_constraint.value = generic_constraint_interface;
+        }
+      }
+      array_aosoa_add(&new_generic_constraints, new_generic_constraint);
+    }
+    declaration.generic_constraints = new_generic_constraints;
+
+    ast_instantiate_statement_block(declaration.block, instantiation_context);
+  }
+}
+
+/**
+* Instantiates the AST of a type specification.
+*
+* @param type                  The type specification to instantiate.
+* @param instantiation_context The generic instantiation context to use in the process.
+* @return The instantiated type specification.
+*/
+internal proc ast_instantiate_type_specification(type_specification: *Type_Specification, instantiation_context: Instantiation_Context) -> *Type_Specification {
+  if (type_specification == null) then return null;
+
+  switch (type_specification.kind) {
+    case .Name: {
+      type_specification := cast(*Type_Specification_Name) type_specification;
+      foreach (generic_type_name, i in instantiation_context.generic_type_names) {
+        if (type_specification.name == generic_type_name) {
+          // No destroying of non-instantiated 'type' necessary here because we have a dedicated AST allocator.
+          type := ast_clone_type_specification(instantiation_context.generic_types[i]);
+          if (type.kind == .Name) {
+            type_specification = cast(*Type_Specification_Name) type;
+          } else {
+            return type;
+          }
+        }
+      }
+      new_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in type_specification.generic_types) {
+        array_add(&new_generic_types, ast_instantiate_type_specification(generic_type, instantiation_context));
+      }
+      array_destroy(&type_specification.generic_types);
+      type_specification.generic_types = new_generic_types;
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Pointer: {
+      type_specification := cast(*Type_Specification_Pointer) type_specification;
+      type_specification.base = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.base, instantiation_context);
+      type_specification.relative_base = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.relative_base, instantiation_context);
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Array: {
+      type_specification := cast(*Type_Specification_Array) type_specification;
+      type_specification.base = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.base, instantiation_context);
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Slice: {
+      type_specification := cast(*Type_Specification_Slice) type_specification;
+      type_specification.base = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.base, instantiation_context);
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Map: {
+      type_specification := cast(*Type_Specification_Map) type_specification;
+      type_specification.key = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.key, instantiation_context);
+      type_specification.value = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.value, instantiation_context);
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Tuple: {
+      type_specification := cast(*Type_Specification_Tuple) type_specification;
+      new_elements: [dynamic]*Type_Specification;
+      foreach (element in type_specification.elements) {
+        array_add(&new_elements, ast_instantiate_type_specification(element, instantiation_context));
+      }
+      array_destroy(&type_specification.elements);
+      type_specification.elements = new_elements;
+      return cast(*Type_Specification) type_specification;
+    }
+    case .Procedure, .Function: {
+      type_specification := cast(*Type_Specification_Routine) type_specification;
+      new_parameters: [dynamic]*Type_Specification;
+      foreach (parameter in type_specification.parameters) {
+        array_add(&new_parameters, ast_instantiate_type_specification(parameter, instantiation_context));
+      }
+      array_destroy(&type_specification.parameters);
+      type_specification.parameters = new_parameters;
+      type_specification.return_type = ast_instantiate_type_specification(cast(*Type_Specification) type_specification.return_type, instantiation_context);
+      return cast(*Type_Specification) type_specification;
+    }
+
+    case .None: fallthrough;
+    case: assert(false);
+  }
+
+  assert(false);
+  return null;
+}
+
+/**
+* Instantiates the AST of a statement.
+*
+* @param type                  The statement to instantiate.
+* @param instantiation_context The generic instantiation context to use in the process.
+*/
+internal proc ast_instantiate_statement(statement: *Statement, instantiation_context: Instantiation_Context) {
+  if (statement == null) then return;
+
+  switch (statement.kind) {
+    case .Return: {
+      statement := cast(*Statement_Return) statement;
+      ast_instantiate_expression(cast(*Expression) statement.expression, instantiation_context);
+    }
+    case .Break, .Continue, .Fallthrough:
+    case .Defer: {
+      statement := cast(*Statement_Defer) statement;
+      ast_instantiate_statement(cast(*Statement) statement.statement, instantiation_context);
+    }
+    case .Push_Context: {
+      statement := cast(*Statement_Push_Context) statement;
+      ast_instantiate_expression(cast(*Expression) statement.expression, instantiation_context);
+      ast_instantiate_statement_block(statement.block, instantiation_context);
+    }
+
+    case .Scope: {
+      statement := cast(*Statement_Scope) statement;
+      ast_instantiate_statement_block(statement.block, instantiation_context);
+    }
+    case .If, .Static_If: {
+      statement := cast(*Statement_If) statement;
+      ast_instantiate_expression(cast(*Expression) statement.condition, instantiation_context);
+      ast_instantiate_statement_block(statement.then_block, instantiation_context);
+      foreach (else_if in statement.else_ifs) {
+        ast_instantiate_expression(else_if.condition, instantiation_context);
+        ast_instantiate_statement_block(else_if.block, instantiation_context);
+      }
+      ast_instantiate_statement_block(statement.else_block, instantiation_context);
+    }
+    case .For: {
+      statement := cast(*Statement_For) statement;
+      ast_instantiate_statement(cast(*Statement) statement.initializer, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) statement.condition, instantiation_context);
+      ast_instantiate_statement(cast(*Statement) statement.next, instantiation_context);
+      ast_instantiate_statement_block(statement.block, instantiation_context);
+    }
+    case .Foreach: {
+      statement := cast(*Statement_Foreach) statement;
+      ast_instantiate_expression(cast(*Expression) statement.collection, instantiation_context);
+      ast_instantiate_statement_block(statement.block, instantiation_context);
+    }
+    case .Switch: {
+      statement := cast(*Statement_Switch) statement;
+      ast_instantiate_expression(cast(*Expression) statement.expression, instantiation_context);
+      foreach (switch_case in statement.cases) {
+        foreach (pattern in switch_case.patterns) {
+          ast_instantiate_expression(pattern, instantiation_context);
+        }
+        ast_instantiate_statement_block(switch_case.block, instantiation_context);
+      }
+    }
+
+    case .Assign: {
+      statement := cast(*Statement_Assign) statement;
+      foreach (left_expression in statement.left_expressions) {
+        ast_instantiate_expression(left_expression, instantiation_context);
+      }
+      ast_instantiate_expression(cast(*Expression) statement.right_expression, instantiation_context);
+    }
+    case .Initialize: {
+      statement := cast(*Statement_Initialize) statement;
+      statement.type = ast_instantiate_type_specification(cast(*Type_Specification) statement.type, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) statement.expression, instantiation_context);
+    }
+    case .Expression: {
+      statement := cast(*Statement_Expression) statement;
+      ast_instantiate_expression(cast(*Expression) statement.expression, instantiation_context);
+    }
+  }
+}
+
+/**
+* Instantiates the AST of a statement block.
+*
+* @param type                  The statement block to instantiate.
+* @param instantiation_context The generic instantiation context to use in the process.
+*/
+internal proc ast_instantiate_statement_block(block: Statement_Block, instantiation_context: Instantiation_Context) {
+  foreach (statement in block.statements) {
+    ast_instantiate_statement(statement, instantiation_context);
+  }
+}
+
+/**
+* Instantiates the AST of an expression.
+*
+* @param type                  The expression to instantiate.
+* @param instantiation_context The generic instantiation context to use in the process.
+*/
+internal proc ast_instantiate_expression(expression: *Expression, instantiation_context: Instantiation_Context) {
+  if (expression == null) then return;
+
+  switch (expression.kind) {
+    case .Parenthesized: {
+      expression := cast(*Expression_Parenthesized) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+    }
+
+    case .Boolean, .Integer, .Float, .Character, .String:
+    case .Name: {
+      expression := cast(*Expression_Name) expression;
+      new_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in expression.generic_types) {
+        array_add(&new_generic_types, ast_instantiate_type_specification(generic_type, instantiation_context));
+      }
+      array_destroy(&expression.generic_types);
+      expression.generic_types = new_generic_types;
+    }
+
+    case .Cast: {
+      expression := cast(*Expression_Cast) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      expression.type = ast_instantiate_type_specification(cast(*Type_Specification) expression.type, instantiation_context);
+    }
+    case .Call: {
+      expression := cast(*Expression_Call) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      foreach (argument in expression.arguments) {
+        ast_instantiate_expression(argument, instantiation_context);
+      }
+    }
+    case .Index: {
+      expression := cast(*Expression_Index) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.index, instantiation_context);
+    }
+    case .Slice: {
+      expression := cast(*Expression_Slice) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.lower, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.higher, instantiation_context);
+    }
+    case .Member: {
+      expression := cast(*Expression_Member) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      new_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in expression.generic_types) {
+        array_add(&new_generic_types, ast_instantiate_type_specification(generic_type, instantiation_context));
+      }
+      array_destroy(&expression.generic_types);
+      expression.generic_types = new_generic_types;
+    }
+    case .Compound: {
+      expression := cast(*Expression_Compound) expression;
+      expression.type = ast_instantiate_type_specification(cast(*Type_Specification) expression.type, instantiation_context);
+      foreach (field in expression.fields) {
+        ast_instantiate_expression(field.initializer, instantiation_context);
+        if (field.kind == .Index) {
+          ast_instantiate_expression(field.value.(*Expression), instantiation_context);
+        }
+      }
+    }
+    case .Selector: {
+      expression := cast(*Expression_Selector) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+      expression.type = ast_instantiate_type_specification(cast(*Type_Specification) expression.type, instantiation_context);
+    }
+    case .Implicit_Selector:
+
+    case .Unary: {
+      expression := cast(*Expression_Unary) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+    }
+    case .Binary: {
+      expression := cast(*Expression_Binary) expression;
+      ast_instantiate_expression(cast(*Expression) expression.left, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.right, instantiation_context);
+    }
+    case .Ternary: {
+      expression := cast(*Expression_Ternary) expression;
+      ast_instantiate_expression(cast(*Expression) expression.condition, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.then_expression, instantiation_context);
+      ast_instantiate_expression(cast(*Expression) expression.else_expression, instantiation_context);
+    }
+    case .Modify: {
+      expression := cast(*Expression_Modify) expression;
+      ast_instantiate_expression(cast(*Expression) expression.expression, instantiation_context);
+    }
+
+    case .Query: {
+      expression := cast(*Expression_Query) expression;
+      switch (expression.query_kind) {
+        case .Size_Of_Expression, .Typeid_Of_Expression, .Type_Info_Of_Expression: ast_instantiate_expression(expression.value.(*Expression), instantiation_context);
+        case .Size_Of_Type, .Typeid_Of_Type, .Type_Info_Of_Type: expression.value = ast_instantiate_type_specification(
+          expression.value.(*Type_Specification),
+          instantiation_context,
+        );
+      }
+    }
+    case .Directive:
+
+    case .None: fallthrough;
+    case: assert(false);
+  }
+}

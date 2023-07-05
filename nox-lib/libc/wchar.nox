@@ -1,0 +1,1 @@
+public extern proc wcslen(s: *wchar_t) -> size_t

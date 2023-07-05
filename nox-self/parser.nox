@@ -1,0 +1,1979 @@
+/**
+* Holds data needed for parsing.
+*/
+public struct Parser {
+  lexer: *Lexer,                              // Reference to the lexer.
+  allocator: Allocator,                       // The allocator to use when allocating AST elements.
+
+  declarations: [dynamic]*Declaration,        // Holds all parsed declarations.
+  import_declarations: [dynamic]*Declaration, // Holds import declarations at the top scope (Not those nested inside a static if for example).
+}
+
+/**
+* Makes a new parser.
+*
+* @param lexer     The lexer to use..
+* @param allocator The allocator to use when allocating AST elements.
+* @return The new parser.
+*/
+public proc parser_make(lexer: *Lexer, allocator: Allocator) -> Parser {
+  p: Parser;
+  p.lexer = lexer;
+  p.allocator = allocator;
+  p.declarations = array_make!(*Declaration)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, allocator);
+  p.import_declarations = array_make!(*Declaration)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, allocator);
+  return p;
+}
+
+implement Parser {
+
+  /**
+  * Parses all top scope declarations.
+  */
+  public proc parse_declarations() {
+    new_context := *context;
+    new_context.allocator = self.allocator;
+    push_context (new_context) {
+      self.lexer.get_next_token();
+      for (!self.lexer.is_token(.Eof)) {
+        declaration := self.parse_declaration();
+
+        if (declaration.kind == .Import) {
+          array_add(&self.import_declarations, declaration);
+        }
+        array_add(&self.declarations, declaration);
+      }
+    }
+  }
+
+  /**
+  * Parses a single declaration.
+  *
+  * @return The parsed declaration.
+  */
+  private proc parse_declaration() -> *Declaration {
+    attributes := self.parse_attributes();
+    
+    declaration := self.parse_declaration_optional();
+    if (declaration == null) {
+      self.report_error("Expected declaration keyword. Got '%'", self.lexer.get_token_info());
+    }
+
+    if (length(attributes.attributes) > 0) {
+      if (declaration.kind == .Import) {
+        self.report_error("Import declaration can't have any attributes");
+      } else if (declaration.kind == .Implementation) {
+        self.report_error("Implementation block can't have any attributes");
+      }
+    }
+    declaration.attributes = attributes;
+
+    return declaration;
+  }
+
+  /**
+  * Parses a set of attributes.
+  *
+  * @return The parsed attribute set.
+  */
+  private proc parse_attributes() -> Attributes {
+    attributes: Attributes;
+    for (self.lexer.match_token(.At)) {
+      attribute := self.parse_attribute();
+      array_aosoa_add(&attributes.attributes, attribute);
+    }
+    return attributes;
+  }
+
+  /**
+  * Parses a single attribute.
+  *
+  * @return The parsed attribute.
+  */
+  private proc parse_attribute() -> Attribute {
+    position := self.get_current_position();
+    kind := self.parse_attribute_kind();
+
+    arguments: aosoa[dynamic]Attribute_Argument;
+    if (self.lexer.match_token(.Left_Parentheses)) {
+      for (!self.lexer.is_token(.Right_Parentheses)) {
+        array_aosoa_add(&arguments, self.parse_attribute_argument());
+        if (!self.lexer.match_token(.Comma)) {
+          break;
+        }
+      }
+      self.lexer.expect_token(.Right_Parentheses);
+    }
+
+    return {kind, position, arguments};
+  }
+
+  /**
+  * Parses a single attribute argument.
+  *
+  * @return The parsed attribute argument.
+  */
+  private proc parse_attribute_argument() -> Attribute_Argument {
+    position := self.get_current_position();
+    expression := self.parse_expression();
+
+    name: string;
+    if (self.lexer.match_token(.Assign)) {
+      if (expression.kind != .Name) {
+        self.report_error("Left operand of '=' in attribute argument must be a name");
+      }
+
+      expression_name := cast(*Expression_Name) expression;
+      name = expression_name.name;
+      // No destroying of 'expression' necessary here because we have a dedicated AST allocator.
+      expression = self.parse_expression();
+    }
+
+    return {position, name, expression};
+  }
+
+  /**
+  * Parses an optional declaration.
+  *
+  * @return The parsed declaration or null if none could be parsed.
+  */
+  private proc parse_declaration_optional() -> *Declaration {
+    if (self.lexer.match_token(.Keyword_Public)) {
+      return self.parse_declaration_base(.Public);
+    } else if (self.lexer.match_token(.Keyword_Internal)) {
+      return self.parse_declaration_base(.Internal);
+    } else if (self.lexer.match_token(.Keyword_Private)) {
+      return self.parse_declaration_base(.Private);
+    } else {
+      position := self.get_current_position();
+
+      if (self.lexer.match_token(.Keyword_Import)) {
+        return self.parse_declaration_import(position);
+      } else if (self.lexer.match_token(.Keyword_Implement)) {
+        return self.parse_declaration_implementation(position);
+      } else if (self.lexer.match_token(.Pound)) {
+        return self.parse_declaration_directive(position);
+      } else {
+        return self.parse_declaration_base(.Declaration_Default);
+      }
+    }
+  }
+
+  /**
+  * Parses a base declaration.
+  *
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed base declaration.
+  */
+  private proc parse_declaration_base(access_modifier: Access_Modifier) -> *Declaration {
+    position := self.get_current_position();
+
+    if (self.lexer.match_token(.Keyword_Const)) {
+      return self.parse_declaration_constant(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Global)) {
+      return self.parse_declaration_global(position, access_modifier, {});
+    } else if (self.lexer.match_token(.Keyword_Enum)) {
+      return self.parse_declaration_enumeration(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Struct)) {
+      return self.parse_declaration_struct(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Union)) {
+      return self.parse_declaration_union(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Proc)) {
+      return self.parse_declaration_routine(position, access_modifier, .Procedure, {});
+    } else if (self.lexer.match_token(.Keyword_Func)) {
+      return self.parse_declaration_routine(position, access_modifier, .Function, {});
+    } else if (self.lexer.match_token(.Keyword_Pure)) {
+      self.lexer.expect_token(.Keyword_Func);
+      return self.parse_declaration_routine(position, access_modifier, .Function, .Routine_Is_Pure_Function);
+    } else if (self.lexer.match_token(.Keyword_Extern)) {
+      return self.parse_declaration_extern(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Interface)) {
+      return self.parse_declaration_interface(position, access_modifier);
+    } else if (self.lexer.match_token(.Keyword_Type_Alias)) {
+      return self.parse_declaration_type_alias(position, access_modifier);
+    }  else if (self.lexer.match_token(.Keyword_Type_Define)) {
+      return self.parse_declaration_type_define(position, access_modifier);
+    }
+
+    return null;
+  }
+  
+  /**
+  * Parses an import declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed import declaration.
+  */
+  private proc parse_declaration_import(position: Source_Position) -> *Declaration {
+    alias: string;
+    import_in_scope := false;
+    flags: Declaration_Flags;
+    if (self.lexer.is_token(.Name)) {
+      alias = self.parse_name();
+    } else if (self.lexer.is_token(.Multiply)) {
+      import_in_scope = true;
+      self.lexer.expect_token(.Multiply);
+    } else if (self.lexer.match_token(.Keyword_Extern)) {
+      set_flag(&flags, .Extern);
+    }
+
+    name := self.lexer.token.value.(string);
+    self.lexer.expect_token(.String);
+
+    return ast_declaration_make_import(position, name, flags, alias, import_in_scope);
+  }
+
+  /**
+  * Parses a constant declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed constant declaration.
+  */
+  private proc parse_declaration_constant(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    type: *Type_Specification;
+    if (self.lexer.match_token(.Colon)) {
+      type = self.parse_type();
+      self.lexer.expect_token(.Assign);
+    } else {
+      self.lexer.expect_token(.Colon_Assign);
+    }
+    expression := self.parse_expression();
+    self.lexer.expect_token(.Semicolon);
+    return ast_declaration_make_constant(position, access_modifier, name, type, expression);
+  }
+
+  /**
+  * Parses a global declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @param flags           The flags of the global declaration.
+  * @return The parsed global declaration.
+  */
+  private proc parse_declaration_global(position: Source_Position, access_modifier: Access_Modifier, flags: Declaration_Flags) -> *Declaration {
+    name := self.parse_name();
+    if (self.lexer.match_token(.Colon_Assign)) {
+      expression := self.parse_expression();
+      self.lexer.expect_token(.Semicolon);
+      return ast_declaration_make_global(position, access_modifier, name, flags, null, expression);
+    } else if (self.lexer.match_token(.Colon)) {
+      type := self.parse_type();
+      expression: *Expression;
+      if (self.lexer.match_token(.Assign)) {
+        expression = self.parse_expression();
+      }
+      self.lexer.expect_token(.Semicolon);
+      return ast_declaration_make_global(position, access_modifier, name, flags, type, expression);
+    }
+
+    self.report_error("Expected ':' or ':=' after global. Got '%'", self.lexer.get_token_info());
+    return null;
+  }
+
+  /**
+  * Parses an enumeration declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed enumeration declaration.
+  */
+  private proc parse_declaration_enumeration(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    type: *Type_Specification;
+    if (self.lexer.match_token(.Colon)) {
+      type = self.parse_type();
+    }
+
+    self.lexer.expect_token(.Left_Brace);
+    items: aosoa[dynamic]Declaration_Enumeration_Item;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      array_aosoa_add(&items, self.parse_declaration_enumeration_item());
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Brace);
+
+    return ast_declaration_make_enumeration(position, access_modifier, name, type, items);
+  }
+
+  /**
+  * Parses an enumeration declaration item.
+  *
+  * @return The parsed enumeration declaration item.
+  */
+  private proc parse_declaration_enumeration_item() -> Declaration_Enumeration_Item {
+    position := self.get_current_position();
+    name := self.parse_name();
+    initializer: *Expression;
+    if (self.lexer.match_token(.Assign)) {
+      initializer = self.parse_expression();
+    }
+    return {position, name, initializer};
+  }
+
+  /**
+  * Parses a struct declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed struct declaration.
+  */
+  private proc parse_declaration_struct(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    generic_type_names, has_generic_type_names := self.parse_declaration_generic_type_names();
+    flags: Declaration_Flags = has_generic_type_names ? .Generic : {};
+
+    self.lexer.expect_token(.Left_Brace);
+    fields: aosoa[dynamic]Declaration_Struct_Field;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      array_aosoa_add(&fields, self.parse_declaration_struct_field());
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Brace);
+
+    return ast_declaration_make_struct(position, access_modifier, name, flags, fields, generic_type_names);
+  }
+
+  /**
+  * Parses a struct declaration field.
+  *
+  * @return The parsed struct declaration field.
+  */
+  private proc parse_declaration_struct_field() -> Declaration_Struct_Field {
+    position := self.get_current_position();
+    access_modifier := self.pasrse_access_modifier(.Member_Unspecified);
+    is_composite := self.lexer.match_token(.Keyword_Composite);
+    name := self.parse_name();
+    self.lexer.expect_token(.Colon);
+    type := self.parse_type();
+    return {position, access_modifier, is_composite, name, type};
+  }
+
+  /**
+  * Parses a union declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed union declaration.
+  */
+  private proc parse_declaration_union(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+
+    self.lexer.expect_token(.Left_Brace);
+    types: [dynamic]*Type_Specification;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      array_add(&types, self.parse_type());
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Brace);
+
+    return ast_declaration_make_union(position, access_modifier, name, types);
+  }
+
+  /**
+  * Parses a routine declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @param kind            The kind of the routine declaration.
+  * @param flags           The flags of the routine declaration.
+  * @return The parsed routine declaration.
+  */
+  private proc parse_declaration_routine(
+    position: Source_Position,
+    access_modifier: Access_Modifier,
+    kind: Declaration_Kind,
+    flags: Declaration_Flags
+  ) -> *Declaration {
+    assert(kind == .Procedure || kind == .Function);
+
+    flags := flags;
+    calling_convention := self.parse_calling_convention(has_flag(flags, .Extern) ? .C : .Nox);
+    name := self.parse_name();
+    generic_type_names, has_generic_type_names := self.parse_declaration_generic_type_names();
+    if (has_generic_type_names) then set_flag(&flags, .Generic);
+
+    parameters: aosoa[dynamic]Declaration_Routine_Parameter;
+    has_params := false;
+    has_c_varargs := false;
+    last_was_default_parameter := false;
+
+    self.lexer.expect_token(.Left_Parentheses);
+    for (!self.lexer.is_token(.Right_Parentheses)) {
+      if (has_params) {
+        self.report_error("Parameter marked with 'params' has to be the last parameter in a routine");
+      }
+      if (has_c_varargs) {
+        self.report_error("C varargs have to be the last parameter in a routine");
+      }
+
+      parameter, parameter_is_params, parameter_is_c_varargs := self.parse_declaration_routine_parameter();
+      if (last_was_default_parameter && parameter.initializer == null) {
+        self.report_error_position(parameter.position, "Non-default routine parameters cannot be declared after default parameters");
+      }
+      last_was_default_parameter = parameter.initializer != null;
+
+      has_params = parameter_is_params;
+      has_c_varargs = parameter_is_c_varargs;
+      if (!parameter_is_c_varargs) {
+        array_aosoa_add(&parameters, parameter);
+      }
+
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Parentheses);
+
+    if (has_params) {
+      set_flag(&flags, .Routine_Has_Params);
+    } else if (has_c_varargs) {
+      set_flag(&flags, .Routine_Has_C_Varargs);
+    }
+
+    return_type: *Type_Specification;
+    if (self.lexer.match_token(.Arrow)) {
+      return_type = self.parse_type();
+    }
+
+    generic_constraints: aosoa[dynamic]Declaration_Routine_Generic_Constraint;
+    if (has_generic_type_names) {
+      for (self.lexer.match_token(.Keyword_Where)) {
+        position := self.get_current_position();
+
+        constraint_kind: Declaration_Routine_Generic_Constraint_Kind;
+        constraint_value: Declaration_Routine_Generic_Constraint_Value;
+        if (self.lexer.match_token(.Left_Parentheses)) {
+          expression := self.parse_expression();
+          self.lexer.expect_token(.Right_Parentheses);
+
+          constraint_kind = .Expression;
+          constraint_value = Declaration_Routine_Generic_Constraint_Expression{expression};
+        } else {
+          generic_type_name := self.parse_name();
+          self.lexer.expect_token(.Colon);
+          type := self.parse_type();
+
+          constraint_kind = .Interface;
+          constraint_value = Declaration_Routine_Generic_Constraint_Interface{generic_type_name, type};
+        }
+        
+        constraint := Declaration_Routine_Generic_Constraint{position, constraint_kind, constraint_value};
+        array_aosoa_add(&generic_constraints, constraint);
+      }
+    } else if (self.lexer.is_token(.Keyword_Where)) {
+      self.report_error("Routine with no generic type parameters can not have generic constraints");
+    }
+
+    block: Statement_Block;
+    if (self.lexer.is_token(.Left_Brace)) {
+      block = self.parse_statement_block();
+      set_flag(&flags, .Routine_Has_Block);
+    }
+
+    return ast_declaration_make_routine(
+      kind,
+      position,
+      access_modifier,
+      name,
+      flags,
+      calling_convention,
+      generic_type_names,
+      parameters,
+      return_type,
+      generic_constraints,
+      block
+    );
+  }
+
+
+  /**
+  * Parses a routine declaration parameter.
+  *
+  * @return 1. The parsed routine declaration parameter; 2. True if the parameter is params otherwise false; 3. True if the parameter is c varargs otherwise false.
+  */
+  private proc parse_declaration_routine_parameter() -> (Declaration_Routine_Parameter, bool, bool) {
+    position := self.get_current_position();
+    name: string;
+    type: *Type_Specification;
+    is_params := false;
+    is_c_varags := false;
+    initializer: *Expression;
+    if (self.lexer.match_token(.Ellipsis)) {
+      is_c_varags = true;
+    } else {
+      if (self.lexer.match_token(.Keyword_Params)) {
+        is_params = true;
+      }
+
+      name = self.parse_name();
+      self.lexer.expect_token(.Colon);
+      type = self.parse_type();
+
+      if (!is_params && self.lexer.match_token(.Assign)) {
+        initializer = self.parse_expression();
+      }
+    }
+
+    return {{position, name, type, initializer}, is_params, is_c_varags};
+  }
+
+  /**
+  * Parses an interface declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed interface declaration.
+  */
+  private proc parse_declaration_interface(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    methods := self.parse_declaration_method_block();
+    return ast_declaration_make_interface(position, access_modifier, name, methods);
+  }
+
+
+  /**
+  * Parses an implementation declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed implementation declaration.
+  */
+  private proc parse_declaration_implementation(position: Source_Position) -> *Declaration {
+    interface_type: *Type_Specification;
+    implementation_type := self.parse_type();
+    if (self.lexer.match_token(.Keyword_For)) {
+      interface_type = implementation_type;
+      implementation_type = self.parse_type();
+    }
+    methods := self.parse_declaration_method_block();
+    return ast_declaration_make_implementation(position, interface_type, implementation_type, methods);
+  }
+
+  /**
+  * Parses method declarations.
+  *
+  * @return The parsed method declarations.
+  */
+  private proc parse_declaration_method_block() -> [dynamic]*Declaration {
+    self.lexer.expect_token(.Left_Brace);
+    methods: [dynamic]*Declaration;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      attributes := self.parse_attributes();
+      access_modifier := self.pasrse_access_modifier(.Declaration_Default);
+      position := self.get_current_position();
+
+      if (self.lexer.is_token(.Keyword_Proc) || self.lexer.is_token(.Keyword_Func)) {
+        is_procedure := self.lexer.is_token(.Keyword_Proc);
+        self.lexer.get_next_token();
+
+        method := self.parse_declaration_routine(position, access_modifier, is_procedure ? .Procedure : .Function, {});
+        method.attributes = attributes;
+        array_add(&methods, method);
+      } else {
+        if (self.lexer.is_token(.Keyword_Pure)) {
+          self.report_error("Pure functions are not allowed as methods");
+        } else {
+          self.report_error("Expected 'proc' or 'func' declaration. Got '%'", self.lexer.get_token_info());
+        }
+      }
+    }
+    self.lexer.expect_token(.Right_Brace);
+
+    return methods;
+  }
+
+  /**
+  * Parses a type alias declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed type alias declaration.
+  */
+  private proc parse_declaration_type_alias(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    generic_type_names, has_generic_type_names := self.parse_declaration_generic_type_names();
+    flags: Declaration_Flags = has_generic_type_names ? .Generic : {};
+    self.lexer.expect_token(.Colon_Assign);
+    type := self.parse_type();
+    self.lexer.expect_token(.Semicolon);
+
+    return ast_declaration_make_type_alias(position, access_modifier, name, flags, type, generic_type_names);
+  }
+
+  /**
+  * Parses a type define declaration.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed type define declaration.
+  */
+  private proc parse_declaration_type_define(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    name := self.parse_name();
+    self.lexer.expect_token(.Colon_Assign);
+    type := self.parse_type();
+    self.lexer.expect_token(.Semicolon);
+
+    return ast_declaration_make_type_define(position, access_modifier, name, type);
+  }
+
+  /**
+  * Parses a declaration marked extern.
+  *
+  * @param position        The source position of the declaration.
+  * @param access_modifier The access modifier of the declaration.
+  * @return The parsed declaration marked extern.
+  */
+  private proc parse_declaration_extern(position: Source_Position, access_modifier: Access_Modifier) -> *Declaration {
+    if (self.lexer.match_token(.Keyword_Global)) {
+      return self.parse_declaration_global(position, access_modifier, .Extern);
+    } else if (self.lexer.match_token(.Keyword_Proc)) {
+      return self.parse_declaration_routine(position, access_modifier, .Procedure, .Extern);
+    }
+
+    self.report_error("Expected 'global' or 'proc' after 'extern'. Got '%'", self.lexer.get_token_info());
+    return null;
+  }
+
+  /**
+  * Parses a directive declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed directive declaration.
+  */
+  private proc parse_declaration_directive(position: Source_Position) -> *Declaration {
+    name := self.lexer.token.value.(string);
+    if (self.lexer.is_token(.Name)) {
+      self.lexer.expect_token(.Name);
+    } else {
+      self.lexer.expect_token(.Keyword_If);
+    }
+
+    if (name == DECLARATION_DIRECTIVE_STATIC_ASSERT) {
+      return self.parse_declaration_directive_assert(position);
+    } else if (name == DECLARATION_DIRECTIVE_STATIC_IF) {
+      return self.parse_declaration_directive_if(position);
+    } else if (name == DECLARATION_DIRECTIVE_EXPAND_CONTEXT) {
+      return self.parse_declaration_directive_expand_context(position);
+    }
+
+    self.report_error("Unknown directive '%'", name);
+    return null;
+  }
+
+  /**
+  * Parses an assert directive declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed assert directive declaration.
+  */
+  private proc parse_declaration_directive_assert(position: Source_Position) -> *Declaration {
+    expression := self.parse_expression_parenthesized();
+    return ast_declaration_make_directive_assert(position, expression);
+  }
+
+  /**
+  * Parses an if directive declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed if directive declaration.
+  */
+  private proc parse_declaration_directive_if(position: Source_Position) -> *Declaration {
+    condition := self.parse_expression_parenthesized();
+    then_declarations := self.parse_declaration_directive_if_block();
+
+    else_ifs: aosoa[dynamic]Declaration_Directive_If_Else;
+    else_declarations: [dynamic]*Declaration;
+    for (self.lexer.match_token(.Keyword_Else)) {
+      if (self.lexer.match_token(.Pound) && self.lexer.match_token(.Keyword_If)) {
+        else_if_condition := self.parse_expression_parenthesized();
+        else_if_declarations := self.parse_declaration_directive_if_block();
+        else_if := Declaration_Directive_If_Else{else_if_condition, else_if_declarations};
+        array_aosoa_add(&else_ifs, else_if);
+      } else {
+        else_declarations = self.parse_declaration_directive_if_block();
+        break;
+      }
+    }
+
+    return ast_declaration_make_directive_if(position, condition, then_declarations, else_ifs, else_declarations);
+  }
+
+  /**
+  * Parses an if directive declaration block.
+  *
+  * @return The parsed if directive declaration block.
+  */
+  private proc parse_declaration_directive_if_block() -> [dynamic]*Declaration {
+    self.lexer.expect_token(.Left_Brace);
+    declarations: [dynamic]*Declaration;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      array_add(&declarations, self.parse_declaration());
+    }
+    self.lexer.expect_token(.Right_Brace);
+    return declarations;
+  }
+
+  /** 
+  * Parses an expand context directive declaration.
+  *
+  * @param position The source position of the declaration.
+  * @return The parsed expand context directive declaration.
+  */
+  private proc parse_declaration_directive_expand_context(position: Source_Position) -> *Declaration {
+    self.lexer.expect_token(.Left_Parentheses);
+    field_name := self.parse_name();
+    self.lexer.expect_token(.Comma);
+    field_type := self.parse_type();
+    self.lexer.expect_token(.Right_Parentheses);
+    return ast_declaration_make_directive_expand_context(position, field_name, field_type);
+  }
+
+  /**
+  * Parses generic type name declarations.
+  *
+  * @param position The source position of the generic type names.
+  * @return 1. The parsed generic type name declarations; 2. True if generic type names where present otherwise false.
+  */
+  private proc parse_declaration_generic_type_names() -> ([dynamic]string, bool) {
+    has_generic_type_names := false;
+    generic_type_names: [dynamic]string;
+    if (self.lexer.match_token(.Not)) {
+      if (self.lexer.match_token(.Left_Parentheses)) {
+        for (!self.lexer.is_token(.Right_Parentheses)) {
+          array_add(&generic_type_names, self.parse_name());
+          if (!self.lexer.match_token(.Comma)) {
+            break;
+          }
+        } 
+        self.lexer.expect_token(.Right_Parentheses);
+
+        if (length(generic_type_names) == 0) {
+          self.report_error("Expected at least one generic type name");
+        }
+
+        has_generic_type_names = true;
+      }
+    }
+    return {generic_type_names, has_generic_type_names};
+  }
+
+  /**
+  * Parses a type specification.
+  *
+  * @return The parsed type specification.
+  */
+  private proc parse_type() -> *Type_Specification {
+    position := self.get_current_position();
+
+    if (self.lexer.is_token(.Name)) {
+      return self.parse_type_name(position);
+    } else if (self.lexer.match_token(.Left_Bracket)) {
+      return self.parse_type_array_or_slice(position, .None);
+    } else if (self.lexer.match_token(.Keyword_SoA)) {
+      if (self.lexer.is_token(.Multiply)) {
+        return self.parse_type_pointer(position, .SoA_Layout);
+      } else {
+        return self.parse_type_array_or_slice(position, .SoA);
+      }
+    } else if (self.lexer.match_token(.Keyword_AoSoA)) {
+      if (self.lexer.is_token(.Multiply)) {
+        return self.parse_type_pointer(position, .AoSoA_Layout);
+      } else {
+        return self.parse_type_array_or_slice(position, .AoSoA);
+      }
+    } else if (self.lexer.match_token(.Keyword_Map)) {
+      return self.parse_type_map(position);
+    } else if (self.lexer.match_token(.Multiply)) {
+      return self.parse_type_pointer(position, .Absolute);
+    } else if (self.lexer.match_token(.Negate)) {
+      return self.parse_type_pointer(position, .Self_Relative);
+    } else if (self.lexer.match_token(.Xor)) {
+      return self.parse_type_pointer(position, .Offset_Relative);
+    } else if (self.lexer.match_token(.Keyword_Dynamic)) {
+      return self.parse_type_pointer(position, .Dynamic);
+    } else if (self.lexer.match_token(.Left_Parentheses)) {
+      type := self.parse_type();
+      if (self.lexer.is_token(.Comma)) {
+        type = self.parse_type_tuple(position, type);
+      } else {
+        self.lexer.expect_token(.Right_Parentheses);
+      }
+      return type;
+    } else if (self.lexer.match_token(.Keyword_Proc)) {
+      return self.parse_type_routine(position, .Procedure, false);
+    } else if (self.lexer.match_token(.Keyword_Func)) {
+      return self.parse_type_routine(position, .Function, false);
+    } else if (self.lexer.match_token(.Keyword_Pure)) {
+      self.lexer.expect_token(.Keyword_Func);
+      return self.parse_type_routine(position, .Function, true);
+    }
+
+    self.report_error("Unexpected token '%' in type", self.lexer.get_token_info());
+    return null;
+  }
+
+  /**
+  * Parses a name type specification.
+  *
+  * @param position The source position of the type specification.
+  * @return The parsed name type specification.
+  */
+  private proc parse_type_name(position: Source_Position) -> *Type_Specification {
+    package_name := "";
+    name := self.parse_name();
+    if (self.lexer.match_token(.Dot)) {
+      package_name = name;
+      name = self.parse_name();
+    }
+    generic_types := self.parse_generic_types();
+    
+    return ast_type_specification_make_name(position, package_name, name, generic_types);
+  }
+
+  /**
+  * Parses an array or slice type specification.
+  *
+  * @param position        The source position of the type specification.
+  * @param layout_modifier The layout modifier of the type specification.
+  * @return The parsed array or slice type specification.
+  */
+  private proc parse_type_array_or_slice(position: Source_Position, layout_modifier: Layout_Modifier) -> *Type_Specification {
+    if (layout_modifier != .None) {
+      self.lexer.expect_token(.Left_Bracket);
+    }
+
+    is_array := true;
+    array_kind := Type_Specification_Array_Kind.Fixed;
+    size: *Expression;
+    if (self.lexer.match_token(.Ellipsis)) {
+      is_array = true;
+      array_kind = .Fixed;
+    } else if (self.lexer.match_token(.Keyword_Dynamic)) {
+      is_array = true;
+      array_kind = .Dynamic;
+    } else {
+      if (self.lexer.is_token(.Right_Bracket)) {
+        is_array = false;
+      } else {
+        is_array = true;
+        array_kind = .Fixed;
+        size = self.parse_expression();
+      }
+    }
+    self.lexer.expect_token(.Right_Bracket);
+    base := self.parse_type();
+
+    if (is_array) {
+      return ast_type_specification_make_array(position, array_kind, layout_modifier, base, size);
+    } else {
+      return ast_type_specification_make_slice(position, layout_modifier, base);
+    }
+  }
+
+  /**
+  * Parses a map type specification.
+  *
+  * @param position The source position of the type specification.
+  * @return The parsed map type specification.
+  */
+  private proc parse_type_map(position: Source_Position) -> *Type_Specification {
+    self.lexer.expect_token(.Left_Bracket);
+    key := self.parse_type();
+    self.lexer.expect_token(.Right_Bracket);
+    value := self.parse_type();
+
+    return ast_type_specification_make_map(position, key, value);
+  }
+
+  /**
+  * Parses a pointer type specification.
+  *
+  * @param position The source position of the type specification.
+  * @param kind     The pointer kind of the type specification.
+  * @return The parsed pointer type specification.
+  */
+  private proc parse_type_pointer(position: Source_Position, pointer_kind: Type_Specification_Pointer_Kind) -> *Type_Specification {
+    relative_base: *Type_Specification;
+    if (pointer_kind != .Absolute) {
+      if ((pointer_kind == .Self_Relative || pointer_kind == .Offset_Relative)) {
+        if (!self.lexer.is_token(.Multiply)) {
+          relative_base = self.parse_type();
+        }
+      }
+      self.lexer.expect_token(.Multiply);
+    }
+
+    base := self.parse_type();
+    return ast_type_specification_make_pointer(position, pointer_kind, base, relative_base);
+  }
+
+  /**
+  * Parses a tuple specification.
+  *
+  * @param position      The source position of the type specification.
+  * @param first_element The first element of the tuple type specification.
+  * @return The parsed tuple specification.
+  */
+  private proc parse_type_tuple(position: Source_Position, first_element: *Type_Specification) -> *Type_Specification {
+    elements: [dynamic]*Type_Specification;
+    array_add(&elements, first_element);
+    for (self.lexer.match_token(.Comma)) {
+      element := self.parse_type();
+      array_add(&elements, element);
+    }
+    self.lexer.expect_token(.Right_Parentheses);
+
+    return ast_type_specification_make_tuple(position, elements);
+  }
+
+  /**
+  * Parses a routine type specification.
+  *
+  * @param position The source position of the type specification.
+  * @param kind     The kind of the routine type specification.
+  * @param is_pure  Is the routine type specification a pure function?
+  * @return The parsed routine type specification.
+  */
+  private proc parse_type_routine(position: Source_Position, kind: Type_Specification_Kind, is_pure: bool) -> *Type_Specification {
+    assert(kind == .Procedure || kind == .Function);
+
+    calling_convention := self.parse_calling_convention(.Nox);
+
+    parameters: [dynamic]*Type_Specification;
+    has_params := false;
+    has_c_varargs := false;
+
+    self.lexer.expect_token(.Left_Parentheses);
+    for (!self.lexer.is_token(.Right_Parentheses)) {
+      if (has_c_varargs) {
+        self.report_error("C varargs have to be the last parameter in a routine");
+      }
+      if (has_params) {
+        self.report_error("Parameter marked with 'params' has to be the last parameter in a routine");
+      }
+
+      parameter, parameter_is_params, parameter_is_c_varargs := self.parse_type_routine_parameter();
+      has_params = parameter_is_params;
+      has_c_varargs = parameter_is_c_varargs;
+      if (!parameter_is_c_varargs) {
+        array_add(&parameters, parameter);
+      }
+
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Parentheses);
+
+    return_type: *Type_Specification;
+    if (self.lexer.match_token(.Arrow)) {
+      return_type = self.parse_type();
+    }
+
+    return ast_type_specification_make_routine(kind, position, calling_convention, parameters, has_params, has_c_varargs, return_type, is_pure);
+  }
+
+  /**
+  * Parses a routine type specification parameter.
+  *
+  * @return 1. The parsed routine specification parameter; 2. True if the parameter is params otherwise false; 3. True if the parameter is c varargs otherwise false.
+  */
+  private proc parse_type_routine_parameter() -> (*Type_Specification, bool, bool) {
+    type: *Type_Specification;
+    is_params := false;
+    is_c_varags := false;
+    if (self.lexer.match_token(.Ellipsis)) {
+      is_c_varags = true;
+    } else {
+      if (self.lexer.match_token(.Keyword_Params)) {
+        is_params = true;
+      }
+
+      type = self.parse_type();
+      if (self.lexer.match_token(.Colon)) {
+        if (type.kind != .Name) {
+          self.report_error("Colons in parameters of procedure types must be preceded by a name");
+        }
+
+        if (self.lexer.match_token(.Keyword_Params)) {
+          is_params = true;
+        }
+        // No destroying of 'type' necessary here because we have a dedicated AST allocator.
+        type = self.parse_type();
+      }
+    }
+
+    return {type, is_params, is_c_varags};
+  }
+
+  /**
+  * Parses a statement.
+  *
+  * @return The parsed statement.
+  */
+  private proc parse_statement() -> *Statement {
+    // We skip every standalone semicolon as a statement.
+    for (self.lexer.match_token(.Semicolon)) {}
+
+    position := self.get_current_position();
+
+    if (self.lexer.match_token(.Keyword_Return)) {
+      return self.parse_statement_return(position);
+    } else if (self.lexer.match_token(.Keyword_Break)) {
+      return self.parse_statement_break(position);
+    } else if (self.lexer.match_token(.Keyword_Continue)) {
+      return self.parse_statement_continue(position);
+    } else if (self.lexer.match_token(.Keyword_Fallthrough)) {
+      return self.parse_statement_fallthrough(position);
+    } else if (self.lexer.match_token(.Keyword_Defer)) {
+      return self.parse_statement_defer(position);
+    } else if (self.lexer.match_token(.Keyword_Push_Context)) {
+      return self.parse_statement_push_context(position);
+    } else if (self.lexer.match_token(.Keyword_If)) {
+      return self.parse_statement_if(position, false);
+    } else if (self.lexer.match_token(.Keyword_For)) {
+      return self.parse_statement_for(position);
+    } else if (self.lexer.match_token(.Keyword_Foreach)) {
+      return self.parse_statement_foreach(position);
+    } else if (self.lexer.match_token(.Keyword_Switch)) {
+      return self.parse_statement_switch(position);
+    } else if (self.lexer.is_token(.Left_Brace)) {
+      return ast_statement_make_scope(position, self.parse_statement_block());
+    } else if (self.lexer.match_token(.Pound)) {
+      if (self.lexer.match_token(.Keyword_If)) {
+        return self.parse_statement_if(position, true);
+      } else {
+        name := self.parse_name();
+        self.report_error("Unknown directive '%'", name);
+        return null;
+      }
+    } else {
+      statement := self.parse_statement_simple();
+      self.lexer.expect_token(.Semicolon);
+      return statement;
+    }
+  }
+
+  /**
+  * Parses a return statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed return statement.
+  */
+  private proc parse_statement_return(position: Source_Position) -> *Statement {
+    expression: *Expression;
+    if (!self.lexer.is_token(.Semicolon)) {
+      expression = self.parse_expression();
+    }
+    self.lexer.expect_token(.Semicolon);
+    return ast_statement_make_return(position, expression);
+  }
+
+  /**
+  * Parses a break statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed break statement.
+  */
+  private proc parse_statement_break(position: Source_Position) -> *Statement {
+    self.lexer.expect_token(.Semicolon);
+    return ast_statement_make_break(position);
+  }
+
+  /**
+  * Parses a continue statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed continue statement.
+  */
+  private proc parse_statement_continue(position: Source_Position) -> *Statement {
+    self.lexer.expect_token(.Semicolon);
+    return ast_statement_make_continue(position);
+  }
+
+  /**
+  * Parses a fallthrough statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed fallthrough statement.
+  */
+  private proc parse_statement_fallthrough(position: Source_Position) -> *Statement {
+    self.lexer.expect_token(.Semicolon);
+    return ast_statement_make_fallthrough(position);
+  }
+
+  /**
+  * Parses a defer statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed defer statement.
+  */
+  private proc parse_statement_defer(position: Source_Position) -> *Statement {
+    statement := self.parse_statement();
+    return ast_statement_make_defer(position, statement);
+  }
+
+  /**
+  * Parses a push context statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed push context statement.
+  */
+  private proc parse_statement_push_context(position: Source_Position) -> *Statement {
+    expression := self.parse_expression_parenthesized();
+    block := self.parse_statement_block();
+    return ast_statement_make_push_context(position, expression, block);
+  }
+
+  /**
+  * Parses an if statement.
+  *
+  * @param position  The source position of the statement.
+  * @param is_static Is the if statement static?
+  * @return The parsed if statement.
+  */
+  private proc parse_statement_if(position: Source_Position, is_static: bool) -> *Statement {
+    condition := self.parse_expression_parenthesized();
+
+    then_block: Statement_Block;
+    else_block: Statement_Block;
+    else_ifs: soa[dynamic]Statement_If_Else;
+    if (self.lexer.match_token(.Keyword_Then)) {
+      then_block.start_position = self.get_current_position();
+      array_add(&then_block.statements, self.parse_statement());
+      then_block.end_position = self.get_current_position();
+    } else {
+      then_block = self.parse_statement_block();
+      for (self.lexer.match_token(.Keyword_Else)) {
+        if ((is_static && self.lexer.match_token(.Pound) && self.lexer.match_token(.Keyword_If)) || (!is_static && self.lexer.match_token(.Keyword_If))) {
+          else_if_condition := self.parse_expression_parenthesized();
+          else_if_block := self.parse_statement_block();
+          else_if := Statement_If_Else{else_if_condition, else_if_block};
+          array_soa_add(&else_ifs, else_if);
+        } else {
+          else_block = self.parse_statement_block();
+          break;
+        }
+      }
+    }
+
+    return ast_statement_make_if(is_static ? .Static_If : .If, position, condition, then_block, else_ifs, else_block);
+  }
+
+  /**
+  * Parses a for statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed for statement.
+  */
+  private proc parse_statement_for(position: Source_Position) -> *Statement {
+    if (self.lexer.match_token(.Left_Parentheses)) {
+      if (self.lexer.is_token(.Semicolon)) {
+        return self.parse_statement_for_statements(position, null);
+      } else {
+        statement := self.parse_statement_simple();
+
+        if (statement.kind == .Expression) {
+          // This is a loop with a simple condition.
+          self.lexer.expect_token(.Right_Parentheses);
+          condition := cast(*Expression) (cast(*Statement_Expression) statement).expression;
+          return ast_statement_make_for(position, null, condition, null, self.parse_statement_block());
+        } else {
+          assert(statement.kind == .Initialize || statement.kind == .Assign);
+          return self.parse_statement_for_statements(position, statement);
+        }
+      }
+    } else {
+      // Here we know we have an empty loop, meaning an endless one.
+      return ast_statement_make_for(position, null, null, null, self.parse_statement_block());
+    }
+  }
+
+  /**
+  * Parses a for statement with regular statements.
+  *
+  * @param position    The source position of the statement.
+  * @param initializer The initializer statement of the for statement.
+  * @return The parsed for statement.
+  */
+  private proc parse_statement_for_statements(position: Source_Position, initializer: *Statement) -> *Statement {
+    condition: *Expression;
+    next: *Statement;
+
+    if (self.lexer.match_token(.Semicolon)) {
+      if (!self.lexer.is_token(.Semicolon)) {
+        condition = self.parse_expression();
+      }
+      self.lexer.expect_token(.Semicolon);
+      if (!self.lexer.is_token(.Right_Parentheses)) {
+        next = self.parse_statement_simple();
+        if (next.kind == .Initialize) {
+          self.report_error("Initializer statement not allowed in for-statement's next clause");
+        }
+      }
+    }
+
+    self.lexer.expect_token(.Right_Parentheses);
+    return ast_statement_make_for(position, initializer, condition, next, self.parse_statement_block());
+  }
+
+  /**
+  * Parses a foreach statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed foreach statement.
+  */
+  private proc parse_statement_foreach(position: Source_Position) -> *Statement {
+    self.lexer.expect_token(.Left_Parentheses);
+    element_name := self.parse_name();
+    index_name: string;
+    if (self.lexer.match_token(.Comma)) {
+      index_name = self.parse_name();
+    }
+    self.lexer.expect_token(.Keyword_In);
+    collection := self.parse_expression();
+    self.lexer.expect_token(.Right_Parentheses);
+
+    block := self.parse_statement_block();
+
+    return ast_statement_make_foreach(position, element_name, index_name, collection, block);
+  }
+
+  /**
+  * Parses a switch statement.
+  *
+  * @param position The source position of the statement.
+  * @return The parsed switch statement.
+  */
+  private proc parse_statement_switch(position: Source_Position) -> *Statement {
+    expression := self.parse_expression_parenthesized();
+
+    cases: soa[dynamic]Statement_Switch_Case;
+    has_default_case := false;
+
+    self.lexer.expect_token(.Left_Brace);
+    for (!self.lexer.is_token(.Right_Brace)) {
+      switch_case, is_default := self.parse_statement_switch_case();
+      if (is_default) {
+        if (has_default_case) {
+          self.report_error_position(position, "Switch statement can't have multiple default cases");
+        }
+        has_default_case = true;
+      }
+      has_default_case = is_default;
+      array_soa_add(&cases, switch_case);
+    }
+    self.lexer.expect_token(.Right_Brace);
+
+    if (length(cases) == 0) {
+      self.report_warning_position(position, "Switch statement is empty");
+    }
+
+    return ast_statement_make_switch(position, expression, cases);
+  }
+
+  /**
+  * Parses a switch statement case.
+  *
+  * @return 1. The parsed switch statement case; 2. True if the case is the default case otherwise false.
+  */
+  private proc parse_statement_switch_case() -> (Statement_Switch_Case, bool) {
+    is_default := false;
+    patterns: [dynamic]*Expression;
+    block: Statement_Block;
+
+    self.lexer.expect_token(.Keyword_Case);
+    if (self.lexer.is_token(.Colon)) {
+      is_default = true;
+    } else {
+      array_add(&patterns, self.parse_expression());
+      for (self.lexer.match_token(.Comma)) {
+        array_add(&patterns, self.parse_expression());
+      }
+    }
+    self.lexer.expect_token(.Colon);
+
+    block.start_position = self.get_current_position();
+    for (!self.lexer.is_token(.Right_Brace) && !self.lexer.is_token(.Keyword_Case)) {
+      array_add(&block.statements, self.parse_statement());
+    }
+    block.end_position = self.get_current_position();
+
+    return {{patterns, block}, is_default};
+  }
+
+  /**
+  * Parses a statement block.
+  *
+  * @return The parsed statement block.
+  */
+  private proc parse_statement_block() -> Statement_Block {
+    start_position := self.get_current_position();
+    self.lexer.expect_token(.Left_Brace);
+    statements: [dynamic]*Statement;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      array_add(&statements, self.parse_statement());
+    }
+    end_position := self.get_current_position();
+    self.lexer.expect_token(.Right_Brace);
+
+    return {start_position, end_position, statements};
+  }
+
+  /**
+  * Parses a simple statement.
+  *
+  * @return The parsed simple statement.
+  */
+  private proc parse_statement_simple() -> *Statement {
+    position := self.get_current_position();
+    expression := self.parse_expression();
+
+    left_expressions: [dynamic]*Expression;
+    if (self.lexer.is_token(.Comma)) {
+      array_add(&left_expressions, expression);
+      for (self.lexer.match_token(.Comma)) {
+        array_add(&left_expressions, self.parse_expression());
+      }
+    }
+
+    statement := self.parse_statement_initialize(expression, left_expressions);
+    if (statement == null) {
+      if (self.lexer.is_assign_operator()) {
+        operator := self.lexer.token.kind;
+        self.lexer.get_next_token();
+        if (length(left_expressions) == 0) {
+          array_add(&left_expressions, expression);
+        }
+
+        statement = ast_statement_make_assign(position, operator, left_expressions, self.parse_expression());
+      } else {
+        statement = ast_statement_make_expression(position, expression);
+      }
+    }  else {
+      // No destroying of 'expressions' necessary here because we have a dedicated AST allocator.
+    }
+
+    return statement;
+  }
+
+  /**
+  * Parses an initialize statement.
+  *
+  * @param left_expression  The left expression of the initialize statement.
+  * @param left_expressions The left expressions of the initialize statement (Only filled if there are multiple).
+  * @return The parsed initialize statement.
+  */
+  private proc parse_statement_initialize(left_expression: *Expression, left_expressions: [dynamic]*Expression) -> *Statement {
+    names: [dynamic]string;
+    if (self.lexer.match_token(.Colon_Assign)) {
+      if (length(left_expressions) == 0) {
+        if (left_expression.kind != .Name) {
+          self.report_error("':=' must be preceded by a name");
+        }
+        name := (cast(*Expression_Name) left_expression).name;
+        array_add(&names, name);
+      } else {
+        foreach (expression in left_expressions) {
+          if (expression.kind != .Name) {
+            self.report_error("':=' must be preceded by a name");
+          }
+          name := (cast(*Expression_Name) expression).name;
+          array_add(&names, name);
+        }
+      }
+
+      return ast_statement_make_initialize(left_expression.position, names, null, self.parse_expression());
+    } else if (self.lexer.match_token(.Colon)) {
+      if (length(left_expressions) > 1) {
+        self.report_error("':' cannot be used with multiple names");
+      }
+      if (left_expression.kind != .Name) {
+        self.report_error("':' must be preceded by a name");
+      }
+
+      name := (cast(*Expression_Name) left_expression).name;
+      array_add(&names, name);
+
+      type := self.parse_type();
+
+      expression: *Expression;
+      if (self.lexer.match_token(.Assign)) {
+        expression = self.parse_expression();
+      }
+      return ast_statement_make_initialize(left_expression.position, names, type, expression);
+    } else {
+      return null;
+    }
+  }
+
+  /**
+  * Parses an expression.
+  *
+  * @return The parsed expression.
+  */
+  private proc parse_expression() -> *Expression {
+    return self.parse_expression_ternary();
+  }
+
+  /**
+  * Parses a parenthesized expression.
+  *
+  * @return The parsed parenthesized expression.
+  */
+  private proc parse_expression_parenthesized() -> *Expression {
+    self.lexer.expect_token(.Left_Parentheses);
+    expression := self.parse_expression();
+    self.lexer.expect_token(.Right_Parentheses);
+    return expression;
+  }
+
+  /**
+  * Parses a ternary expression.
+  *
+  * @return The parsed ternary expression.
+  */
+  private proc parse_expression_ternary() -> *Expression {
+    position := self.get_current_position();
+    expression := self.parse_expression_or();
+    if (self.lexer.match_token(.Question)) {
+      then_expression := self.parse_expression_ternary();
+      self.lexer.expect_token(.Colon);
+      else_expression := self.parse_expression_ternary();
+      expression = ast_expression_make_ternary(position, expression, then_expression, else_expression);
+    }
+    return expression;
+  }
+
+  /**
+  * Parses an or expression.
+  *
+  * @return The parsed or expression.
+  */
+  private proc parse_expression_or() -> *Expression {
+    expression := self.parse_expression_and();
+    for (self.lexer.match_token(.Or_Or)) {
+      position := self.get_current_position();
+      expression = ast_expression_make_binary(position, .Or_Or, expression, self.parse_expression_and());
+    }
+    return expression;
+  }
+
+  /**
+  * Parses an and expression.
+  *
+  * @return The parsed and expression.
+  */
+  private proc parse_expression_and() -> *Expression {
+    expression := self.parse_expression_comparison();
+    for (self.lexer.match_token(.And_And)) {
+      position := self.get_current_position();
+      expression = ast_expression_make_binary(position, .And_And, expression, self.parse_expression_comparison());
+    }
+    return expression;
+  }
+
+  /**
+  * Parses a comparison expression.
+  *
+  * @return The parsed comparison expression.
+  */
+  private proc parse_expression_comparison() -> *Expression {
+    expression := self.parse_expression_addition();
+    for (self.lexer.is_comparison_operator()) {
+      position := self.get_current_position();
+      operator := self.lexer.token.kind;
+      self.lexer.get_next_token();
+      expression = ast_expression_make_binary(position, operator, expression, self.parse_expression_addition());
+    }
+    return expression;
+  }
+
+  /** 
+  * Parses an addition expression.
+  *
+  * @return The parsed addition expression.
+  */
+  private proc parse_expression_addition() -> *Expression {
+    expression := self.parse_expression_multiplication();
+    for (self.lexer.is_additive_operator()) {
+      position := self.get_current_position();
+      operator := self.lexer.token.kind;
+      self.lexer.get_next_token();
+      expression = ast_expression_make_binary(position, operator, expression, self.parse_expression_multiplication());
+    }
+    return expression;
+  }
+
+  /**
+  * Parses a multiplication expression.
+  *
+  * @return The parsed multiplication expression.
+  */
+  private proc parse_expression_multiplication() -> *Expression {
+    expression := self.parse_expression_unary();
+    for (self.lexer.is_multiplicative_operator()) {
+      position := self.get_current_position();
+      operator := self.lexer.token.kind;
+      self.lexer.get_next_token();
+      expression = ast_expression_make_binary(position, operator, expression, self.parse_expression_unary());
+    }
+    return expression;
+  }
+
+  /**
+  * Parses a unary expression.
+  *
+  * @return The parsed unary expression.
+  */
+  private proc parse_expression_unary() -> *Expression {
+    if (self.lexer.is_unary_operator()) {
+      position := self.get_current_position();
+      operator := self.lexer.token.kind;
+      self.lexer.get_next_token();
+      if (operator == .Increment || operator == .Decrement) {
+        return ast_expression_make_modify(position, operator, false, self.parse_expression_unary());
+      } else {
+        return ast_expression_make_unary(position, operator, self.parse_expression_unary());
+      }
+    }
+
+    return self.parse_expression_base();
+  }
+
+  /**
+  * Parses a base expression.
+  *
+  * @return The parsed base expression.
+  */
+  private proc parse_expression_base() -> *Expression {
+    expression := self.parse_expression_operand();
+
+    for (self.lexer.is_token(.Left_Parentheses) ||
+      self.lexer.is_token(.Left_Bracket) ||
+      self.lexer.is_token(.Dot) ||
+      self.lexer.is_token(.Increment) ||
+      self.lexer.is_token(.Decrement)
+    ) {
+      position := self.get_current_position();
+
+      if (self.lexer.match_token(.Left_Parentheses)) {
+        arguments: [dynamic]*Expression;
+        for (!self.lexer.is_token(.Right_Parentheses)) {
+          array_add(&arguments, self.parse_expression());
+          if (!self.lexer.match_token(.Comma)) {
+            break;
+          }
+        }
+        self.lexer.expect_token(.Right_Parentheses);
+        expression = ast_expression_make_call(position, expression, arguments);
+      } else if (self.lexer.match_token(.Left_Bracket)) {
+        if (self.lexer.match_token(.Colon)) {
+          higher: *Expression;
+          if (!self.lexer.is_token(.Right_Bracket)) {
+            higher = self.parse_expression();
+          }
+          self.lexer.expect_token(.Right_Bracket);
+          expression = ast_expression_make_slice(position, expression, null, higher);
+        } else {
+          index := self.parse_expression();
+          if (self.lexer.match_token(.Colon)) {
+            lower := index;
+            higher: *Expression;
+            if (!self.lexer.is_token(.Right_Bracket)) {
+              higher = self.parse_expression();
+            }
+            self.lexer.expect_token(.Right_Bracket);
+            expression = ast_expression_make_slice(position, expression, lower, higher);
+          } else {
+            self.lexer.expect_token(.Right_Bracket);
+            expression = ast_expression_make_index(position, expression, index);
+          }
+        }
+      } else if (self.lexer.match_token(.Dot)) {
+        if (self.lexer.match_token(.Left_Parentheses)) {
+          selection_type := self.parse_type();
+          self.lexer.expect_token(.Right_Parentheses);
+          expression = ast_expression_make_selector(position, expression, selection_type);
+        } else {
+          name := self.parse_name();
+          generic_types := self.parse_generic_types();
+          expression = ast_expression_make_member(position, expression, name, generic_types);
+        }
+      } else {
+        assert(self.lexer.is_token(.Increment) || self.lexer.is_token(.Decrement));
+        operator := self.lexer.token.kind;
+        self.lexer.get_next_token();
+        expression = ast_expression_make_modify(position, operator, true, expression);
+      }
+    }
+
+    return expression;
+  }
+
+  /**
+  * Parses an operand expression.
+  *
+  * @return The parsed operand expression.
+  */
+  private proc parse_expression_operand() -> *Expression {
+    position := self.get_current_position();
+
+    if (self.lexer.is_token(.Boolean)) {
+      value := self.lexer.token.value.(bool);
+      self.lexer.expect_token(.Boolean);
+      return ast_expression_make_boolean(position, value);
+    } else if (self.lexer.is_token(.Integer)) {
+      value := self.lexer.token.value.(u64);
+      self.lexer.expect_token(.Integer);
+      return ast_expression_make_integer(position, value);
+    } else if (self.lexer.is_token(.Float)) {
+      value := self.lexer.token.value.(f64);
+      self.lexer.expect_token(.Float);
+      return ast_expression_make_float(position, value);
+    } else if (self.lexer.is_token(.Character)) {
+      value := self.lexer.token.value.(char);
+      self.lexer.expect_token(.Character);
+      return ast_expression_make_character(position, value);
+    } else if (self.lexer.is_token(.String)) {
+      value := self.lexer.token.value.(string);
+      self.lexer.expect_token(.String);
+      return ast_expression_make_string(position, value);
+    } else if (self.lexer.is_token(.Name)) {
+      name := self.parse_name();
+      first_generic_types := self.parse_generic_types();
+      if (self.lexer.match_token(.Dot)) {
+        if (self.lexer.match_token(.Left_Parentheses)) {
+          selection_type := self.parse_type();
+          self.lexer.expect_token(.Right_Parentheses);
+          return ast_expression_make_selector(position, ast_expression_make_name(position, name, {}), selection_type);
+        } else {
+          member := self.parse_name();
+          second_generic_types := self.parse_generic_types();
+          if (self.lexer.is_token(.Left_Brace)) {
+            type := ast_type_specification_make_name(position, name, member, second_generic_types);
+            return self.parse_expression_compound(type);
+          } else {
+            return ast_expression_make_member(position, ast_expression_make_name(position, name, first_generic_types), member, second_generic_types);
+          }
+        }
+      } else if (self.lexer.is_token(.Left_Brace)) {
+        type := ast_type_specification_make_name(position, "", name, first_generic_types);
+        return self.parse_expression_compound(type);
+      } else {
+        return ast_expression_make_name(position, name, first_generic_types);
+      }
+    } else if (self.lexer.match_token(.Dot)) {
+      name := self.parse_name();
+      return ast_expression_make_implicit_selector(position, name);
+    } else if (self.lexer.is_token(.Left_Brace)) {
+      return self.parse_expression_compound(null);
+    } else if (self.lexer.match_token(.Left_Parentheses)) {
+      if (self.lexer.match_token(.Colon)) {
+        type := self.parse_type();
+        self.lexer.expect_token(.Right_Parentheses);
+        return self.parse_expression_compound(type);
+      } else {
+        expression := self.parse_expression();
+        self.lexer.expect_token(.Right_Parentheses);
+        return ast_expression_make_parenthesized(position, expression);
+      }
+    } else if (self.lexer.match_token(.Keyword_Cast)) {
+      self.lexer.expect_token(.Left_Parentheses);
+      type := self.parse_type();
+      self.lexer.expect_token(.Right_Parentheses);
+      return ast_expression_make_cast(position, type, self.parse_expression_unary());
+    } else if (self.lexer.match_token(.Keyword_Size_Of)) {
+      return self.parse_expression_query(position, .Size_Of_Expression, .Size_Of_Type);
+    } else if (self.lexer.match_token(.Keyword_Typeid_Of)) {
+      return self.parse_expression_query(position, .Typeid_Of_Expression, .Typeid_Of_Type);
+    } else if (self.lexer.match_token(.Keyword_Type_Info_Of)) {
+      return self.parse_expression_query(position, .Type_Info_Of_Expression, .Type_Info_Of_Type);
+    } else if (self.lexer.match_token(.Pound)) {
+      return self.parse_expression_directive(position);
+    } else {
+      report_error_fatal(position, "Unexpected token '%' in expression", self.lexer.get_token_info());
+      return null;
+    }
+  }
+
+  /**
+  * Parses a compound expression.
+  *
+  * @param type   The type of the compound expression.
+  * @return The parsed compound expression.
+  */
+  private proc parse_expression_compound(type: *Type_Specification) -> *Expression {
+    position := self.get_current_position();
+    self.lexer.expect_token(.Left_Brace);
+    fields: aosoa[dynamic]Expression_Compound_Field;
+    for (!self.lexer.is_token(.Right_Brace)) {
+      compound_field := self.parse_expression_compound_field();
+      array_aosoa_add(&fields, compound_field);
+      if (!self.lexer.match_token(.Comma)) {
+        break;
+      }
+    }
+    self.lexer.expect_token(.Right_Brace);
+    return ast_expression_make_compound(position, type, fields);
+  }
+
+  /**
+  * Parses a compound expression field.
+  *
+  * @return The parsed compound expression field.
+  */
+  private proc parse_expression_compound_field() -> Expression_Compound_Field {
+    position := self.get_current_position();
+
+    if (self.lexer.match_token(.Left_Bracket)) {
+      index := self.parse_expression();
+      self.lexer.expect_token(.Right_Bracket);
+      self.lexer.expect_token(.Assign);
+      return {.Index, position, self.parse_expression(), index};
+    } else {
+      expression := self.parse_expression();
+      if (self.lexer.match_token(.Assign)) {
+        if (expression.kind != .Name) {
+          self.report_error("Named initializer in compound literal must be preceded by a field name");
+        }
+        name := (cast(*Expression_Name) expression).name;
+        return {.Name, position, self.parse_expression(), name};
+      } else {
+        return {.Default, position, expression, {}};
+      }
+    }
+  }
+
+  /**
+  * Parses a query expression.
+  *
+  * @param position        The source position of the expression.
+  * @param expression_kind The kind of the query expression in case of an expression.
+  * @param type_kind       The kind of the query expression in case of a type.
+  * @return The parsed query expression.
+  */
+  private proc parse_expression_query(position: Source_Position, expression_kind: Expression_Query_Kind, type_kind: Expression_Query_Kind) -> *Expression {
+    kind: Expression_Query_Kind;
+    value: Expression_Query_Value;
+
+    self.lexer.expect_token(.Left_Parentheses);
+    if (self.lexer.match_token(.Colon)) {
+      kind = type_kind;
+      value = self.parse_type();
+    } else {
+      kind = expression_kind;
+      value = self.parse_expression();
+    }
+    self.lexer.expect_token(.Right_Parentheses);
+
+    return ast_expression_make_query(position, kind, value);
+  }
+
+  /**
+  * Parses a directive expression.
+  *
+  * @param position The source position of the expression.
+  * @return The parsed directive expression.
+  */
+  private proc parse_expression_directive(position: Source_Position) -> *Expression {
+    name := self.parse_name();
+
+    kind: Expression_Directive_Kind;
+    if (name == EXPRESSION_DIRECTIVE_LINE) {
+      kind = .Line;
+    } else if (name == EXPRESSION_DIRECTIVE_ROUTINE) {
+      kind = .Routine;
+    } else if (name == EXPRESSION_DIRECTIVE_FILE) {
+      kind = .File;
+    } else if (name == EXPRESSION_DIRECTIVE_LOCATION) {
+      kind = .Location;
+    } else {
+      self.report_error("Unknown directive '%'", name);
+    }
+
+    return ast_expression_make_directive(position, kind);
+  }
+
+  /**
+  * Parses a name.
+  *
+  * @return The parsed name.
+  */
+  private proc parse_name() -> string {
+    name := self.lexer.token.value.(string);
+    self.lexer.expect_token(.Name);
+    return name;
+  }
+
+  /**
+  * Parses generic types.
+  *
+  * @return The parsed generic types.
+  */
+  private proc parse_generic_types() -> [dynamic]*Type_Specification {
+    generic_types: [dynamic]*Type_Specification;
+
+    if (self.lexer.match_token(.Not)) {
+      if (self.lexer.match_token(.Left_Parentheses)) {
+        for (!self.lexer.is_token(.Right_Parentheses)) {
+          array_add(&generic_types, self.parse_type());
+          if (!self.lexer.match_token(.Comma)) {
+            break;
+          }
+        } 
+        self.lexer.expect_token(.Right_Parentheses);
+
+        if (length(generic_types) == 0) {
+          self.report_error("Expected at least one generic type parameter");
+        }
+      }
+    }
+    return generic_types;
+  }
+
+  /**
+  * Parses an attribute kind.
+  *
+  * @return The parsed attribute kind.
+  */
+  private proc parse_attribute_kind() -> Attribute_Kind {
+    attribute_kind_name := self.parse_name();
+
+    if (attribute_kind_name == ATTRIBUTE_FLAGS) {
+      return .Flags;
+    } else if (attribute_kind_name == ATTRIBUTE_THREAD_LOCAL) {
+      return .Thread_Local;
+    } else if (attribute_kind_name == ATTRIBUTE_INTRINSIC) {
+      return .Intrinsic;
+    } else if (attribute_kind_name == ATTRIBUTE_BUILTIN) {
+      return .Builtin;
+    } else if (attribute_kind_name == ATTRIBUTE_DISABLED) {
+      return .Disabled;
+    } else {
+      self.report_error("Invalid attribute '%'", attribute_kind_name);
+      return .Invalid;
+    }
+  }
+
+  /**
+  * Parses an access modifier.
+  *
+  * @return The parsed access modifier.
+  */
+  private proc pasrse_access_modifier(default: Access_Modifier) -> Access_Modifier {
+    result := default;
+    if (self.lexer.match_token(.Keyword_Public)) {
+      result = .Public;
+    } else if (self.lexer.match_token(.Keyword_Internal)) {
+      result = .Internal;
+    } else if (self.lexer.match_token(.Keyword_Private)) {
+      result = .Private;
+    }
+    return result;
+  }
+
+  /**
+  * Parses a calling convention.
+  *
+  * @return The parsed calling convention.
+  */
+  private proc parse_calling_convention(default: Calling_Convention) -> Calling_Convention {
+    result := default;
+    if (self.lexer.is_token(.String)) {
+      calling_convention_string := self.lexer.token.value.(string);
+      self.lexer.expect_token(.String);
+
+      if (calling_convention_string == CALLING_CONVENTION_NOX) {
+        result = .Nox;
+      } else if (calling_convention_string == CALLING_CONVENTION_NOCONTEXT) {
+        result = .No_Context;
+      } else if (calling_convention_string == CALLING_CONVENTION_C) {
+        result = .C;
+      } else if (calling_convention_string == CALLING_CONVENTION_STDCALL) {
+        result = .Std_Call;
+      } else if (calling_convention_string == CALLING_CONVENTION_FASTCALL) {
+        result = .Fast_Call;
+      } else if (calling_convention_string == CALLING_CONVENTION_WIN64) {
+        result = .Win64;
+      } else {
+        self.report_error("Invalid calling convention '%'", calling_convention_string);
+      }
+
+      // No destroying of 'calling_convention_string' necessary here because we have a dedicated AST allocator.
+    }
+
+    return result;
+  }
+
+  /**
+  * Gets the current position.
+  *
+  * @return The current source position.
+  */
+  private proc get_current_position() -> Source_Position {
+    return self.lexer.token.position;
+  }
+
+  /**
+  * Reports a warning message at a given position.
+  *
+  * @param position The position of the message.
+  * @param fmt      The format of the message.
+  * @param args     The format arguments.
+  */
+  private proc report_warning_position(position: Source_Position, fmt: string, params args: []any) {
+    report_warning(position, fmt, args);
+  }
+
+  /**
+  * Reports an error message at the current position.
+  *
+  * @param fmt      The format of the message.
+  * @param args     The format arguments.
+  */
+  private proc report_error(fmt: string, params args: []any) {
+    report_error_fatal(self.lexer.token.position, fmt, args);
+  }
+
+  /**
+  * Reports an error message at a given position.
+  *
+  * @param position The position of the message.
+  * @param fmt      The format of the message.
+  * @param args     The format arguments.
+  */
+  private proc report_error_position(position: Source_Position, fmt: string, params args: []any) {
+    report_error_fatal(position, fmt, args);
+  }
+
+}
+
+private const ATTRIBUTE_FLAGS := "flags";
+private const ATTRIBUTE_THREAD_LOCAL := "thread_local";
+private const ATTRIBUTE_INTRINSIC := "intrinsic";
+private const ATTRIBUTE_BUILTIN := "builtin";
+private const ATTRIBUTE_DISABLED := "disabled";
+
+private const DECLARATION_DIRECTIVE_STATIC_ASSERT := "assert";
+private const DECLARATION_DIRECTIVE_STATIC_IF := "if";
+private const DECLARATION_DIRECTIVE_EXPAND_CONTEXT := "expand_context";
+
+private const EXPRESSION_DIRECTIVE_LINE := "line";
+private const EXPRESSION_DIRECTIVE_ROUTINE := "routine";
+private const EXPRESSION_DIRECTIVE_FILE := "file";
+private const EXPRESSION_DIRECTIVE_LOCATION := "location";
+
+private const CALLING_CONVENTION_NOX := "nox";
+private const CALLING_CONVENTION_NOCONTEXT := "nocontext";
+private const CALLING_CONVENTION_C := "c";
+private const CALLING_CONVENTION_STDCALL := "stdcall";
+private const CALLING_CONVENTION_FASTCALL := "fastcall";
+private const CALLING_CONVENTION_WIN64 := "win64";

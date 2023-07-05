@@ -1,0 +1,52 @@
+/**
+* Test the functionality of arrays.
+*/
+internal proc test_arrays() {
+  test_arrays_simple();
+  test_arrays_multidimensional();
+  test_arrays_pointers();
+
+  array: [4]int = {1, 2, 3, 4};
+  test_pass_array_as_parameter(array);
+}
+
+private proc test_arrays_simple() {
+  array: [2]int;
+  array[0] = 23;
+  assert(array[0] == 23);
+
+  var := array[0];
+  assert(var == 23);
+}
+
+private proc test_arrays_multidimensional() {
+  ma: [3][9]int;
+
+  ma[2][6] = 17;
+  assert(ma[2][6] == 17);
+
+  v: int = ma[2][6];
+  assert(v == 17);
+
+  p := &ma[2][6];
+  dp := &p;
+  **dp = 78;
+  assert(ma[2][6] == 78);
+}
+
+private proc test_arrays_pointers() {
+  i := 8;
+  a: [3]*int;
+  a[0] = &i;
+  *a[0] = 178;
+  assert(i == 178);
+  value := *a[0];
+  assert(value == 178);
+}
+
+proc test_pass_array_as_parameter(array: [4]int) {
+  assert(array[0] == 1);
+  assert(array[1] == 2);
+  assert(array[2] == 3);
+  assert(array[3] == 4);
+}

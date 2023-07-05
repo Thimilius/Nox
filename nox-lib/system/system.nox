@@ -1,0 +1,297 @@
+import "std:libc"
+import "std:memory"
+import "std:strings"
+
+/**
+* The color of a console output.
+*/
+public enum Console_Color {
+  Black,
+  Grey,
+  White,
+
+  Red,
+  Green,
+  Blue,
+  Yellow,
+  Magenta,
+  Cyan,
+
+  Dark_Red,
+  Dark_Green,
+  Dark_Blue,
+  Dark_Yellow,
+  Dark_Magenta,
+  Dark_Cyan,
+}
+
+/**
+* The maximum system path length.
+*/
+public const MAX_PATH := 1024;
+
+/**
+* Gets the directory of the currently running executable.
+*
+* @return The directory of the currently running executable.
+*/
+public proc get_exe_directory() -> string {
+  exe_path := get_exe_path();
+  last_seperator_index := strings.last_index_of(exe_path, PATH_SEPERATOR);
+  return exe_path[:last_seperator_index + 1];
+}
+
+/**
+* Runs a given system command.
+* 
+* @param command The command to run.
+*/
+public proc run(command: string) {
+  command_cstr := strings.clone_to_cstring(command);
+  defer cstring_destroy(command_cstr);
+  libc.system(command_cstr);
+}
+
+#if (NOX_OS == .Windows) {
+  
+  import "std:system/windows"
+
+  /**
+  * The system path seperator.
+  */
+  public const PATH_SEPERATOR := "\\";
+  /**
+  * The maximum system wide path length.
+  */
+  public const MAX_PATH_WIDE := 0x8000;
+
+  /**
+  * Sets a new console color.
+  * 
+  * @param color The console color to set.
+  */
+  public proc set_console_color(color: Console_Color) {
+    console_color: windows.WORD;
+    switch (color) {
+      case .Black: console_color = 0;
+      case .Grey: console_color = windows.FOREGROUND_INTENSITY;
+      case .White: console_color = windows.FOREGROUND_RED | windows.FOREGROUND_GREEN | windows.FOREGROUND_BLUE;
+
+      case .Red: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_RED;
+      case .Green: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_GREEN;
+      case .Blue: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_BLUE;
+      case .Yellow: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_RED | windows.FOREGROUND_GREEN;
+      case .Magenta: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_RED | windows.FOREGROUND_BLUE;
+      case .Cyan: console_color = windows.FOREGROUND_INTENSITY | windows.FOREGROUND_GREEN | windows.FOREGROUND_BLUE;
+
+      case .Dark_Red: console_color = windows.FOREGROUND_RED;
+      case .Dark_Green: console_color = windows.FOREGROUND_GREEN;
+      case .Dark_Blue: console_color = windows.FOREGROUND_BLUE;
+      case .Dark_Yellow: console_color = windows.FOREGROUND_RED | windows.FOREGROUND_GREEN;
+      case .Dark_Magenta: console_color = windows.FOREGROUND_RED | windows.FOREGROUND_BLUE;
+      case .Dark_Cyan: console_color = windows.FOREGROUND_GREEN | windows.FOREGROUND_BLUE;
+    }
+
+    handle := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE);
+    windows.SetConsoleTextAttribute(handle, console_color);
+  }
+
+  /**
+  * Gets the path to the currently running executable.
+  * 
+  * @return The path to the currently running executable.
+  */
+  public proc get_exe_path() -> string {
+    buffer: [MAX_PATH]windows.WCHAR;
+    windows.GetModuleFileNameW(null, data(buffer), cast(u32) MAX_PATH);
+    return utf16_to_utf8(data(buffer));
+  }
+
+  /**
+  * Gets the current directory.
+  * 
+  * @return The current directory.
+  */
+  public proc get_current_directory() -> string {
+    buffer: [MAX_PATH]windows.WCHAR;
+    windows.GetCurrentDirectoryW(cast(u32) MAX_PATH, data(buffer));
+
+    current_directory := utf16_to_utf8(data(buffer), context.temporary_allocator);
+    if (strings.has_suffix(current_directory, PATH_SEPERATOR)) {
+      return strings.clone(current_directory);
+    } else {
+      directory := strings.concatenate({current_directory, PATH_SEPERATOR});
+      return directory;
+    }
+  }
+
+  public proc get_processor_count() -> int {
+    buffer_size: windows.DWORD = 0;
+    windows.GetLogicalProcessorInformation(null, &buffer_size);
+    buffer_length := buffer_size / cast(u32) size_of(:windows.SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+    processors := array_make!(windows.SYSTEM_LOGICAL_PROCESSOR_INFORMATION)(cast(int) buffer_length, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+    windows.GetLogicalProcessorInformation(&processors[0], &buffer_size);
+
+    thread_count := 0;
+    foreach (processor in processors) {
+      if (processor.Relationship == .RelationProcessorCore) {
+        thread_count += memory.count_ones(processor.ProcessorMask);
+      }
+    }
+    return thread_count;
+  }
+
+  /**
+  * Gets the size of the L1 cache line in bytes.
+  *
+  * @return The size of the L1 cache line in bytes.
+  */
+  public proc get_l1_cache_line_size() -> uint {
+    buffer_size: windows.DWORD;
+    windows.GetLogicalProcessorInformation(null, &buffer_size);
+    buffer_length := buffer_size / cast(u32) size_of(:windows.SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+    buffer := array_make!(windows.SYSTEM_LOGICAL_PROCESSOR_INFORMATION)(cast(int) buffer_length, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+    windows.GetLogicalProcessorInformation(data(buffer), &buffer_size);
+
+    line_size: uint;
+    foreach (info in buffer) {
+      if (info.Relationship == .RelationCache && info.Cache.Level == 1 && info.Cache.Type == .CacheData) {
+        line_size = cast(uint) info.Cache.LineSize;
+      }
+    }
+    return line_size;
+  }
+
+  /**
+  * Converts an UtF-16 string to UtF-8.
+  *
+  * @param str       The UtF-16 string to convert.
+  * @param allocator The allocator to use.
+  * @return The converted string.
+  */
+  public proc utf16_to_utf8(str: *libc.wchar_t, allocator: Allocator = context.allocator) -> string {
+    in_length: i32 = cast(i32) libc.wcslen(str);
+    
+    out_length := windows.WideCharToMultiByte(windows.CP_UTF8, 0, str, in_length, null, 0, null, null);
+    buffer := array_make!(byte)(cast(int) out_length, cast(int) out_length, allocator);
+    windows.WideCharToMultiByte(windows.CP_UTF8, 0, str, in_length, data(buffer), out_length, null, null);
+
+    raw_string: memory.Raw_String = {data(buffer), cast(int) out_length};
+    return *cast(*string) &raw_string;
+  }
+
+  /**
+  * Converts an UTF-8 string to UTF-16.
+  *
+  * @param str       The UTF-8 string to convert.
+  * @param allocator The allocator to use.
+  * @return The converted string.
+  */
+  public proc utf8_to_utf16(str: string, allocator: Allocator = context.allocator) -> *libc.wchar_t {
+    in_length: i32 = cast(i32) length(str) + 1; // We have to incorporate the null-terminating character.
+
+    out_length := windows.MultiByteToWideChar(windows.CP_UTF8, 0, cast(*u8) data(str), in_length, null, 0);
+    buffer := array_make!(libc.wchar_t)(cast(int) out_length, cast(int) out_length, allocator);
+    windows.MultiByteToWideChar(windows.CP_UTF8, 0, cast(*u8) data(str), in_length, data(buffer), out_length);
+    buffer[in_length - 1] = 0;
+
+    return data(buffer);
+  }
+
+} else {
+
+  import "std:system/unix"
+
+  /**
+  * The system path seperator.
+  */
+  public const PATH_SEPERATOR := "/";
+
+  /**
+  * Sets a new console color.
+  * 
+  * @param color The console color to set.
+  */
+  public proc set_console_color(color: Console_Color) {
+    libc.printf("\e[");
+
+    switch (color) {
+      case .Black: libc.printf("30m");
+      case .Grey: libc.printf("37m");
+      case .White: libc.printf("1;37m");
+
+      case .Red: libc.printf("1;31m");
+      case .Green: libc.printf("1;32m");
+      case .Blue: libc.printf("1;34m");
+      case .Yellow: libc.printf("1;33m");
+      case .Magenta: libc.printf("1;35m");
+      case .Cyan: libc.printf("1;36m");
+
+      case .Dark_Red: libc.printf("31m");
+      case .Dark_Green: libc.printf("32m");
+      case .Dark_Blue: libc.printf("34m");
+      case .Dark_Yellow: libc.printf("33m");
+      case .Dark_Magenta: libc.printf("35m");
+      case .Dark_Cyan: libc.printf("36m");
+    }
+  }
+
+  /**
+  * Gets the path to the currently running executable.
+  * 
+  * @return The path to the currently running executable.
+  */
+  public proc get_exe_path() -> string {
+    pid := unix.getpid();
+
+    builder := strings.builder_make(context.temporary_allocator);
+    builder.write_string("/proc/");
+    builder.write_uint(cast(uint) pid);
+    builder.write_string("/exe");
+    pid_path := builder.to_string();
+    cpid_path := strings.clone_to_cstring(pid_path, context.temporary_allocator);
+
+    buffer: [MAX_PATH]byte;
+    unix.readlink(cpid_path, data(buffer), cast(uint) MAX_PATH);
+
+    return strings.clone_from_cstring(cast(cstring) data(buffer));
+  }
+  
+  /**
+  * Gets the current directory.
+  * 
+  * @return The current directory.
+  */
+  public proc get_current_directory() -> string {
+    buffer: [MAX_PATH]u8;
+    unix.getcwd(cast(cstring) data(buffer), cast(uint) MAX_PATH);
+
+    current_directory := strings.clone_from_cstring(cast(cstring) data(buffer));
+    if (strings.has_suffix(current_directory, PATH_SEPERATOR)) {
+      return current_directory;
+    } else {
+      directory := strings.concatenate({current_directory, PATH_SEPERATOR});
+      string_destroy(current_directory);
+      return directory;
+    }
+  }
+
+  /**
+  * Gets the number of processor cores.
+  *
+  * @return The number of processor cores.
+  */
+  public proc get_processor_count() -> int {
+    return cast(int) unix.get_nprocs();
+  }
+
+  /**
+  * Gets the size of the L1 cache line in bytes.
+  *
+  * @return The size of the L1 cache line in bytes.
+  */
+  public proc get_l1_cache_line_size() -> uint {
+    return cast(uint) unix.sysconf(unix._SC_LEVEL1_DCACHE_LINESIZE);
+  }
+
+}

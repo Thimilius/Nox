@@ -1,0 +1,324 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "Nox",
+	"patterns": [
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#types"
+		},
+		{
+			"include": "#functions-and-declarations"
+		},
+		{
+			"include": "#strings"
+		},
+		{
+			"include": "#string-escaped-char"
+		},
+		{
+			"include": "#punctuation"
+		},
+		{
+			"include": "#identifier"
+		}
+	],
+	"repository": {
+		"identifier": {
+			"patterns": [{
+				"name": "variable.other.nox",
+				"match": "\\b[[:alpha:]_][[:alnum:]_]*\\b"
+			}]
+		},
+		"type-chars": {
+			"patterns": [{
+				"match": "[[:alnum:]\\s,._^<>\\[\\]-]"
+			}]
+		},
+		"screaming-identifier": {
+			"patterns": [{
+				"match": "\\b[A-Z_](?![a-z])[A-Z_0-9]+\\b"
+			}]
+		},
+
+		"block-comment": {
+			"patterns": [
+				{
+					"name": "comment.block.nox",
+					"begin": "/\\*",
+					"end": "\\*/",
+					"patterns": [{
+						"include": "#block-comment"
+					}]
+				}
+			]
+		},
+		"comments": {
+			"patterns": [
+				{
+					"include": "#block-comment"
+				},
+				{
+					"name": "comment.line.double-slash.nox",
+					"begin": "//",
+					"end": "\n"
+				}
+			]
+		},
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.tag.nox",
+					"comment": "Use #name to use a pattern",
+					"match": "\\b([#@]\\s*[A-Za-z_][A-Za-z0-9_]*)\\b"
+				},
+				{
+					"name": "keyword.control.nox",
+					"match": "\\b(import)\\b"
+				},
+				{
+					"name": "keyword.control.nox",
+					"match": "\\b(return|defer|push_context|if|then|else|for|foreach|in|switch)\\b"
+				},
+				{
+					"name": "keyword.control.nox",
+					"match": "\\b(fallthrough|break|continue|case)\\b"
+				},
+				{
+					"name": "constant.language.nox",
+					"match": "\\b(null|true|false)\\b"
+				},
+				{
+					"name": "constant.numeric.nox",
+					"match": "\\b(\\d(\\d|_)*(.\\d(\\d|_)*)?)((e|E)(\\+|-)?\\d+)?[ijk]?\\b"
+				},
+				{
+					"name": "constant.numeric.nox",
+					"match": "\\b((0b(0|1|_)+)|(0o(\\d|_)+)|(0d(\\d|_)+)|(0[xXh](\\h|_)+))[i]?\\b"
+				},
+				{
+					"name": "storage.type.nox",
+					"match": "\\b(global|const|enum|map|struct|union|interface|implement|type_alias|type_define)\\b"
+				},
+				{
+					"name": "storage.type.nox",
+					"match": "\\b(private|internal|public|extern|pure)\\b"
+				},
+				{
+					"name": "keyword.function.nox",
+					"match": "\\b(cast|size_of|typeid_of|type_info_of)\\b"
+				},
+				{
+					"name": "keyword.special.nox",
+					"match": "\\b(composite|params|where|dynamic|soa|aosoa|context|self)\\b"
+				},
+				{
+					"name": "keyword.operator.nox",
+					"match": "(\\||\\!|:|\\+|-\\>?|\\*|/|\\<\\<?|\\>\\>?|\\~)=?|=|::?|\\.\\."
+				},
+				{
+					"name": "keyword.other.nox",
+					"match": "#[A-Za-z_][A-Za-z_0-9]*"
+				},
+				{
+					"name": "keyword.other.nox",
+					"match": "@[A-Za-z_][A-Za-z_0-9]*"
+				}
+			]
+		},
+		"functions-and-declarations": {
+			"patterns": [
+				{
+					"captures": {
+						"1": {
+							"name": "entity.name.function.nox"
+						},
+						"2": {
+							"name": "punctuation.nox"
+						},
+						"3": {
+							"name": "punctuation.nox"
+						},
+						"4": {
+							"name": "storage.type.nox"
+						}
+					},
+					"match": "\\s*(proc|func)\\b([A-Za-z_][A-Za-z0-9_]*)"
+				},
+				{
+					"captures": {
+						"1": {
+							"name": "entity.name.function.nox"
+						},
+						"2": {
+							"name": "keyword.control.nox"
+						},
+						"3": {
+							"name": "storage.type.nox"
+						},
+						"4": {
+							"name": "keyword.control.nox"
+						},
+						"5": {
+							"name": "storage.type.nox"
+						}
+					},
+					"match": "\\s+(proc|func)\\b([A-Za-z_][A-Za-z0-9_]*)"
+				},	
+				{
+					"captures": {
+						"1": {
+							"name": "storage.type.nox"
+						},
+						"2": {
+							"name": "punctuation.nox"
+						}
+					},
+					"match": "(proc|func)\\s*([\\(])"
+				},
+				{
+					"captures": {
+						"1": {
+							"name": "support.function.nox"
+						},
+						"2": {
+							"name": "punctuation.nox"
+						}
+					},
+					"match": "([A-Za-z_][A-Za-z0-9_]*)\\s*[!]?\\s*([\\(])"
+				},
+				{
+					"captures": {
+						"1": {
+							"name": "meta.type.name.nox"
+						},
+						"2": {
+							"name": "storage.type.nox"
+						}
+					},
+					"match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*[:]\\s*[:]\\s*(struct|union|enum)"
+				}
+			]
+		},
+		"types": {
+			"patterns": [
+				{
+					"captures": {
+						"1": {
+							"name": "storage.type.nox"
+						},
+						"2": {
+							"name": "meta.block.nox"
+						},
+						"3": {
+							"name": "meta.block.nox"
+						}
+					},
+					"match": "\\b(struct|union|enum)\\b(?:(\\{)(\\}))?"
+				},
+				{
+					"name": "storage.type.nox",
+					"match": "\\b(proc|func)\\b"
+				},
+				{
+					"name": "meta.brackets.nox",
+					"captures": {
+						"1": {
+							"name": "punctuation.definition.brackets.begin.nox"
+						},
+						"2": {
+							"name": "constant.numeric.nox"
+						},
+						"3": {
+							"name": "punctuation.definition.brackets.end.nox"
+						}
+					},
+					"match": "(\\[)(\\d*)(\\])(?=[[:alpha:]_])"
+				},
+				{
+					"name": "storage.type.nox",
+					"match": "\\$\\s*({{identifier}})"
+				},
+				{
+					"include": "#basic-types"
+				}
+			]
+		},
+		"basic-types": {
+			"patterns": [
+				{
+					"name": "support.type.nox",
+					"match": "\\b((i8|i16|i32|i64|int)|(u8|u16|u32|u64|uint)|(byte))\\b"
+				},
+				{
+					"name": "support.type.nox",
+					"match": "\\b((f32|f64))\\b"
+				},
+				{
+					"name": "support.type.nox",
+					"match": "\\b(b8|b16|b32|b64|bool)\\b"
+				},
+				{
+					"name": "support.type.nox",
+					"match": "\\b(string|cstring|char|rawptr|any|typeid)\\b"
+				}
+			]
+		},
+		"strings": {
+			"patterns": [
+				{
+					"name": "string.quoted.double.nox",
+					"begin": "\"",
+					"end": "\"",
+					"patterns": [
+						{
+							"include": "#string-escaped-char"
+						}
+					]
+				},
+				{
+					"name": "string.quoted.double.nox",
+					"begin": "`",
+					"end": "`"
+				},
+				{
+					"name": "string.quoted.single.nox",
+					"begin": "'",
+					"end": "'",
+					"patterns": [
+						{
+							"include": "#string-escaped-char"
+						}
+					]
+				}
+			],
+			"repository": {
+				"string-escaped-char": {
+					"patterns": [
+						{
+							"name": "constant.character.escape.nox",
+							"match": "\\\\(\\\\|[0abfnrutv''\"]|x\\h{2}|u\\h{4}|U\\h{8}|[0-7]{3})"
+						},
+						{
+							"name": "invalid.illegal.unknown-escape.nox",
+							"match": "\\\\."
+						}
+					]
+				}
+			}
+		},
+		"punctuation": {
+			"patterns": [
+				{
+					"name": "punctuation.nox",
+					"match": "\\(|\\)|\\{|\\}|;|\\[|\\]|\\.|,"
+				}
+			]
+		}
+	},
+	"scopeName": "source.nox"
+}

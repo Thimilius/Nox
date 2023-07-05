@@ -1,0 +1,430 @@
+implement Resolver {
+
+  /**
+  * Resolves a type specification.
+  * 
+  * @param type_specification The type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved type.
+  */
+  internal proc resolve_type_specification(type_specification: *Type_Specification, generic_context: Generic_Context = {}) -> *Type {
+    type: *Type;
+    switch (type_specification.kind) {
+      case .Name: type = self.resolve_type_specification_name(type_specification, generic_context);
+      case .Pointer: type = self.resolve_type_specification_pointer(type_specification, generic_context);
+      case .Array: type = self.resolve_type_specification_array(type_specification, generic_context);
+      case .Slice: type = self.resolve_type_specification_slice(type_specification, generic_context);
+      case .Map: type = self.resolve_type_specification_map(type_specification, generic_context);
+      case .Tuple: type = self.resolve_type_specification_tuple(type_specification, generic_context);
+      case .Procedure, .Function: type = self.resolve_type_specification_routine(type_specification, generic_context);
+    }
+
+    self.set_resolved_type(type_specification, type);
+
+    return type;
+  }
+
+  /**
+  * Resolves a name type specification.
+  * 
+  * @param type_specification The name type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved name type.
+  */
+  private proc resolve_type_specification_name(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Name) type_specification;
+    package_name := type_specification.package_name;
+    name := type_specification.name;
+
+    refers_to_package := package_name != "";
+
+    if (!refers_to_package) {
+      generic_type := self.resolve_generic_type_by_name(generic_context, name);
+      if (generic_type != null) {
+        return generic_type;
+      }
+    }
+
+    // We might have an overwrite type set when we are coming from an instantiated routine.
+    // In that case we got already resolved and can just return the overwritten type.
+    if (type_specification.overwrite_type != null) {
+      return type_specification.overwrite_type;
+    }
+
+    package_to_look_in := context.compiler.current_package;
+    if (refers_to_package) {
+      package_symbol := package_get_symbol(package_to_look_in, type_specification.position, package_name, .All);
+      if (package_symbol.kind != .Package) {
+        report_error_fatal(type_specification.position, "'%' must reference a package", package_name);
+      }
+      package_to_look_in = package_symbol.value.(*Package);
+    }
+
+    symbol := package_get_symbol(package_to_look_in, type_specification.position, name, refers_to_package ? .Public_Only : .All);
+    if (symbol.kind != .Type) {
+      report_error_fatal(type_specification.position, "'%' is not a type", name);
+    }
+
+    self.resolve_symbol(symbol);
+
+    result_type := symbol.type;
+    if (has_flag(symbol.flags, .Uninstantiated_Generic)) {
+      result_type = self.resolve_generic_type_specification_name(symbol, type_specification, generic_context);
+    } else if (length(type_specification.generic_types) > 0) {
+      report_error_fatal(type_specification.position, "Type '%' has no generic type parameters", result_type.name);
+    }
+
+    return result_type;
+  }
+
+  /**
+  * Resolves a pointer type specification.
+  * 
+  * @param type_specification The pointer type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved pointer type.
+  */
+  private proc resolve_type_specification_pointer(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Pointer) type_specification;
+
+    base := self.resolve_type_specification(cast(*Type_Specification) type_specification.base, generic_context);
+    storage := context.storage;
+
+    switch (type_specification.pointer_kind) {
+      case .Absolute: {
+        if (has_flag(base.flags, .Not_Allowed_As_Pointer)) {
+          report_error_fatal(type_specification.base.position, "Type '%' is not allowed to be used as a pointer base", base.name);
+        }
+        return storage.get_or_make_type_pointer(base);
+      }
+      case .Self_Relative, .Offset_Relative: {
+        if (has_flag(base.flags, .Not_Allowed_As_Pointer)) {
+          report_error_fatal(type_specification.base.position, "Type '%' is not allowed to be used as a pointer base", base.name);
+        }
+
+        relative_base := type_specification.pointer_kind == .Self_Relative ? storage.type_i32 : storage.type_int;
+        if (type_specification.relative_base != null) {
+          relative_base = self.resolve_type_specification(cast(*Type_Specification) type_specification.relative_base, generic_context);
+        }
+
+        if (!relative_base.is_integer()) {
+          report_error_fatal(type_specification.relative_base.position, "Relative base type for relative pointer must be an integer. Got '%'", relative_base.name);
+        }
+
+        if (type_specification.pointer_kind == .Self_Relative) {
+          return storage.get_or_make_type_self_relative_pointer(base, relative_base);
+        } else {
+          return storage.get_or_make_type_offset_relative_pointer(base, relative_base);
+        }
+      }
+      case .SoA_Layout, .AoSoA_Layout: {
+        if (has_flag(base.flags, .Not_Allowed_As_Pointer)) {
+          report_error_fatal(type_specification.base.position, "Type '%' is not allowed to be used as a pointer base", base.name);
+        }
+        
+        self.complete_type(type_specification.base.position, base);
+        if (type_specification.pointer_kind == .SoA_Layout) {
+          if (!base.is_soa()) {
+            report_error_fatal(type_specification.base.position, "Base type of an SoA pointer must be an SoA collection. Got '%v'", base.name);
+          }
+          return storage.get_or_make_type_soa_pointer(base);
+        } else {
+          if (!base.is_aosoa()) {
+            report_error_fatal(type_specification.base.position, "Base type of an AoSoA pointer must be an AoSoA collection. Got '%v'", base.name);
+          }
+          return storage.get_or_make_type_aosoa_pointer(base);
+        }
+      }
+      case .Dynamic: {
+        if (!base.is_interface()) {
+          report_error_fatal(type_specification.base.position, "Dynamic pointer must have an interface as its base. Got '%'", base.name);
+        }
+
+        // A dynamic pointer has a special effect on the reachability of symbols as we can't determine at compiletime which routines might get called.
+        // Because of that we set all implemented routine symbols for all types that implement the interface as reachable.
+        if (!has_flag(base.flags, .Interface_Used_In_Dynamic_Pointer)) {
+          types_implementing_interface, _ := map_get(&self.types_implementing_interface, base);
+          foreach (type in types_implementing_interface) {
+            key := Resolved_Implementation_Key{base, type};
+            resolved_implementations, found := map_get(&self.output.resolved_implementations, key);
+            assert(found);
+            assert(length(resolved_implementations) == 1);
+            resolved_implementation := resolved_implementations[0];
+            foreach (_, symbol in resolved_implementation.symbols) {
+              self.resolve_symbol(symbol);
+            }
+          }
+        }
+        return storage.get_or_make_type_dynamic_pointer(base);
+      }
+    }
+
+    assert(false);
+    return null;
+  }
+
+  /**
+  * Resolves an array type specification.
+  * 
+  * @param type_specification The array type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved array type.
+  */
+  private proc resolve_type_specification_array(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Array) type_specification;
+
+    base := self.resolve_type_specification(cast(*Type_Specification) type_specification.base, generic_context);
+    if (has_flag(base.flags, .Not_Allowed_As_Base)) {
+      report_error_fatal(type_specification.base.position, "Type '%' is not allowed to be used as an array base", base.name);
+    }
+
+    array_kind := type_specification.array_kind;
+    layout_modifier := type_specification.layout_modifier;
+
+    // For regular dynamic arrays we don't need to complete the type (as the necessary info required is handled by the library implementation).
+    if (layout_modifier != .None || array_kind == .Fixed) {
+      self.complete_type(type_specification.base.position, base);
+    }
+
+    if (layout_modifier != .None && !base.is_struct() && !base.is_generic()) {
+      report_error_fatal(type_specification.base.position, "Base type of an SoA/AoSoA array must be a struct. Got '%'", base.name);
+    }
+
+    storage := context.storage;
+
+    number_of_elements := 0;
+    has_incomplete_elements := type_specification.size == null;
+    if (array_kind == .Fixed) {
+      if (has_incomplete_elements && layout_modifier != .None) {
+        report_error_fatal(type_specification.position, "Incomplete soa array is not allowed");
+      } else if (!has_incomplete_elements) {
+        operand := self.resolve_expression_constant(cast(*Expression) type_specification.size, statement_context_default());
+        if (!self.operand_cast(type_specification.size.position, &operand, storage.type_int)) {
+          report_error_fatal(type_specification.position, "Array size constant expression must be castable to an integer");
+        }
+        number_of_elements = operand.value.(int);
+        if (number_of_elements < 0) {
+          report_error_fatal(type_specification.size.position, "Array size constant must be positive");
+        }
+      }
+    }
+
+    if (!base.is_generic() && layout_modifier != .None) {
+      collection_type := array_kind == .Fixed ? Collection_Type.Array : Collection_Type.Dynamic_Array;
+      base = self.resolve_type_specification_layout_struct(type_specification.base.position, collection_type, base, layout_modifier, number_of_elements);
+    }
+
+    layout_info := Layout_Info{layout_modifier, 0};
+
+    if (array_kind == .Fixed) {
+      return storage.get_or_make_type_array(layout_info, base, number_of_elements, has_incomplete_elements);
+    } else {
+      assert(array_kind == .Dynamic);
+      return storage.get_or_make_type_dynamic_array(layout_info, base);
+    }
+  }
+
+  /**
+  * Resolves a slice type specification.
+  * 
+  * @param type_specification The slice type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved slice type.
+  */
+  private proc resolve_type_specification_slice(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Slice) type_specification;
+
+    base := self.resolve_type_specification(cast(*Type_Specification) type_specification.base, generic_context);
+    if (has_flag(base.flags, .Not_Allowed_As_Base)) {
+      report_error_fatal(type_specification.base.position, "Type '%' is not allowed to be used as a slice base", base.name);
+    }
+
+    layout_modifier := type_specification.layout_modifier;
+    layout_info: Layout_Info;
+    if (layout_modifier == .SoA) {
+      self.complete_type(type_specification.base.position, base);
+
+      if (!base.is_struct() && !base.is_generic()) {
+        report_error_fatal(type_specification.base.position, "Base type of an SoA/AoSoA slice must be a struct. Got '%'", base.name);
+      }
+
+      if (!base.is_generic()) {
+        base = self.resolve_type_specification_layout_struct(type_specification.base.position, .Slice, base, layout_modifier, 0);
+        layout_info = (cast(*Type_Struct) base).layout_info;
+      }
+    } else if (layout_modifier == .AoSoA) {
+      report_error_fatal(type_specification.position, "AoSoA slices are currently not supported");
+    }
+
+    return context.storage.get_or_make_type_slice(layout_info, base);
+  }
+
+  /**
+  * Resolves a map type specification.
+  * 
+  * @param type_specification The map type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved map type.
+  */
+  private proc resolve_type_specification_map(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Map) type_specification;
+
+    key := self.resolve_type_specification(cast(*Type_Specification) type_specification.key, generic_context);
+    self.complete_type(type_specification.key.position, key);
+    if (has_flag(key.flags, .Not_Allowed_As_Base) || (!key.is_generic() && (!has_flag(key.flags, .Has_Hash_Function) || !has_flag(key.flags, .Has_Compare_Function)))) {
+      report_error_fatal(type_specification.key.position, "Type '%' is not allowed to be used as a map key", key.name);
+    }
+
+    value := self.resolve_type_specification(cast(*Type_Specification) type_specification.value, generic_context);
+    self.complete_type(type_specification.value.position, value);
+    if (has_flag(value.flags, .Not_Allowed_As_Base)) {
+      report_error_fatal(type_specification.value.position, "Type '%' is not allowed to be used as a map value", value.name);
+    }
+
+    return context.storage.get_or_make_type_map(key, value);
+  }
+
+  /**
+  * Resolves a tuple type specification.
+  * 
+  * @param type_specification The tuple type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved tuple type.
+  */
+  private proc resolve_type_specification_tuple(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Tuple) type_specification;
+
+    elements: aosoa[dynamic]Type_Tuple_Element;
+    foreach (element in type_specification.elements) {
+      element_type := self.resolve_type_specification(element, generic_context);
+      if (has_flag(element_type.flags, .Not_Allowed_As_Tuple)) {
+        report_error_fatal(element.position, "Type '%' is not allowed to be part of a tuple", element_type.name);
+      }
+      self.complete_type(element.position, element_type);
+      array_aosoa_add(&elements, {element_type, 0});
+    }
+
+    return context.storage.get_or_make_type_tuple(elements);
+  }
+
+  /**
+  * Resolves a routine type specification.
+  * 
+  * @param type_specification The routine type specification to resolve.
+  * @param generic_context    The generic context to use.
+  * @return The resolved routine type.
+  */
+  private proc resolve_type_specification_routine(type_specification: *Type_Specification, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Routine) type_specification;
+
+    parameters: aosoa[dynamic]Type_Routine_Parameter;
+    foreach (parameter in type_specification.parameters) {
+      parameter_type := self.resolve_type_specification(parameter, generic_context);
+      if (has_flag(parameter_type.flags, .Not_Allowed_As_Parameter_Or_Return_Type)) {
+        report_error_fatal(parameter.position, "Type '%' is not allowed as parameter type", parameter_type.name);
+      }
+      array_aosoa_add(&parameters, {parameter_type, false});
+    }
+
+    return_type := context.storage.type_void;
+    if (type_specification.return_type != null) {
+      return_type = self.resolve_type_specification(cast(*Type_Specification) type_specification.return_type, generic_context);
+      if (has_flag(return_type.flags, .Not_Allowed_As_Parameter_Or_Return_Type)) {
+        report_error_fatal(type_specification.return_type.position, "Type '%' is not allowed as return type", return_type.name);
+      }
+    }
+
+    has_params := type_specification.has_params;
+    if (has_params) {
+      params_index := length(parameters) - 1;
+      params_type := parameters[params_index].type;
+      if (!params_type.is_slice()) {
+        report_error_fatal(type_specification.parameters[params_index].position, "Parameter marked 'params' must be a slice type. Got '%'", params_type.name);
+      }
+    }
+
+    return context.storage.get_or_make_type_routine(
+      type_specification.kind == .Procedure ? .Procedure : .Function,
+      type_specification.calling_convention,
+      parameters,
+      return_type,
+      make_routine_flags(has_params, type_specification.has_c_varargs, false, false, type_specification.is_pure),
+    );
+  }
+
+  /**
+  * Resolves a layout struct for a type specification.
+  * 
+  * @param position          The position of the type specification.
+  * @param collection_type   The collection type the layout struct is being used in.
+  * @param base              The base struct in AoS form the layout struct is based on.
+  * @param layout_modifier   The layout modifier of the layout struct.
+  * @param number_of_element The number of elements (in case on array).
+  * @return The resolved layout struct type.
+  */
+  internal proc resolve_type_specification_layout_struct(
+    position: Source_Position,
+    collection_type: Collection_Type,
+    base: *Type,
+    layout_modifier: Layout_Modifier,
+    number_of_elements: int,
+  ) -> *Type {
+    assert(layout_modifier != .None);
+
+    storage := context.storage;
+
+    cached_layout_struct := storage.get_cached_type_layout_struct(collection_type, base, layout_modifier, number_of_elements);
+    if (cached_layout_struct == null) {
+      soa_symbol_name_suffix: string;
+      switch (collection_type) {
+        case .Array: soa_symbol_name_suffix = "Array";
+        case .Dynamic_Array: soa_symbol_name_suffix = "Dynamic_Array";
+        case .Slice: soa_symbol_name_suffix = "Slice";
+        case .None: fallthrough;
+        case: assert(false);
+      }
+      soa_symbol_name_infix := layout_modifier == .SoA ? "SoA" : "AoSoA";
+
+      soa_symbol_name := self.make_formatted_symbol_name("%_%_%", base.symbol.name, soa_symbol_name_infix, soa_symbol_name_suffix);
+      soa_symbol := symbol_make(self, .Type, .Private, base.symbol.package_file, soa_symbol_name, null);
+
+      aosoa_chunk_symbol: *Symbol;
+      items_in_aosoa_chunk: int;
+      if (layout_modifier == .AoSoA) {
+        aosoa_chunk_symbol_name := self.make_formatted_symbol_name("%_Base", soa_symbol_name);
+        aosoa_chunk_symbol = symbol_make(self, .Type, .Private, base.symbol.package_file, aosoa_chunk_symbol_name, null);
+
+        // Currently we allow 'items_in_aosoa_chunk' to be equal to 1.
+        // This is not really a problem but is just not really practial as it does not use the properties of AoSoA at all.
+        // Its memory properties are similiar to that of a regular AoS.
+        biggest_field: Type_Struct_Field;
+        items_in_aosoa_chunk, biggest_field = storage.calculate_items_in_aosoa_chunk(base);
+        if (items_in_aosoa_chunk <= 0) {
+          report_error_fatal(
+            position,
+            "The struct '%' is not allowed as a base for AoSoA as the field '%' has a size which exceeds the limit of % bytes for an AoSoA chunk",
+            base.name,
+            biggest_field.name,
+            L1_CACHE_LINE_SIZE,
+          );
+        }
+      }
+
+      layout_struct_type := storage.make_type_layout_struct(
+        soa_symbol,
+        collection_type,
+        base,
+        layout_modifier,
+        number_of_elements,
+        aosoa_chunk_symbol,
+        items_in_aosoa_chunk,
+      );
+      soa_symbol.type = layout_struct_type;
+
+      return layout_struct_type;
+    } else {
+      return cached_layout_struct;
+    }
+  }
+
+}

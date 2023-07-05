@@ -1,0 +1,53 @@
+/**
+* Test the functionality of implementation blocks.
+*/
+internal proc test_implementations() {
+  test_struct_implementations();
+  test_basic_implementations();
+}
+
+private proc test_struct_implementations() {
+  foo: Foo;
+  assert(foo.get_constant() == 178);
+
+  foo.b.u = 13;
+  assert(foo.get_bar().u == 13);
+}
+
+private struct Bar {
+  u: u32,
+}
+
+private struct Foo {
+  i: i32,
+  b: Bar,
+}
+
+implement Foo {
+
+  private func get_constant() -> int {
+    return 178;
+  }
+
+  private proc get_bar() -> Bar {
+    return self.b;
+  }
+
+}
+
+private proc test_basic_implementations() {
+  123.assert();
+  assert(123.get() == 123);
+}
+
+implement int {
+
+  private proc assert() {
+    assert(*self == 123);
+  }
+
+  private func get() -> int {
+    return *self;
+  }
+
+}

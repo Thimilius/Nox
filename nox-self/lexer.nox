@@ -1,0 +1,1187 @@
+import "std:libc"
+import "std:math"
+import "std:memory"
+import "std:strings"
+
+/**
+* Represents a position in source code.
+*/
+public struct Source_Position {
+  file: string, // The file of the position.
+  line: u32,    // The line of the position.
+  column: u32,  // The column of the position.
+}
+
+/**
+* Represents the special builtin source position
+*/
+public global SOURCE_POSITION_BUILTIN := Source_Position{"<builtin>", 0, 0 };
+
+/**
+* The kind of a token.
+*/
+public enum Token_Kind {
+  Invalid,
+
+  Eof,
+
+  // Single/Misc
+  Colon,
+  Dot,
+  Comma,
+  Semicolon,
+  Negate,
+  Not,
+  Question,
+  At,
+  Pound,
+  Arrow,
+  Ellipsis,
+  Left_Parentheses,
+  Right_Parentheses,
+  Left_Brace,
+  Right_Brace,
+  Left_Bracket,
+  Right_Bracket,
+
+  // Literals
+  Boolean,
+  Integer,
+  Float,
+  Character,
+  String,
+  Name,
+
+  // Multiplicative precedence
+  First_Multiplicative,
+  Multiply = First_Multiplicative,
+  Divide,
+  Modulo,
+  And,
+  Left_Shift,
+  Right_Shift,
+  Last_Multiplicative = Right_Shift,
+
+  // Additive precedence
+  First_Additive,
+  Add = First_Additive,
+  Subtract,
+  Xor,
+  Or,
+  Last_Additive = Or,
+
+  // Comperative precedence
+  First_Comparison,
+  Equal = First_Comparison,
+  Not_Equal,
+  Less_Than,
+  Greater_Than,
+  Less_Than_Equal,
+  Greater_Than_Equal,
+  Last_Comparison = Greater_Than_Equal,
+
+  // Special comparison
+  And_And,
+  Or_Or,
+
+  // Assignment
+  First_Assign,
+  Assign = First_Assign,
+  Add_Assign,
+  Subtract_Assign,
+  Or_Assign,
+  And_Assign,
+  Xor_Assign,
+  Left_Shift_Assign,
+  Right_Shift_Assign,
+  Multiply_Assign,
+  Divide_Assign,
+  Modulo_Assign,
+  Last_Assign = Modulo_Assign,
+
+  // Special assignment
+  Increment,
+  Decrement,
+  Colon_Assign,
+
+  // Keywords.
+  Keyword_True,
+  Keyword_False,
+  Keyword_Import,
+  Keyword_Public,
+  Keyword_Internal,
+  Keyword_Private,
+  Keyword_Extern,
+  Keyword_Const,
+  Keyword_Global,
+  Keyword_Enum,
+  Keyword_Struct,
+  Keyword_Union,
+  Keyword_Proc,
+  Keyword_Func,
+  Keyword_Pure,
+  Keyword_Interface,
+  Keyword_Implement,
+  Keyword_Type_Alias,
+  Keyword_Type_Define,
+  Keyword_Composite,
+  Keyword_Dynamic,
+  Keyword_Map,
+  Keyword_SoA,
+  Keyword_AoSoA,
+  Keyword_Params,
+  Keyword_Where,
+  Keyword_Return,
+  Keyword_Break,
+  Keyword_Continue,
+  Keyword_Fallthrough,
+  Keyword_Defer,
+  Keyword_Push_Context,
+  Keyword_If,
+  Keyword_Then,
+  Keyword_Else,
+  Keyword_For,
+  Keyword_Foreach,
+  Keyword_In,
+  Keyword_Switch,
+  Keyword_Case,
+  Keyword_Cast,
+  Keyword_Size_Of,
+  Keyword_Typeid_Of,
+  Keyword_Type_Info_Of,
+}
+
+public const KEYWORD_TRUE := "true";
+public const KEYWORD_FALSE := "false";
+public const KEYWORD_IMPORT := "import";
+public const KEYWORD_PUBLIC := "public";
+public const KEYWORD_INTERNAL := "internal";
+public const KEYWORD_PRIVATE := "private";
+public const KEYWORD_EXTERN := "extern";
+public const KEYWORD_CONST := "const";
+public const KEYWORD_GLOBAL := "global";
+public const KEYWORD_ENUM := "enum";
+public const KEYWORD_STRUCT := "struct";
+public const KEYWORD_UNION := "union";
+public const KEYWORD_PROC := "proc";
+public const KEYWORD_FUNC := "func";
+public const KEYWORD_PURE := "pure";
+public const KEYWORD_INTERFACE := "interface";
+public const KEYWORD_IMPLEMENT := "implement";
+public const KEYWORD_TYPE_ALIAS := "type_alias";
+public const KEYWORD_TYPE_DEFINE := "type_define";
+public const KEYWORD_COMPOSITE := "composite";
+public const KEYWORD_DYNAMIC := "dynamic";
+public const KEYWORD_MAP := "map";
+public const KEYWORD_SOA := "soa";
+public const KEYWORD_AOSOA := "aosoa";
+public const KEYWORD_PARAMS := "params";
+public const KEYWORD_WHERE := "where";
+public const KEYWORD_RETURN := "return";
+public const KEYWORD_BREAK := "break";
+public const KEYWORD_CONTINUE := "continue";
+public const KEYWORD_FALLTHROUGH := "fallthrough";
+public const KEYWORD_DEFER := "defer";
+public const KEYWORD_PUSH_CONTEXT := "push_context";
+public const KEYWORD_IF := "if";
+public const KEYWORD_THEN := "then";
+public const KEYWORD_ELSE := "else";
+public const KEYWORD_FOR := "for";
+public const KEYWORD_FOREACH := "foreach";
+public const KEYWORD_IN := "in";
+public const KEYWORD_SWITCH := "switch";
+public const KEYWORD_CASE := "case";
+public const KEYWORD_CAST := "cast";
+public const KEYWORD_SIZE_OF := "size_of";
+public const KEYWORD_TYPEID_OF := "typeid_of";
+public const KEYWORD_TYPE_INFO_OF := "type_info_of";
+
+/**
+* Holds the token kind for a keyword.
+*/
+private global KEYWORDS: map[string]Token_Kind;
+
+/**
+* Holds the names corresponding to a token kind.
+*/
+private global TOKEN_KIND_NAMES: [...]string = {
+  [Token_Kind.Invalid] = "Invalid",
+
+  [Token_Kind.Eof] = "Eof",
+
+  [Token_Kind.Colon] = ":",
+  [Token_Kind.Dot] = ".",
+  [Token_Kind.Comma] = ",",
+  [Token_Kind.Semicolon] = ";",
+  [Token_Kind.Negate] = "~",
+  [Token_Kind.Not] = "!",
+  [Token_Kind.Question] = "?",
+  [Token_Kind.At] = "@",
+  [Token_Kind.Pound] = "#",
+  [Token_Kind.Arrow] = "->",
+  [Token_Kind.Ellipsis] = "...",
+  [Token_Kind.Left_Parentheses] = "(",
+  [Token_Kind.Right_Parentheses] = ")",
+  [Token_Kind.Left_Brace] = "{",
+  [Token_Kind.Right_Brace] = "}",
+  [Token_Kind.Left_Bracket] = "[",
+  [Token_Kind.Right_Bracket] = "]",
+
+  [Token_Kind.Boolean] = "boolean",
+  [Token_Kind.Integer] = "integer",
+  [Token_Kind.Float] = "float",
+  [Token_Kind.Character] = "character",
+  [Token_Kind.String] = "string",
+  [Token_Kind.Name] = "name",
+
+  [Token_Kind.Multiply] = "*",
+  [Token_Kind.Divide] = "/",
+  [Token_Kind.Modulo] = "%",
+  [Token_Kind.And] = "&",
+  [Token_Kind.Left_Shift] = "<<",
+  [Token_Kind.Right_Shift] = ">>",
+
+  [Token_Kind.Add] = "+",
+  [Token_Kind.Subtract] = "-",
+  [Token_Kind.Xor] = "*",
+  [Token_Kind.Or] = "|",
+
+  [Token_Kind.Equal] = "==",
+  [Token_Kind.Not_Equal] = "!=",
+  [Token_Kind.Less_Than] = "<",
+  [Token_Kind.Greater_Than] = ">",
+  [Token_Kind.Less_Than_Equal] = "<=",
+  [Token_Kind.Greater_Than_Equal] = ">=",
+
+  [Token_Kind.And_And] = "&&",
+  [Token_Kind.Or_Or] = "||",
+
+  [Token_Kind.Assign] = "=",
+  [Token_Kind.Add_Assign] = "+=",
+  [Token_Kind.Subtract_Assign] = "-=",
+  [Token_Kind.Or_Assign] = "|=",
+  [Token_Kind.And_Assign] = "&=",
+  [Token_Kind.Xor_Assign] = "*=",
+  [Token_Kind.Left_Shift_Assign] = "<<=",
+  [Token_Kind.Right_Shift_Assign] = ">>=",
+  [Token_Kind.Multiply_Assign] = "*=",
+  [Token_Kind.Divide_Assign] = "/=",
+  [Token_Kind.Modulo_Assign] = "%=",
+
+  [Token_Kind.Increment] = "++",
+  [Token_Kind.Decrement] = "--",
+  [Token_Kind.Colon_Assign] = ":=",
+
+  [Token_Kind.Keyword_True] = KEYWORD_TRUE,
+  [Token_Kind.Keyword_False] = KEYWORD_FALSE,
+  [Token_Kind.Keyword_Import] = KEYWORD_IMPORT,
+  [Token_Kind.Keyword_Public] = KEYWORD_PUBLIC,
+  [Token_Kind.Keyword_Internal] = KEYWORD_INTERNAL,
+  [Token_Kind.Keyword_Private] = KEYWORD_PRIVATE,
+  [Token_Kind.Keyword_Extern] = KEYWORD_EXTERN,
+  [Token_Kind.Keyword_Const] = KEYWORD_CONST,
+  [Token_Kind.Keyword_Global] = KEYWORD_GLOBAL,
+  [Token_Kind.Keyword_Enum] = KEYWORD_ENUM,
+  [Token_Kind.Keyword_Struct] = KEYWORD_STRUCT,
+  [Token_Kind.Keyword_Union] = KEYWORD_UNION,
+  [Token_Kind.Keyword_Proc] = KEYWORD_PROC,
+  [Token_Kind.Keyword_Func] = KEYWORD_FUNC,
+  [Token_Kind.Keyword_Pure] = KEYWORD_PURE,
+  [Token_Kind.Keyword_Interface] = KEYWORD_INTERFACE,
+  [Token_Kind.Keyword_Implement] = KEYWORD_IMPLEMENT,
+  [Token_Kind.Keyword_Type_Alias] = KEYWORD_TYPE_ALIAS,
+  [Token_Kind.Keyword_Type_Define] = KEYWORD_TYPE_DEFINE,
+  [Token_Kind.Keyword_Composite] = KEYWORD_COMPOSITE,
+  [Token_Kind.Keyword_Dynamic] = KEYWORD_DYNAMIC,
+  [Token_Kind.Keyword_Map] = KEYWORD_MAP,
+  [Token_Kind.Keyword_SoA] = KEYWORD_SOA,
+  [Token_Kind.Keyword_AoSoA] = KEYWORD_AOSOA,
+  [Token_Kind.Keyword_Params] = KEYWORD_PARAMS,
+  [Token_Kind.Keyword_Where] = KEYWORD_WHERE,
+  [Token_Kind.Keyword_Return] = KEYWORD_RETURN,
+  [Token_Kind.Keyword_Break] = KEYWORD_BREAK,
+  [Token_Kind.Keyword_Continue] = KEYWORD_CONTINUE,
+  [Token_Kind.Keyword_Fallthrough] = KEYWORD_FALLTHROUGH,
+  [Token_Kind.Keyword_Defer] = KEYWORD_DEFER,
+  [Token_Kind.Keyword_Push_Context] = KEYWORD_PUSH_CONTEXT,
+  [Token_Kind.Keyword_If] = KEYWORD_IF,
+  [Token_Kind.Keyword_Then] = KEYWORD_THEN,
+  [Token_Kind.Keyword_Else] = KEYWORD_ELSE,
+  [Token_Kind.Keyword_For] = KEYWORD_FOR,
+  [Token_Kind.Keyword_Foreach] = KEYWORD_FOREACH,
+  [Token_Kind.Keyword_In] = KEYWORD_IN,
+  [Token_Kind.Keyword_Switch] = KEYWORD_SWITCH,
+  [Token_Kind.Keyword_Case] = KEYWORD_CASE,
+  [Token_Kind.Keyword_Cast] = KEYWORD_CAST,
+  [Token_Kind.Keyword_Size_Of] = KEYWORD_SIZE_OF,
+  [Token_Kind.Keyword_Typeid_Of] = KEYWORD_TYPEID_OF,
+  [Token_Kind.Keyword_Type_Info_Of] = KEYWORD_TYPE_INFO_OF,
+};
+
+/**
+* Holds the corresponding binary token kinds for binary assignments.
+*/
+internal global ASSIGN_TOKEN_TO_BINARY_TOKEN: [...]Token_Kind = {
+  [Token_Kind.Add_Assign] = .Add,
+  [Token_Kind.Subtract_Assign] = .Subtract,
+  [Token_Kind.Or_Assign] = .Or,
+  [Token_Kind.And_Assign] = .And,
+  [Token_Kind.Xor_Assign] = .Xor,
+  [Token_Kind.Left_Shift_Assign] = .Left_Shift,
+  [Token_Kind.Right_Shift_Assign] = .Right_Shift,
+  [Token_Kind.Multiply_Assign] = .Multiply,
+  [Token_Kind.Divide_Assign] = .Divide,
+  [Token_Kind.Modulo_Assign] = .Modulo,
+};
+
+/**
+* Represents the value of a token.
+*/
+public union Token_Value {
+  bool,
+  u64,
+  f64,
+  char,
+  string,
+}
+
+/**
+* Represents a single token in a token stream.
+*/
+public struct Token {
+  kind: Token_Kind,          // The kind of the token.
+  value: Token_Value,        // The value of the token.
+  position: Source_Position, // The source position of the token.
+}
+
+/**
+* Represents the state of the Lexer.
+*/
+public struct Lexer {
+  private stream: string,            // The source stream.
+  private stream_byte_position: int, // The byte position inside the source stream.
+  public token: Token,              // The current token inside the stream.
+}
+
+/*
+* Maps a char to their numerical digit.
+*/
+private global CHAR_TO_DIGIT: [256]u64 = {
+  ['0'] = 0,
+  ['1'] = 1,
+  ['2'] = 2,
+  ['3'] = 3,
+  ['4'] = 4,
+  ['5'] = 5,
+  ['6'] = 6,
+  ['7'] = 7,
+  ['8'] = 8,
+  ['9'] = 9,
+  ['a'] = 10, ['A'] = 10,
+  ['b'] = 11, ['B'] = 11,
+  ['c'] = 12, ['C'] = 12,
+  ['d'] = 13, ['D'] = 13,
+  ['e'] = 14, ['E'] = 14,
+  ['f'] = 15, ['F'] = 15,
+};
+
+/*
+* Maps a char to their corresponding escape character.
+* Currently our support for espace sequences is very limited.
+*/
+private global ESCAPE_TO_CHAR: [256]char = {
+  ['0']  = '\0',
+  ['a']  = '\a',
+  ['b']  = '\b',
+  ['e']  = '\e',
+  ['f']  = '\f',
+  ['n']  = '\n',
+  ['r']  = '\r',
+  ['t']  = '\t',
+  ['v']  = '\v',
+  ['\''] = '\'',
+  ['"']  = '"',
+  ['\\'] = '\\',
+};
+
+/**
+* Initializes the keyword mappings.
+*/
+public proc lexer_init_keywords() {
+  map_set(&KEYWORDS, KEYWORD_TRUE, .Keyword_True);
+  map_set(&KEYWORDS, KEYWORD_FALSE, .Keyword_False);
+  map_set(&KEYWORDS, KEYWORD_IMPORT, .Keyword_Import);
+  map_set(&KEYWORDS, KEYWORD_PUBLIC, .Keyword_Public);
+  map_set(&KEYWORDS, KEYWORD_INTERNAL, .Keyword_Internal);
+  map_set(&KEYWORDS, KEYWORD_PRIVATE, .Keyword_Private);
+  map_set(&KEYWORDS, KEYWORD_EXTERN, .Keyword_Extern);
+  map_set(&KEYWORDS, KEYWORD_CONST, .Keyword_Const);
+  map_set(&KEYWORDS, KEYWORD_GLOBAL, .Keyword_Global);
+  map_set(&KEYWORDS, KEYWORD_ENUM, .Keyword_Enum);
+  map_set(&KEYWORDS, KEYWORD_STRUCT, .Keyword_Struct);
+  map_set(&KEYWORDS, KEYWORD_UNION, .Keyword_Union);
+  map_set(&KEYWORDS, KEYWORD_PROC, .Keyword_Proc);
+  map_set(&KEYWORDS, KEYWORD_FUNC, .Keyword_Func);
+  map_set(&KEYWORDS, KEYWORD_PURE, .Keyword_Pure);
+  map_set(&KEYWORDS, KEYWORD_INTERFACE, .Keyword_Interface);
+  map_set(&KEYWORDS, KEYWORD_IMPLEMENT, .Keyword_Implement);
+  map_set(&KEYWORDS, KEYWORD_TYPE_ALIAS, .Keyword_Type_Alias);
+  map_set(&KEYWORDS, KEYWORD_TYPE_DEFINE, .Keyword_Type_Define);
+  map_set(&KEYWORDS, KEYWORD_COMPOSITE, .Keyword_Composite);
+  map_set(&KEYWORDS, KEYWORD_DYNAMIC, .Keyword_Dynamic);
+  map_set(&KEYWORDS, KEYWORD_MAP, .Keyword_Map);
+  map_set(&KEYWORDS, KEYWORD_SOA, .Keyword_SoA);
+  map_set(&KEYWORDS, KEYWORD_AOSOA, .Keyword_AoSoA);
+  map_set(&KEYWORDS, KEYWORD_PARAMS, .Keyword_Params);
+  map_set(&KEYWORDS, KEYWORD_WHERE, .Keyword_Where);
+  map_set(&KEYWORDS, KEYWORD_RETURN, .Keyword_Return);
+  map_set(&KEYWORDS, KEYWORD_BREAK, .Keyword_Break);
+  map_set(&KEYWORDS, KEYWORD_CONTINUE, .Keyword_Continue);
+  map_set(&KEYWORDS, KEYWORD_FALLTHROUGH, .Keyword_Fallthrough);
+  map_set(&KEYWORDS, KEYWORD_DEFER, .Keyword_Defer);
+  map_set(&KEYWORDS, KEYWORD_PUSH_CONTEXT, .Keyword_Push_Context);
+  map_set(&KEYWORDS, KEYWORD_IF, .Keyword_If);
+  map_set(&KEYWORDS, KEYWORD_THEN, .Keyword_Then);
+  map_set(&KEYWORDS, KEYWORD_ELSE, .Keyword_Else);
+  map_set(&KEYWORDS, KEYWORD_FOR, .Keyword_For);
+  map_set(&KEYWORDS, KEYWORD_FOREACH, .Keyword_Foreach);
+  map_set(&KEYWORDS, KEYWORD_IN, .Keyword_In);
+  map_set(&KEYWORDS, KEYWORD_SWITCH, .Keyword_Switch);
+  map_set(&KEYWORDS, KEYWORD_CASE, .Keyword_Case);
+  map_set(&KEYWORDS, KEYWORD_CAST, .Keyword_Cast);
+  map_set(&KEYWORDS, KEYWORD_SIZE_OF, .Keyword_Size_Of);
+  map_set(&KEYWORDS, KEYWORD_TYPEID_OF, .Keyword_Typeid_Of);
+  map_set(&KEYWORDS, KEYWORD_TYPE_INFO_OF, .Keyword_Type_Info_Of);
+}
+
+/*
+* Destroys the keyword mappings.
+*/
+public proc lexer_destroy_keywords() {
+  map_destroy(&KEYWORDS);
+}
+
+/**
+* Makes a new lexer.
+*
+* @param file   The file the stream came from.
+* @param stream The stream for the lexer.
+* @return The new lexer.
+*/
+public proc lexer_make(file: string, stream: string) -> Lexer {
+  lexer: Lexer;
+  lexer.init(file, stream);
+  return lexer;
+}
+
+
+/**
+* Gets a string representation for a token kind.
+*
+* @param kind The token kind to get the string representation for.
+* @return The string representation of the token kind.
+*/
+public proc lexer_get_token_kind_name(kind: Token_Kind) -> string {
+  return TOKEN_KIND_NAMES[kind];
+}
+
+implement Lexer {
+
+  /**
+  * Initializes a lexer with given properties.
+  *
+  * @param file   The file the stream came from.
+  * @param stream The stream for the lexer.
+  */
+  public proc init(file: string, stream: string) {
+    self.stream = stream;
+    self.stream_byte_position = 0;
+    self.token = { };
+    self.token.position.file = file;
+    self.token.position.line = 1;
+    self.token.position.column = 1;
+  }
+
+  /**
+  * Gets a string containing information about the current token in a lexer.
+  *
+  * @return The token info.
+  */
+  public proc get_token_info() -> string {
+    if (self.token.kind == .Name) {
+      return self.token.value.(string);
+    } else {
+      return lexer_get_token_kind_name(self.token.kind);
+    }
+  }
+
+  /**
+  * Checks whether or not the current lexer token is of a specific kind.
+  * 
+  * @param kind  The kind to check for.
+  * @return True when the current lexer token is of the given kind otherwise false.
+  */
+  public func is_token(kind: Token_Kind) -> bool {
+    return self.token.kind == kind;
+  }
+
+  /**
+  * Checks whether or not the current lexer token is an assignment operator.
+  * 
+  * @return True when the current lexer token is an assignment operator otherwise false.
+  */
+  public func is_assign_operator() -> bool {
+    return self.token.kind >= .First_Assign && self.token.kind <= .Last_Assign;
+  }
+
+  /**
+  * Checks whether or not the current lexer token is a comparison operator.
+  * 
+  * @return True when the current lexer token is a comparison operator otherwise false.
+  */
+  public func is_comparison_operator() -> bool {
+    return self.token.kind >= .First_Comparison && self.token.kind <= .Last_Comparison;
+  }
+
+  /**
+  * Checks whether or not the current lexer token is an additive operator.
+  * 
+  * @return True when the current lexer token is an additive operator otherwise false.
+  */
+  public func is_additive_operator() -> bool {
+    return self.token.kind >= .First_Additive && self.token.kind <= .Last_Additive;
+  }
+
+  /**
+  * Checks whether or not the current lexer token is a multiplicative operator.
+  * 
+  * @return True when the current lexer token is a multiplicative operator otherwise false.
+  */
+  public func is_multiplicative_operator() -> bool {
+    return self.token.kind >= .First_Multiplicative && self.token.kind <= .Last_Multiplicative;
+  }
+
+  /**
+  * Checks whether or not the current lexer token is a unary operator.
+  * 
+  * @return True when the current lexer token is a unary operator otherwise false.
+  */
+  public func is_unary_operator() -> bool {
+    return self.is_token(.Add)  ||
+      self.is_token(.Subtract)  ||
+      self.is_token(.Multiply)  ||
+      self.is_token(.And)       ||
+      self.is_token(.Negate)    ||
+      self.is_token(.Not)       ||
+      self.is_token(.Increment) ||
+      self.is_token(.Decrement);
+  }
+
+  /**
+  * Trys to match a given token kind and lexes the next one on success.
+  * 
+  * @param kind  The token kind to match.
+  * @return True when the current lexer token is of the given kind otherwise false.
+  */
+  public proc match_token(kind: Token_Kind) -> bool {
+    if (self.is_token(kind)) {
+      self.get_next_token();
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+  * Expects a given token kind and lexes the next one on success.
+  * 
+  * @param kind  The token kind to expect.
+  * @return True when the current lexer token is of the given kind otherwise false.
+  */
+  public proc expect_token(kind: Token_Kind) -> bool {
+    if (self.is_token(kind)) {
+      self.get_next_token();
+      return true;
+    } else {
+      report_error_fatal_lexer(self, "Expected token '%'. Got '%'", lexer_get_token_kind_name(kind), self.get_token_info());
+      return false;
+    }
+  }
+
+  /**
+  * Gets/Lexes the next token in the stream of a lexer.
+  * 
+  * @return The newly lexed token.
+  */
+  public proc get_next_token() -> Token {
+    self.token.value = {};
+    self.token.kind = .Invalid;
+
+    self.skip_whitespace_and_comments();
+
+    // Check for end.
+    if (self.stream_byte_position >= length(self.stream)) {
+      self.token.kind = .Eof;
+      return self.token;
+    }
+
+    start_column := self.token.position.column;
+    token_start := self.stream_byte_position;
+    character := self.consume_character();
+
+    switch (character) {
+      case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9': {
+        for (strings.is_digit(character)) {
+          character = self.consume_character();
+        }
+        
+        is_float := character == '.' || strings.to_lower(character) == 'e';
+        // If we encounter a alpha character after the '.', we know we have a regular member access on a literal like: 123.foo().
+        if (strings.is_letter(self.peek_next_character())) {
+          is_float = false;
+        }
+
+        // We reset the stream position to the start for proper scanning.
+        self.stream_byte_position = token_start;
+
+        if (is_float) {
+          self.scan_float();
+        } else {
+          self.scan_integer();
+        }
+      }
+
+      case '\'': {
+        self.scan_character();
+      }
+      case '"': {
+        self.scan_string(false);
+      }
+      case '`': {
+        self.scan_string(true);
+      }
+
+      case '.': {
+        self.token.kind = .Dot;
+        character = self.peek_next_character();
+        second_character := self.peek_second_next_character();
+        if (strings.is_digit(character)) {
+          // We have to "reset" the stream to the start position because the "." we have consumed is needed for properly scanning the float.
+          self.stream_byte_position = token_start;
+          self.scan_float();
+        } else if (character == '.' && second_character == '.') {
+          self.token.kind = .Ellipsis;
+          self.consume_character();
+          self.consume_character();
+        }
+      }
+
+      case ',': { self.token.kind = .Comma; }
+      case ';': { self.token.kind = .Semicolon; }
+      case '~': { self.token.kind = .Negate; }
+      case '?': { self.token.kind = .Question; }
+      case '@': { self.token.kind = .At; }
+      case '#': { self.token.kind = .Pound; }
+      case '(': { self.token.kind = .Left_Parentheses; }
+      case ')': { self.token.kind = .Right_Parentheses; }
+      case '[': { self.token.kind = .Left_Bracket; }
+      case ']': { self.token.kind = .Right_Bracket; }
+      case '{': { self.token.kind = .Left_Brace; }
+      case '}': { self.token.kind = .Right_Brace; }
+      case '!': {
+        self.token.kind = .Not;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Not_Equal;
+        }
+      }
+      case '=': {
+        self.token.kind = .Assign;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Equal;
+        }
+      }
+      case ':': {
+        self.token.kind = .Colon;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Colon_Assign;
+        }
+      }
+      case '*': {
+        self.token.kind = .Multiply;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Multiply_Assign;
+        }
+      }
+      case '/': {
+        self.token.kind = .Divide;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Divide_Assign;
+        }
+      }
+      case '%': {
+        self.token.kind = .Modulo;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Modulo_Assign;
+        }
+      }
+      case '^': {
+        self.token.kind = .Xor;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Xor_Assign;
+        }
+      }
+      case '+': {
+        self.token.kind = .Add;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Add_Assign;
+        } else if (self.peek_next_character() == '+') {
+          self.consume_character();
+          self.token.kind = .Increment;
+        }
+      }
+      case '-': {
+        self.token.kind = .Subtract;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Subtract_Assign;
+        } else if (self.peek_next_character() == '-') {
+          self.consume_character();
+          self.token.kind = .Decrement;
+        } else if (self.peek_next_character() == '>') {
+          self.consume_character();
+          self.token.kind = .Arrow;
+        }
+      }
+      case '&': {
+        self.token.kind = .And;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .And_Assign;
+        } else if (self.peek_next_character() == '&') {
+          self.consume_character();
+          self.token.kind = .And_And;
+        }
+      }
+      case '|': {
+        self.token.kind = .Or;
+        if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Or_Assign;
+        } else if (self.peek_next_character() == '|') {
+          self.consume_character();
+          self.token.kind = .Or_Or;
+        }
+      }
+      case '<': {
+        self.token.kind = .Less_Than;
+        if (self.peek_next_character() == '<') {
+          self.consume_character();
+          self.token.kind = .Left_Shift;
+          if (self.peek_next_character() == '=') {
+            self.consume_character();
+            self.token.kind = .Left_Shift_Assign;
+          }
+        } else if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Less_Than_Equal;
+        }
+      }
+      case '>': {
+        self.token.kind = .Greater_Than;
+        if (self.peek_next_character() == '>') {
+          self.consume_character();
+          self.token.kind = .Right_Shift;
+          if (self.peek_next_character() == '=') {
+            self.consume_character();
+            self.token.kind = .Right_Shift_Assign;
+          }
+        } else if (self.peek_next_character() == '=') {
+          self.consume_character();
+          self.token.kind = .Greater_Than_Equal;
+        }
+      }
+      case: {
+        // Currently we interpret everything else as a valid character for an identifier/keyword.
+        character = self.peek_next_character();
+        for (strings.is_letter(character) || strings.is_digit(character) || character == '_') {
+          self.consume_character();
+          character = self.peek_next_character();
+        }
+        token_end := self.stream_byte_position;
+
+        str := self.stream[token_start:token_end];
+        self.token.value = str;
+        self.token.position.column = start_column;
+
+        keyword_kind, keyword_found := map_get(&KEYWORDS, str);
+        if (keyword_found) {
+          self.token.kind = keyword_kind;
+          if (keyword_kind == .Keyword_True || keyword_kind == .Keyword_False) {
+            self.token.kind = .Boolean;
+            self.token.value = keyword_kind == .Keyword_True;
+          }
+        } else {
+          self.token.kind = .Name;
+        }
+
+        return self.token;
+      }
+    }
+
+    self.token.position.column = start_column;
+
+    return self.token;
+  }
+
+  /**
+  * Scans the current token of a lexer as a float.
+  */
+  private proc scan_float() {
+    self.token.kind = .Float;
+    self.token.value = 0.0;
+
+    start_position := self.stream_byte_position;
+    character := self.peek_next_character();
+    for (strings.is_digit(character)) {
+      self.consume_character();
+      character = self.peek_next_character();
+    }
+
+    if (character == '.') {
+      self.consume_character();
+      character = self.peek_next_character();
+      for (strings.is_digit(character)) {
+        self.consume_character();
+        character = self.peek_next_character();
+      } 
+    } else if (strings.to_lower(character) == 'e') {
+      self.consume_character();
+      character = self.peek_next_character();
+
+      if (character == '+' || character == '-') {
+        self.consume_character();
+        character = self.peek_next_character();
+      }
+
+      if (!strings.is_digit(character)) {
+        report_error_fatal_lexer(self, "Expected digit after float exponent literal but found '%'", character);
+      }
+
+      for (strings.is_digit(character)) {
+        self.consume_character();
+        character = self.peek_next_character();
+      }
+    }
+
+    offset: ^*byte = start_position;
+    stream_data := cast(*byte) data(self.stream);
+    float_begin := cast(cstring) (stream_data + offset);
+
+    value := libc.strtod(float_begin, null);
+
+    self.token.value = value;
+  }
+
+  /**
+  * Scans the current token of a lexer as an integer.
+  */
+  private proc scan_integer() {
+    self.token.kind = .Integer;
+    self.token.value = cast(u64) 0;
+
+    character := self.peek_next_character();
+
+    base: u64 = 10;
+    if (character == '0') {
+      self.consume_character();
+      character := self.peek_next_character();
+
+      if (strings.is_letter(character)) {
+        if (strings.to_lower(character) == 'b') {
+          base = 2;
+        } else if (strings.to_lower(character) == 'o') {
+          base = 8;
+        } else if (strings.to_lower(character) == 'x') {
+          base = 16;
+        } else {
+          report_error_fatal_lexer(self, "Invalid integer literal prefix: '%'", character);
+        }
+        self.consume_character();
+      }
+    }
+
+    character = self.peek_next_character();
+
+    value: u64 = 0;
+    for {
+      // We allow an unlimited amount of underscores anywhere within an integer literal.
+      if (character == '_') {
+        self.consume_character();
+        character = self.peek_next_character();
+        continue;
+      }
+
+      digit := CHAR_TO_DIGIT[character];
+      // Make sure we actually have a valid digit.
+      // This currently does an early out for hexadeciaml numbers greater than 'f'.
+      if (digit == 0 && character != '0') {
+        break;
+      }
+
+      // Make sure the digit is valid for the base.
+      if (digit >= base) {
+        report_error_fatal_lexer(self, "Digit '%' out of range for base %", character, base);
+        digit = 0;
+      }
+
+      // Make sure the literal is not too big.
+      if (value > (math.U64_MAX - digit) / base) {
+        report_error_fatal_lexer(self, "Integer literal constant is too big");
+      }
+
+      value = value * base + digit;
+      self.consume_character();
+      character = self.peek_next_character();
+    }
+
+    self.token.value = value;
+  }
+
+  /**
+  * Scans the current token of a lexer as a character.
+  */
+  private proc scan_character() {
+    self.token.kind = .Character;
+    self.token.value = '\0';
+
+    character := self.peek_next_character();
+
+    value: char;
+    if (character == '\'') {
+      report_error_fatal_lexer(self, "Character literal cannot be empty");
+    } else if (character == '\n') {
+      report_error_fatal_lexer(self, "Character literal cannot contain newline");
+    } else if (character == '\\') {
+      self.consume_character();
+      character := self.peek_next_character();  
+
+      if (cast(int) character < length(ESCAPE_TO_CHAR)) {
+        value = ESCAPE_TO_CHAR[character];  
+
+        // Make sure the escaped character is actually valid.
+        if (value == '\0' && character != '0') {
+          report_error_fatal_lexer(self, "Invalid character literal espace: '\\%'", character);  
+        }
+      } else {
+        report_error_fatal_lexer(self, "Invalid character literal espace: '\\%'", character);
+      }
+    } else {
+      value = character;
+    }
+
+    self.consume_character();
+    character = self.peek_next_character();
+    if (character != '\'') {
+      report_error_fatal_lexer(self, "Expected closing char quote but found: '%'", character);
+    } else {
+      self.consume_character();
+    }
+
+    self.token.value = value;
+  }
+
+  /**
+  * Scans the current token of a lexer as a string.
+  * 
+  * @param is_raw Should the string be passed raw?
+  */
+  private proc scan_string(is_raw: bool) {
+    self.token.kind = .String;
+
+    character := self.peek_next_character();
+
+    // We do not destroy the builder here because we return his buffer as the string.
+    builder: strings.Builder;
+    
+    for (character != '\0' && ((is_raw && character != '`') || (!is_raw && character != '"'))) {
+      value := character;
+      if (!is_raw) {
+        if (character == '\n') {
+          report_error_fatal_lexer(self, "String literal cannot contain newline");
+        } else if (character == '\\') {
+          self.consume_character();
+          character = self.peek_next_character();  
+
+          if (cast(int) character < length(ESCAPE_TO_CHAR)) {
+            value = ESCAPE_TO_CHAR[character];  
+
+            // Make sure the escaped character is actually valid.
+            if (value == '\0' && character != '0') {
+              report_error_fatal_lexer(self, "Invalid string literal espace: '\\%'", character);  
+            }
+          } else {
+            report_error_fatal_lexer(self, "Invalid string literal espace: '\\%'", character);
+          }
+        }
+      }
+
+      builder.write_char(value);
+
+      self.consume_character();
+      character = self.peek_next_character();
+    }
+
+    if ((is_raw && character != '`') || (!is_raw && character != '"')) {
+      report_error_fatal_lexer(self, "Unexpected end of file within string literal");
+      return;
+    }
+    self.consume_character();
+
+    self.token.value = builder.to_string();
+  }
+
+  /**
+  * Skips all whitespace and comments in the lexer stream.
+  */
+  private proc skip_whitespace_and_comments() {
+    for {
+      character := self.peek_next_character();
+      if (character == '\n') {
+        self.advance_newline();
+      } 
+
+      is_whitespace := strings.is_space(character);
+      if (is_whitespace) {
+        // We consume the caracter only if it is truly a whitespace.
+        self.consume_character();
+      } else if (character == '/') {
+        if (self.peek_second_next_character() == '/') {
+          // Skip single-line comment.
+          self.consume_character();
+          self.consume_character();
+
+          character = self.peek_next_character();
+          for (character != '\0' && character != '\n') {
+            self.consume_character();
+            character = self.peek_next_character();
+          }
+        } else if (self.peek_second_next_character() == '*') {
+          // Skip multi-line comment.
+          self.consume_character();
+          self.consume_character();
+
+          level := 1;
+
+          character = self.peek_next_character();
+          for (character != '\0' && level > 0) {
+            // Allow nesting of multi-line comments
+            if (character == '/' && self.peek_second_next_character() == '*') {
+              level += 1;
+
+              self.consume_character();
+              self.consume_character();
+              character = self.peek_next_character();
+            } else if (character == '*' && self.peek_second_next_character() == '/') {
+              level -= 1;
+
+              self.consume_character();
+              self.consume_character();
+              character = self.peek_next_character();
+            } else {
+              if (character == '\n') {
+                self.advance_newline();
+              }
+
+              self.consume_character();
+            }
+            character = self.peek_next_character();
+          }
+        } else {
+          // Here we know that we have found a single '/' which corresponds to a division token.
+          break;
+        }
+      } else {
+        // At this point we have consumed all whitespace characters and can continue on.
+        break;
+      }
+    }
+  }
+
+  /**
+  * Peeks the next character in the lexer stream.
+  * 
+  * @return The peeked character.
+  */
+  private proc peek_next_character() -> char {
+    if (self.stream_byte_position >= length(self.stream)) {
+      return {};
+    }
+
+    character, _ := strings.char_at_byte_position(self.stream, self.stream_byte_position);
+    return character;
+  }
+
+  /**
+  * Peeks the next character in the lexer stream and gets its size.
+  * 
+  * @return 1. The peeked character; 2. The size of the character in bytes.
+  */
+  private proc peek_next_character_with_size() -> (char, int) {
+    if (self.stream_byte_position >= length(self.stream)) {
+      return {};
+    }
+
+    return strings.char_at_byte_position(self.stream, self.stream_byte_position);
+  }
+
+  /**
+  * Peeks the second next character in the lexer stream.
+  * 
+  * @param str The lexer to peek the second next character of.
+  * @return The peeked character.
+  */
+  private proc peek_second_next_character() -> char {
+    _, character_byte_size := self.peek_next_character_with_size();
+    stream_byte_position := self.stream_byte_position + character_byte_size;
+
+    if (stream_byte_position >= length(self.stream)) {
+      return '\0';
+    }
+
+    character, _ := strings.char_at_byte_position(self.stream, stream_byte_position);
+    return character;
+  }
+
+  /**
+  * Consumes the next character in the lexer stream.
+  * 
+  * @param str The lexer to consume the next character of.
+  * @return The consumed character.
+  */
+  private proc consume_character() -> char {
+    character, byte_size := strings.char_at_byte_position(self.stream, self.stream_byte_position);
+    self.stream_byte_position += byte_size;
+    self.token.position.column += 1;
+    return character;
+  }
+
+  /**
+  * Advances the lexer state to a new line.
+  * 
+  * @param str The lexer to advance.
+  */
+  private proc advance_newline() {
+    // We set the column to 0 because it will get incremented to 1 when the \n is consumed.
+    self.token.position.line += 1;
+    self.token.position.column = 0;
+  }
+
+}

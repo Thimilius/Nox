@@ -1,0 +1,116 @@
+implement Generator {
+
+  /**
+  * Executes optimization algorithms.
+  */
+  internal proc optimize() {
+    foreach (symbol in self.resolver_output.reachable_sorted_symbols) {
+      if (symbol.kind != .Routine || has_flag(symbol.flags, .Uninstantiated_Generic) || has_flag(symbol.flags, .Routine_Disabled)) then continue;
+      if (has_flag((cast(*Type_Routine) symbol.type).routine_flags, .Is_Intrinsic)) then continue;
+
+      llvm_routine := self.symbol_to_llvm(symbol);
+      LLVMRunFunctionPassManager(self.llvm_function_pass_manager, llvm_routine);
+    }
+
+    LLVMRunPassManager(self.llvm_module_pass_manager, self.module);
+  }
+
+  /**
+  * Initialize the optimization algorithms for the module manager.
+  *
+  * @param optimization_level The optimization level.
+  */
+  internal proc init_module_pass_manager(optimization_level: int) {
+    llvm_module_pass_manager := LLVMCreatePassManager();
+    self.llvm_module_pass_manager = llvm_module_pass_manager;
+
+    if (optimization_level < 0) {
+      return;
+    }
+
+    LLVMAddAlwaysInlinerPass(llvm_module_pass_manager);
+    LLVMAddStripDeadPrototypesPass(llvm_module_pass_manager);
+    LLVMAddAnalysisPasses(self.llvm_target_machine, llvm_module_pass_manager);
+
+    if (optimization_level == 0) {
+      return;
+    }
+    
+    LLVMAddGlobalDCEPass(llvm_module_pass_manager);
+    LLVMAddIPSCCPPass(llvm_module_pass_manager);
+    LLVMAddCalledValuePropagationPass(llvm_module_pass_manager);
+    LLVMAddGlobalOptimizerPass(llvm_module_pass_manager);
+    LLVMAddDeadArgEliminationPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+    if (optimization_level < 2) {
+      return;
+    }
+
+    LLVMAddFunctionInliningPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+    LLVMAddJumpThreadingPass(llvm_module_pass_manager);
+    LLVMAddSimplifyLibCallsPass(llvm_module_pass_manager);
+    LLVMAddTailCallEliminationPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+    LLVMAddReassociatePass(llvm_module_pass_manager);
+    LLVMAddLoopRotatePass(llvm_module_pass_manager);
+    LLVMAddLICMPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+    LLVMAddLoopIdiomPass(llvm_module_pass_manager);
+    LLVMAddLoopDeletionPass(llvm_module_pass_manager);
+    LLVMAddMergedLoadStoreMotionPass(llvm_module_pass_manager);
+    LLVMAddMemCpyOptPass(llvm_module_pass_manager);
+    LLVMAddSCCPPass(llvm_module_pass_manager);
+    LLVMAddBitTrackingDCEPass(llvm_module_pass_manager);
+    LLVMAddJumpThreadingPass(llvm_module_pass_manager);
+    LLVMAddLICMPass(llvm_module_pass_manager);
+    LLVMAddLoopRerollPass(llvm_module_pass_manager);
+    LLVMAddAggressiveDCEPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+
+    LLVMAddGlobalDCEPass(llvm_module_pass_manager);
+    LLVMAddGlobalOptimizerPass(llvm_module_pass_manager);
+    LLVMAddLoopRotatePass(llvm_module_pass_manager);
+    LLVMAddLoopVectorizePass(llvm_module_pass_manager);
+    LLVMAddEarlyCSEPass(llvm_module_pass_manager);
+    LLVMAddLICMPass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+    LLVMAddSLPVectorizePass(llvm_module_pass_manager);
+    LLVMAddLICMPass(llvm_module_pass_manager);
+    LLVMAddAlignmentFromAssumptionsPass(llvm_module_pass_manager);
+    LLVMAddStripDeadPrototypesPass(llvm_module_pass_manager);
+    LLVMAddGlobalDCEPass(llvm_module_pass_manager);
+    LLVMAddConstantMergePass(llvm_module_pass_manager);
+    LLVMAddCFGSimplificationPass(llvm_module_pass_manager);
+  }
+
+  /**
+  * Initialize the optimization algorithms for the function manager.
+  *
+  * @param optimization_level The optimization level.
+  */
+  internal proc init_function_pass_manager(optimization_level: int) {
+    llvm_function_pass_manager := LLVMCreateFunctionPassManagerForModule(self.module);
+    self.llvm_function_pass_manager = llvm_function_pass_manager;
+
+    LLVMInitializeFunctionPassManager(llvm_function_pass_manager);
+
+    if (optimization_level >= 0) {
+      LLVMAddMemCpyOptPass(llvm_function_pass_manager);
+      LLVMAddPromoteMemoryToRegisterPass(llvm_function_pass_manager);
+      LLVMAddMergedLoadStoreMotionPass(llvm_function_pass_manager);
+
+      if (optimization_level > 0) {
+        LLVMAddSCCPPass(llvm_function_pass_manager);
+        LLVMAddPromoteMemoryToRegisterPass(llvm_function_pass_manager);
+        LLVMAddUnifyFunctionExitNodesPass(llvm_function_pass_manager);
+        LLVMAddCFGSimplificationPass(llvm_function_pass_manager);
+        LLVMAddEarlyCSEPass(llvm_function_pass_manager);
+        LLVMAddLowerExpectIntrinsicPass(llvm_function_pass_manager);
+      }
+    }
+
+    LLVMFinalizeFunctionPassManager(llvm_function_pass_manager);
+  }
+
+}

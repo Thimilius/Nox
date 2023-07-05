@@ -1,0 +1,26 @@
+/**
+* Test the functionality of constants.
+*/
+internal proc test_constants() {
+  assert(B == false);
+  assert(I8 == 100);
+  assert(C == 100.0);
+  assert(RESULT_AFTER == 123);
+  assert(FLOATING == 24.0);
+  assert(TRUE == true);
+  assert(BOOLEAN == true);
+  assert(RESULT == 123);
+  assert(BIG == -0x1000000000000007);
+  assert(NEGATIVE == ~1);
+}
+
+private const B: bool = !true;
+private const I8: i8 = 100;
+private const C: f32 = cast(f32) I8;
+private const FLOATING: f64 = 24.0;
+private const TRUE: bool = BOOLEAN;
+private const BOOLEAN: bool = !false;
+private const RESULT := RESULT_AFTER;
+private const RESULT_AFTER := 123;
+private const NEGATIVE := ~1;
+private const BIG: i64 = -0x1000000000000007;

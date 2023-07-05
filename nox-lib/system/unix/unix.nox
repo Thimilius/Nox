@@ -1,0 +1,34 @@
+#if (NOX_OS == .Linux) {
+
+  import "std:libc"
+
+  public extern proc sysconf(name: i32) -> i64
+
+  public extern proc opendir(name: cstring) -> Dir
+  public extern proc readdir(dirp: Dir) -> *Dirent
+  public extern proc closedir(dirp: Dir) -> i32
+
+  public extern proc getpid() -> i32
+  public extern proc getcwd(buf: cstring, len: libc.size_t) -> cstring
+  public extern proc readlink(path: cstring, buf: *byte, bufsiz: libc.size_t) -> libc.size_t
+  public extern proc realpath(path: cstring, resolved_path: rawptr) -> rawptr
+
+  public extern proc access(path: cstring, mode: i32) -> i32
+
+  public extern proc get_nprocs() -> i32
+
+  public extern proc clock_gettime(clk_id: u64, tp: *Timespec) -> i32
+
+  public extern proc pthread_attr_init(attributes: *pthread_attr_t) -> i32
+	public extern proc pthread_attr_destroy(attributes: *pthread_attr_t) -> i32
+  public extern proc pthread_attr_setdetachstate(attributes: *pthread_attr_t, detach_state: i32) -> i32
+
+  public extern proc pthread_create(thread: *pthread_t, attributes: *pthread_attr_t, procedure: proc "c" (rawptr) -> rawptr, argument: rawptr) -> i32
+  public extern proc pthread_join(thread: pthread_t, return_value: *rawptr) -> i32
+
+  public extern proc pthread_mutex_init(mutex: *pthread_mutex_t, attrs: *pthread_mutexattr_t) -> i32
+	public extern proc pthread_mutex_lock(mutex: *pthread_mutex_t) -> i32
+	public extern proc pthread_mutex_unlock(mutex: *pthread_mutex_t) -> i32
+	public extern proc pthread_mutex_destroy(mutex: *pthread_mutex_t) -> i32
+
+}

@@ -1,0 +1,64 @@
+/**
+* Test the functionality of enums.
+*/
+internal proc test_enums() {
+  test_enums_simple();
+}
+
+private proc test_enums_simple() {
+  c := Color.Red;
+  assert(c == Color.Red);
+
+  c = cast(Color) -1;
+  assert(c == Color.Blue);
+
+  assert(Color.Grey == Color.Gray);
+
+  c = Color.Yellow;
+  i := cast(int) c;
+  assert(i == 54);
+}
+
+private const YELLOW_VALUE: i32 = 54;
+
+private enum Color : i32 {
+  Red,
+  Green,
+  Blue = -1,
+
+  Yellow = YELLOW_VALUE,
+
+  Grey,
+  Gray = Grey,
+}
+
+private proc test_enums_flags() {
+  assert(cast(int) Color_Flag.Red   == 1);
+  assert(cast(int) Color_Flag.Green == 2);
+  assert(cast(int) Color_Flag.Blue  == 4);
+
+  color_flag: Color_Flag;
+
+  set_flag(&color_flag, .Red);
+  assert(has_flag(color_flag, .Red));
+
+  set_flag(&color_flag, .Green);
+  assert(has_flag(color_flag, .Red));
+  assert(has_flag(color_flag, .Green));
+
+  set_flag(&color_flag, .Blue);
+  assert(has_flag(color_flag, .Red));
+  assert(has_flag(color_flag, .Green));
+  assert(has_flag(color_flag, .Blue));
+
+  remove_flag(&color_flag, .Red);
+  assert(!has_flag(color_flag, .Red));
+  assert( has_flag(color_flag, .Green));
+  assert( has_flag(color_flag, .Blue));
+}
+
+@flags private enum Color_Flag {
+  Red,
+  Green,
+  Blue,
+}

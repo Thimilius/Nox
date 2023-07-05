@@ -1,0 +1,1426 @@
+implement Generator {
+
+  /**
+  * Emit a load instruction.
+  *
+  * @param routine_context The context of the routine.
+  * @param type            The type to load.
+  * @param llvm_pointer    The LLVM pointer to load from.
+  * @return The loaded LLVM value.
+  */
+  internal proc emit_load(routine_context: *Routine_Context, type: *Type, llvm_pointer: LLVMValueRef) -> LLVMValueRef {
+    llvm_type := self.type_to_llvm(type);
+    return LLVMBuildLoad2(self.builder, llvm_type, llvm_pointer, make_value_name(routine_context));
+  }
+
+  /**
+  * Emit a raw store instruction.
+  *
+  * @param llvm_pointer The LLVM pointer to store into.
+  * @param llvm_value   The LLVM value to store.
+  */
+  internal proc emit_store_raw(llvm_pointer: LLVMValueRef, llvm_value: LLVMValueRef) {
+    LLVMBuildStore(self.builder, llvm_value, llvm_pointer);
+  }
+
+
+  /**
+  * Emit a store instruction.
+  *
+  * @param routine_context The context of the routine.
+  * @param type            The type to store.
+  * @param llvm_pointer    The LLVM pointer to store into.
+  * @param llvm_value      The LLVM value to store.
+  * @param expression      The expression of the value to store.
+  */
+  internal proc emit_store(routine_context: *Routine_Context, type: *Type, llvm_pointer: LLVMValueRef, llvm_value: LLVMValueRef, expression: *Expression) {
+    needs_special_handling := type.is_union() || type.is_any() || type.is_dynamic_pointer() || type.contains_self_relative_pointer_in_value();
+    if (needs_special_handling) {
+      if (type.is_union()) {
+        self.emit_store_union(routine_context, type, llvm_pointer, llvm_value, expression);
+      } else if (type.is_any()) {
+        self.emit_store_any(routine_context, llvm_pointer, llvm_value, expression);
+      } else if (type.is_dynamic_pointer()) {
+        self.emit_store_dynamic_pointer(routine_context, type, llvm_pointer, llvm_value, expression);
+      } else {
+        assert(type.contains_self_relative_pointer_in_value());
+
+        if (LLVMIsNull(llvm_value)) {
+          self.emit_store_raw(llvm_pointer, llvm_value);
+        } else if (type.is_self_relative_pointer()) {
+          self.emit_store_self_relative_pointer(routine_context, type, llvm_pointer, llvm_value, expression);
+        } else {
+          self.emit_store_self_relative_pointers(routine_context, type, llvm_pointer, llvm_value, expression);
+        }
+      }
+    } else {
+      self.emit_store_raw(llvm_pointer, llvm_value);
+    }
+  }
+
+  /**
+  * Emit a store instruction for a union.
+  *
+  * @param routine_context The context of the routine.
+  * @param union_type      The type of the union to store.
+  * @param llvm_pointer    The LLVM pointer to store into.
+  * @param llvm_value      The LLVM value to store.
+  * @param expression      The expression of the value to store.
+  */
+  internal proc emit_store_union(routine_context: *Routine_Context, union_type: *Type, llvm_pointer: LLVMValueRef, llvm_value: LLVMValueRef, expression: *Expression) {
+    variant_type: *Type;
+    if (expression != null) {
+      variant_type = self.get_resolved_overwrite_type(expression);
+      if (variant_type == null) {
+        variant_type = self.get_resolved_type(expression);
+      }
+    }
+
+    if (expression == null || union_type == variant_type) {
+      // Here we are simply coping the union but because 'llvm_value' is a pointer we have to load it first.
+      llvm_value_union := llvm_value;
+      if (!LLVMIsNull(llvm_value_union)) {
+        llvm_value_union = self.emit_load(routine_context, union_type, llvm_value);
+      }
+      self.emit_store_raw(llvm_pointer, llvm_value_union);
+    } else {
+      switch (variant_type.kind) {
+        case .Untyped_Boolean: variant_type = context.storage.type_bool;
+        case .Untyped_Integer: variant_type = context.storage.type_int;
+        case .Untyped_Float:   variant_type = context.storage.type_f64;
+        case .Untyped_Char:    variant_type = context.storage.type_char;
+        case .Untyped_String:  variant_type = context.storage.type_string;
+      }
+      self.emit_store_union_value(routine_context, union_type, variant_type, llvm_pointer, llvm_value, expression);
+    }
+  }
+
+  /**
+  * Emit a store instruction for a union value.
+  *
+  * @param routine_context The context of the routine.
+  * @param union_type      The type of the union to store.
+  * @param variant_type    The type of the union variant that gets stored.
+  * @param llvm_pointer    The LLVM pointer to store into.
+  * @param llvm_value      The LLVM value to store.
+  * @param expression      The expression of the value to store.
+  */
+  internal proc emit_store_union_value(
+    routine_context: *Routine_Context,
+    union_type: *Type,
+    variant_type: *Type,
+    llvm_pointer: LLVMValueRef,
+    llvm_value: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    assert(variant_type != null);
+
+    type_union := cast(*Type_Union) union_type;
+    
+    llvm_union_type := self.type_to_llvm(union_type);
+    
+    llvm_union_tag_pointer := self.emit_gep_union_tag(self.builder, routine_context, llvm_union_type, llvm_pointer);
+    tag := 0;
+    foreach (variant, i in type_union.variants) {
+      if (variant_type == variant) {
+        tag = i + 1;
+      }
+    }
+    assert(tag != 0);
+    self.emit_store_raw(llvm_union_tag_pointer, LLVMConstInt(LLVMInt64Type(), cast(u64) tag, false));
+
+    llvm_union_value_pointer := self.emit_gep_union_value(self.builder, routine_context, llvm_union_type, llvm_pointer);
+    self.emit_store(routine_context, variant_type, llvm_union_value_pointer, llvm_value, expression);
+  }
+
+  /**
+  * Emit a store instruction for an any.
+  *
+  * @param routine_context The context of the routine.
+  * @param llvm_pointer    The LLVM pointer to store into.
+  * @param llvm_value      The LLVM value to store.
+  * @param expression      The expression of the value to store.
+  */
+  internal proc emit_store_any(routine_context: *Routine_Context, llvm_pointer: LLVMValueRef, llvm_value: LLVMValueRef, expression: *Expression) {
+    llvm_value := llvm_value;
+
+    // We have to explicitly handle the case where we are simply storing an any inside an any.
+    // For example in the case of an empty initializer or a simply copy.
+    expression_type := expression == null ? null : self.get_resolved_type(expression);
+    if (expression_type == null || expression_type.is_any()) {
+      llvm_value_any := self.emit_load(routine_context, context.storage.type_any, llvm_value);
+      self.emit_store_raw(llvm_pointer, llvm_value_any);
+      return;
+    }
+
+    // There are still some scenarios in which 'llvm_value' is still not a pointer like we need it to be,
+    // so that we can properly store it as the data pointer of the any. These cases are:
+    //   - Constants like: 1, 123.323, "Foo" and so on.
+    //   - A parameter that is passed by value (pretty much all basic types).
+    //   - Unary '&' expression are also an rvalue and therefore produce no proper pointer.
+    //   - Query expressions (size_of, typeid_of, ...) which produce direct values.
+    is_pointer := LLVMGetTypeKind(LLVMTypeOf(llvm_value)) == .Pointer;
+    is_constant := cast(bool) LLVMIsConstant(llvm_value);
+    is_value_parameter := !self.type_is_passed_as_pointer(expression_type) && routine_context.last_resolved_symbol_was_parameter;
+    is_unary := expression.kind == .Unary;
+    is_unary_and := is_unary && (cast(*Expression_Unary) expression).operator == .And;
+    is_query := expression.kind == .Query;
+    if ((!is_pointer || (is_value_parameter && !is_unary)) && (is_constant || is_value_parameter || is_unary_and || is_query)) {
+      llvm_temporary := self.emit_temporary(routine_context, expression_type, make_temp_name(routine_context));
+      self.emit_store(routine_context, expression_type, llvm_temporary, llvm_value, expression);
+      llvm_value = llvm_temporary;
+    } 
+
+    id := expression_type.id;
+    // We remove untyped types as those do not have a proper entry in the type table.
+    switch (expression_type.kind) {
+      case .Untyped_Boolean: id = context.storage.type_bool.id;
+      case .Untyped_Integer: id = context.storage.type_int.id;
+      case .Untyped_Float:   id = context.storage.type_f64.id;
+      case .Untyped_Char:    id = context.storage.type_char.id;
+      case .Untyped_String:  id = context.storage.type_string.id;
+      case .Untyped_Null:    id = context.storage.type_rawptr.id;
+    }
+
+    llvm_any_data_pointer := self.emit_gep_value_data(self.builder, routine_context, self.type_to_llvm(context.storage.type_any), llvm_pointer);
+    self.emit_store_raw(llvm_any_data_pointer, llvm_value);
+    llvm_any_typeid_pointer := self.emit_gep_value_length(self.builder, routine_context, self.type_to_llvm(context.storage.type_any), llvm_pointer);
+    self.emit_store_raw(llvm_any_typeid_pointer, LLVMConstInt(LLVMInt64Type(), cast(u64) id, false));
+  }
+
+  /**
+  * Emit a store instruction for a dynamic pointer.
+  *
+  * @param routine_context      The context of the routine.
+  * @param dynamic_pointer_type The type of the dynamic pointer.
+  * @param llvm_pointer         The LLVM pointer to store into.
+  * @param llvm_value           The LLVM value to store.
+  * @param expression           The expression of the value to store.
+  */
+  internal proc emit_store_dynamic_pointer(
+    routine_context: *Routine_Context,
+    dynamic_pointer_type: *Type,
+    llvm_pointer: LLVMValueRef,
+    llvm_value: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    expression_type := expression == null ? null : self.get_resolved_type(expression);
+    if (expression_type == null || expression_type.is_dynamic_pointer() || cast(bool) LLVMIsNull(llvm_value)) {
+      self.emit_store_raw(llvm_pointer, llvm_value);
+    } else {
+      assert(expression_type.is_absolute_pointer());
+
+      llvm_dynamic_pointer_type := self.type_to_llvm(dynamic_pointer_type);
+      llvm_dynamic_pointer_data_pointer := self.emit_gep_value_data(self.builder, routine_context, llvm_dynamic_pointer_type, llvm_pointer);
+      self.emit_store_raw(llvm_dynamic_pointer_data_pointer, llvm_value);
+
+      llvm_dynamic_pointer_vtable_pointer := self.emit_gep_value_length(self.builder, routine_context, llvm_dynamic_pointer_type, llvm_pointer);
+      vtable_key := VTable_Key{dynamic_pointer_type.base, expression_type.base};
+      llvm_vtable, found := map_get(&self.llvm_vtables, vtable_key);
+      assert(found);
+      self.emit_store_raw(llvm_dynamic_pointer_vtable_pointer, llvm_vtable);
+    }
+  }
+
+  /**
+  * Emit a store instruction for a self-relative pointer.
+  *
+  * @param routine_context            The context of the routine.
+  * @param self_relative_pointer_type The type of the dynamic pointer.
+  * @param llvm_pointer               The LLVM pointer to store into.
+  * @param llvm_value                 The LLVM value to store.
+  * @param expression                 The expression of the value to store.
+  */
+  internal proc emit_store_self_relative_pointer(
+    routine_context: *Routine_Context,
+    self_relative_pointer_type: *Type,
+    llvm_pointer: LLVMValueRef,
+    llvm_value: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    llvm_self_relative_offset: LLVMValueRef;
+    if (expression == null) {
+      llvm_value_to_assign := llvm_value;
+      llvm_value_to_assign = self.emit_self_relative_pointer_to_absolute(routine_context, self_relative_pointer_type, llvm_value_to_assign);
+      llvm_self_relative_offset = self.emit_self_relative_pointer_offset(routine_context, self_relative_pointer_type, llvm_pointer, llvm_value_to_assign);
+    } else {
+      llvm_value_to_assign := llvm_value;
+      right_type := self.get_resolved_type(expression);
+      if (right_type.is_self_relative_pointer() && expression.kind != .Unary) {
+        llvm_value_to_assign = self.emit_self_relative_pointer_to_absolute(routine_context, self_relative_pointer_type, llvm_value_to_assign);
+      } else if (right_type.is_absolute_pointer() && !routine_context.last_resolved_symbol_was_parameter) {
+        llvm_value_to_assign = self.emit_load(routine_context, context.storage.get_or_make_type_pointer(right_type.base), llvm_value_to_assign);
+      }
+      llvm_self_relative_offset = self.emit_self_relative_pointer_offset(routine_context, self_relative_pointer_type, llvm_pointer, llvm_value_to_assign);  
+    }
+
+    self.emit_store_raw(llvm_pointer, llvm_self_relative_offset);
+  }
+
+  /**
+  * Emit a store instruction for types containing self-relative pointers.
+  *
+  * @param routine_context    The context of the routine.
+  * @param type               The type that contains the self-relative pointers.
+  * @param llvm_pointer       The LLVM pointer to store into.
+  * @param llvm_value_pointer The LLVM pointer to the value to store.
+  * @param expression         The expression of the value to store.
+  */
+  internal proc emit_store_self_relative_pointers(
+    routine_context: *Routine_Context,
+    type: *Type, llvm_pointer: LLVMValueRef,
+    llvm_value_pointer: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    // First we do a general trivial copy for the type as we will only have special logic for the self-relative pointers.
+    llvm_value_to_store := self.emit_load(routine_context, type, llvm_value_pointer);
+    self.emit_store_raw(llvm_pointer, llvm_value_to_store);
+
+    switch (type.kind) {
+      case .Array: self.emit_store_self_relative_pointers_array(routine_context, type, llvm_pointer, llvm_value_pointer, expression);
+      case .Tuple: self.emit_store_self_relative_pointers_tuple(routine_context, type, llvm_pointer, llvm_value_pointer, expression);
+      case .Struct: self.emit_store_self_relative_pointers_struct(routine_context, type, llvm_pointer, llvm_value_pointer, expression);
+      case: assert(false); // Every other type can't contain a self-relative pointer as a value.
+    }
+  }
+
+  /**
+  * Emit a store instruction for an array containing self-relative pointers.
+  *
+  * @param routine_context    The context of the routine.
+  * @param type               The array type that contains the self-relative pointers.
+  * @param llvm_pointer       The LLVM pointer to store into.
+  * @param llvm_value_pointer The LLVM pointer to the value to store.
+  * @param expression         The expression of the value to store.
+  */
+  internal proc emit_store_self_relative_pointers_array(
+    routine_context: *Routine_Context,
+    type: *Type, llvm_pointer: LLVMValueRef,
+    llvm_value_pointer: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    type_array := cast(*Type_Array) type;
+    assert(!type_array.has_incomplete_elements);
+
+    llvm_type := self.type_to_llvm(type);
+    base_type := type.base;
+
+    if (base_type.is_self_relative_pointer()) {
+      for (i := 0; i < type_array.number_of_elements; i += 1) {
+        llvm_element_pointer := self.emit_gep_field(self.builder, routine_context, llvm_type, llvm_pointer, i);
+        llvm_right_pointer_pointer := self.emit_gep_field(self.builder, routine_context, llvm_type, llvm_value_pointer, i);
+
+        llvm_right_pointer := self.emit_self_relative_pointer_to_absolute(routine_context, base_type, llvm_right_pointer_pointer);
+        llvm_self_relative_offset := self.emit_self_relative_pointer_offset(routine_context, base_type, llvm_element_pointer, llvm_right_pointer);
+        self.emit_store_raw(llvm_element_pointer, llvm_self_relative_offset);
+      }
+    } else {
+      self.emit_store_self_relative_pointers(routine_context, base_type, llvm_pointer, llvm_value_pointer, expression);
+    }
+  }
+
+  /**
+  * Emit a store instruction for a tuple containing self-relative pointers.
+  *
+  * @param routine_context    The context of the routine.
+  * @param type               The tuple type that contains the self-relative pointers.
+  * @param llvm_pointer       The LLVM pointer to store into.
+  * @param llvm_value_pointer The LLVM pointer to the value to store.
+  * @param expression         The expression of the value to store.
+  */
+  internal proc emit_store_self_relative_pointers_tuple(
+    routine_context: *Routine_Context,
+    type: *Type,
+    llvm_pointer: LLVMValueRef,
+    llvm_value_pointer: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    type_tuple := cast(*Type_Tuple) type;
+    llvm_type := self.type_to_llvm(type);
+
+    foreach (element, i in type_tuple.elements) {
+      self.emit_store_self_relative_pointers_struct_or_tuple_element(
+        routine_context,
+        llvm_pointer,
+        llvm_value_pointer,
+        expression,
+        llvm_type,
+        element.type,
+        i,
+      );
+    }
+  }
+
+  /**
+  * Emit a store instruction for a struct containing self-relative pointers.
+  *
+  * @param routine_context    The context of the routine.
+  * @param type               The struct type that contains the self-relative pointers.
+  * @param llvm_pointer       The LLVM pointer to store into.
+  * @param llvm_value_pointer The LLVM pointer to the value to store.
+  * @param expression         The expression of the value to store.
+  */
+  internal proc emit_store_self_relative_pointers_struct(
+    routine_context: *Routine_Context,
+    type: *Type,
+    llvm_pointer: LLVMValueRef,
+    llvm_value_pointer: LLVMValueRef,
+    expression: *Expression,
+  ) {
+    type_struct := cast(*Type_Struct) type;
+    llvm_type := self.type_to_llvm(type);
+
+    foreach (field, i in type_struct.fields) {
+      self.emit_store_self_relative_pointers_struct_or_tuple_element(
+        routine_context,
+        llvm_pointer,
+        llvm_value_pointer,
+        expression,
+        llvm_type,
+        field.type,
+        i,
+      );
+    }
+  }
+
+  /**
+  * Emit a store instruction for a struct or tuple field/element containing self-relative pointers.
+  *
+  * @param routine_context    The context of the routine.
+  * @param llvm_pointer       The LLVM pointer to store into.
+  * @param llvm_value_pointer The LLVM pointer to the value to store.
+  * @param expression         The expression of the value to store.
+  * @param llvm_type          The LLVM type of the field/element.
+  * @param field_type         The type of the field/element.
+  * @param field_index        The index of the field/element.
+  */
+  internal proc emit_store_self_relative_pointers_struct_or_tuple_element(
+    routine_context: *Routine_Context,
+    llvm_pointer: LLVMValueRef,
+    llvm_value_pointer: LLVMValueRef,
+    expression: *Expression,
+    llvm_type: LLVMTypeRef,
+    field_type: *Type,
+    field_index: int,
+  ) {
+    if (!field_type.contains_self_relative_pointer_in_value()) then return;
+
+    llvm_field_pointer := self.emit_gep_field(self.builder, routine_context, llvm_type, llvm_pointer, field_index);
+    llvm_right_pointer_pointer := self.emit_gep_field(self.builder, routine_context, llvm_type, llvm_value_pointer, field_index);
+
+    if (field_type.is_self_relative_pointer()) {
+      llvm_right_pointer := self.emit_self_relative_pointer_to_absolute(routine_context, field_type, llvm_right_pointer_pointer);
+      llvm_self_relative_offset := self.emit_self_relative_pointer_offset(routine_context, field_type, llvm_field_pointer, llvm_right_pointer);
+      LLVMBuildStore(self.builder, llvm_self_relative_offset, llvm_field_pointer);
+    } else {
+      self.emit_store_self_relative_pointers(routine_context, field_type, llvm_field_pointer, llvm_value_pointer, expression);
+    }
+  }
+
+  /**
+  * Emit a possible dereference for a pointer.
+  *
+  * @param routine_context       The context of the routine.
+  * @param expression            The expression of the pointer that possibly needs to be dereferenced.
+  * @param llvm_possible_pointer The LLVM pointer that possibly needs to be dereferenced.
+  * @return The dereferenced pointer.
+  */
+  internal proc emit_possible_pointer_dereference(routine_context: *Routine_Context, expression: *Expression, llvm_possible_pointer: LLVMValueRef) -> LLVMValueRef {
+    type := self.get_resolved_type(expression);
+    needs_to_dereference_pointer := type.is_absolute_pointer() || type.is_self_relative_pointer();
+    if (needs_to_dereference_pointer && !routine_context.last_resolved_symbol_was_parameter && expression.kind != .Unary) {
+      if (type.is_self_relative_pointer()) {
+        return self.emit_self_relative_pointer_to_absolute(routine_context, type, llvm_possible_pointer);
+      } else {
+        return self.emit_load(routine_context, type, llvm_possible_pointer);
+      }
+    }
+    return llvm_possible_pointer;
+  }
+
+  /**
+  * Emit a local on the stack.
+  *
+  * @param routine_context The context of the routine.
+  * @param position        The position of the local.
+  * @param type            The type of the local.
+  * @param name            The name of the local.
+  * @return The local that got emitted.
+  */
+  internal proc emit_local(routine_context: *Routine_Context, position: Source_Position, type: *Type, name: string) -> LLVMValueRef {
+    llvm_type := self.type_to_llvm(type);
+
+    previous_block := self.enter_llvm_block(routine_context, routine_context.declaration_block);
+    llvm_local := LLVMBuildAlloca(self.builder, llvm_type, make_variable_name(routine_context, name));
+    self.enter_llvm_block(routine_context, previous_block);
+
+    self.emit_store_raw(llvm_local, self.default_initializer_value(type));
+
+    // We purposefully overwrite potential previous entries.
+    self.add_local_symbol(name, llvm_local, llvm_type, type, false, routine_context.local_scope);
+    self.debug_emit_local_variable(routine_context, position, type, name, llvm_local);
+
+    return llvm_local;
+  }
+
+  /**
+  * Emit a temporaray on the stack.
+  *
+  * @param routine_context The context of the routine.
+  * @param type            The type of the temporary.
+  * @param name            The name of the temporary.
+  * @return The temporary that got emitted.
+  */
+  internal proc emit_temporary(routine_context: *Routine_Context, type: *Type, name: cstring) -> LLVMValueRef {
+    llvm_type := self.type_to_llvm(type);
+
+    previous_block := self.enter_llvm_block(routine_context, routine_context.declaration_block);
+    llvm_temorary := LLVMBuildAlloca(self.builder, llvm_type, name);
+    self.enter_llvm_block(routine_context, previous_block);
+
+    self.emit_store_raw(llvm_temorary, self.default_initializer_value(type));
+
+    return llvm_temorary;
+  }
+
+  /**
+  * Emit a temporaray on the stack and store a raw value in it.
+  *
+  * @param routine_context The context of the routine.
+  * @param type            The type of the temporary.
+  * @param llvm_value      The LLVM value to store in the temporary.
+  * @param name            The name of the temporary.
+  * @return The temporary that got emitted.
+  */
+  internal proc emit_temporary_and_store_raw(routine_context: *Routine_Context, type: *Type, llvm_value: LLVMValueRef, name: cstring) -> LLVMValueRef {
+    llvm_type := self.type_to_llvm(type);
+
+    previous_block := self.enter_llvm_block(routine_context, routine_context.declaration_block);
+    llvm_temorary := LLVMBuildAlloca(self.builder, llvm_type, name);
+    self.enter_llvm_block(routine_context, previous_block);
+
+    self.emit_store_raw(llvm_temorary, llvm_value);
+
+    return llvm_temorary;
+  }
+
+  /**
+  * Emit a temporaray global.
+  *
+  * @param type      The type of the temporary.
+  * @return The temporary global.
+  */
+  internal proc emit_temporary_global(type: *Type) -> LLVMValueRef {
+    llvm_type := self.type_to_llvm(type);
+    llvm_temporary_global := LLVMAddGlobal(self.module, llvm_type, "global");
+    LLVMSetInitializer(llvm_temporary_global, self.default_initializer_value(type));
+    return llvm_temporary_global;
+  }
+
+  /**
+  * Emit a temporaray routine.
+  *
+  * @param name             The name of the routine.
+  * @param llvm_return_type The LLVM return type of the routine.
+  * @param llvm_parameters  The LLVM parameters of the routine.
+  * @return The temporary routine.
+  */
+  internal proc emit_temporary_routine(name: cstring, llvm_return_type: LLVMTypeRef, llvm_parameters: []LLVMTypeRef) -> (LLVMValueRef, LLVMTypeRef) {
+    llvm_routine_type := LLVMFunctionType(llvm_return_type, data(llvm_parameters), cast(u32) length(llvm_parameters), false);
+    llvm_routine := LLVMAddFunction(self.module, name, llvm_routine_type);
+    return {llvm_routine, llvm_routine_type};
+  }
+
+  /**
+  * Emit the deferred statements in the current local scope.
+  *
+  * @param routine_context The context of the routine.
+  */
+  internal proc emit_deferred_statements_local(routine_context: *Routine_Context) {
+    self.emit_deferred_statements_in_scope(routine_context, routine_context.local_scope);
+  }
+
+  /**
+  * Emit the deferred statements until a control scope is reached.
+  *
+  * @param routine_context The context of the routine.
+  */
+  internal proc emit_deferred_statements_until_control(routine_context: *Routine_Context) {
+    // We emit all deferred statements until we reach the first control block.
+    // This ensures that 'continue' and 'break' don't emit deferred statements past their corresponding control statement.
+    scope := routine_context.local_scope;
+    for (scope != null) {
+      self.emit_deferred_statements_in_scope(routine_context, scope);
+      if (scope.kind == .Control_Block) then return;
+      scope = scope.parent;
+    }
+  }
+
+  /**
+  * Emit all deferred statements starting from the current local scope.
+  *
+  * @param routine_context The context of the routine.
+  */
+  internal proc emit_deferred_statements_all(routine_context: *Routine_Context) {
+    scope := routine_context.local_scope;
+    for (scope != null) {
+      self.emit_deferred_statements_in_scope(routine_context, scope);
+      scope = scope.parent;
+    }
+  }
+
+  /**
+  * Emit the deferred statements of a given scope.
+  *
+  * @param routine_context The context of the routine.
+  * @param scope           The scope to emit the deferred statements of.
+  */
+  internal proc emit_deferred_statements_in_scope(routine_context: *Routine_Context, scope: *Routine_Local_Scope) {
+    for (i := length(scope.deferred_statements) - 1; i >= 0; i -= 1) {
+      deferred_statement := scope.deferred_statements[i];
+      self.emit_statement(routine_context, deferred_statement, false);
+    }
+  }
+
+  /**
+  * Emit a GEP instruction for a field.
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @param field_index     The index of the field to use in the GEP instruction.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_field(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    llvm_type: LLVMTypeRef,
+    llvm_pointer: LLVMValueRef,
+    field_index: int,
+  ) -> LLVMValueRef {
+    return self.emit_gep_field_dynamic(builder, routine_context, llvm_type, llvm_pointer, LLVMConstInt(LLVMInt32Type(), cast(u64) field_index, false));
+  }
+
+  /**
+  * Emit a GEP instruction for a dynamic field.
+  *
+  * @param builder          The LLVM builder to use.
+  * @param routine_context  The context of the routine.
+  * @param llvm_type        The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer     The LLVM pointer the GEP instruction is based on.
+  * @param llvm_field_index The LLVM index of the field to use in the GEP instruction.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_field_dynamic(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    llvm_type: LLVMTypeRef,
+    llvm_pointer: LLVMValueRef,
+    llvm_field_index: LLVMValueRef,
+  ) -> LLVMValueRef {
+    llvm_field_indices: []LLVMValueRef = {LLVMConstInt(LLVMInt32Type(), 0, false), llvm_field_index};
+    return LLVMBuildGEP2(
+      builder,
+      llvm_type,
+      llvm_pointer,
+      data(llvm_field_indices),
+      cast(u32) length(llvm_field_indices),
+      make_value_name(routine_context),
+    );
+  }
+
+  /**
+  * Emit a GEP instruction for a member.
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @param member          The member to use in the GEP instruction.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_member(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    llvm_type: LLVMTypeRef,
+    llvm_pointer: LLVMValueRef,
+    member: Resolved_Member,
+  ) -> LLVMValueRef {
+    if (length(member.indices) == 0) {
+      return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, member.index);
+    } else {
+      llvm_field_indices := array_make!(LLVMValueRef)(0, length(member.indices) + 1, context.temporary_allocator);
+      array_add(&llvm_field_indices, LLVMConstInt(LLVMInt32Type(), 0, false));
+      foreach (index in member.indices) {
+        array_add(&llvm_field_indices, LLVMConstInt(LLVMInt32Type(), cast(u64) index, false));
+      }
+      return LLVMBuildGEP2(
+        builder,
+        llvm_type,
+        llvm_pointer,
+        data(llvm_field_indices),
+        cast(u32) length(llvm_field_indices),
+        make_value_name(routine_context),
+      );
+    }
+  }
+
+  /**
+  * Emit a GEP instruction for a pointer.
+  *
+  * @param builder            The LLVM builder to use.
+  * @param routine_context    The context of the routine.
+  * @param llvm_type          The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer       The LLVM pointer the GEP instruction is based on.
+  * @param llvm_element_index The LLVM element index to use in the GEP instruction.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_pointer(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    llvm_type: LLVMTypeRef,
+    llvm_pointer: LLVMValueRef,
+    llvm_element_index: LLVMValueRef,
+  ) -> LLVMValueRef {
+    llvm_elemenet_indices: []LLVMValueRef = {llvm_element_index};
+    return LLVMBuildGEP2(
+      builder,
+      llvm_type,
+      llvm_pointer,
+      data(llvm_elemenet_indices),
+      cast(u32) length(llvm_elemenet_indices),
+      make_value_name(routine_context),
+    );
+  }
+
+  /**
+  * Emit a GEP instruction for a union tag.
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_union_tag(builder: LLVMBuilderRef, routine_context: *Routine_Context, llvm_type: LLVMTypeRef, llvm_pointer: LLVMValueRef) -> LLVMValueRef {
+    return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, 0);
+  }
+
+  /**
+  * Emit a GEP instruction for a union value.
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_union_value(builder: LLVMBuilderRef, routine_context: *Routine_Context, llvm_type: LLVMTypeRef, llvm_pointer: LLVMValueRef) -> LLVMValueRef {
+    return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, 1);
+  }
+
+  /**
+  * Emit a GEP instruction for the data of a value (first element at index 0).
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_value_data(builder: LLVMBuilderRef, routine_context: *Routine_Context, llvm_type: LLVMTypeRef, llvm_pointer: LLVMValueRef) -> LLVMValueRef {
+    return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, 0);
+  }
+
+  /**
+  * Emit a GEP instruction for the length of a value (second element at index 1).
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_value_length(builder: LLVMBuilderRef, routine_context: *Routine_Context, llvm_type: LLVMTypeRef, llvm_pointer: LLVMValueRef) -> LLVMValueRef {
+    return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, 1);
+  }
+
+  /**
+  * Emit a GEP instruction for the capacity of a value (second element at index 2).
+  *
+  * @param builder         The LLVM builder to use.
+  * @param routine_context The context of the routine.
+  * @param llvm_type       The LLVM type the GEP instruction is based on.
+  * @param llvm_pointer    The LLVM pointer the GEP instruction is based on.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_value_capacity(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    llvm_type: LLVMTypeRef,
+    llvm_pointer: LLVMValueRef,
+  ) -> LLVMValueRef {
+    return self.emit_gep_field(builder, routine_context, llvm_type, llvm_pointer, 2);
+  }
+
+  /**
+  * Emit a GEP instruction for the length of a layout collection.
+  *
+  * @param builder                     The LLVM builder to use.
+  * @param routine_context             The context of the routine.
+  * @param layout_collection_type      The type of the layout collection.
+  * @param llvm_layout_collection_type The LLVM type of the layout collection.
+  * @param llvm_layout_collection      The LLVM layout collection.
+  * @return The result of the GEP.
+  */
+  internal proc emit_gep_layout_collection_length(
+    builder: LLVMBuilderRef,
+    routine_context: *Routine_Context,
+    layout_collection_type: *Type,
+    llvm_layout_collection_type: LLVMTypeRef,
+    llvm_layout_collection: LLVMValueRef,
+  ) -> LLVMValueRef {
+    assert(layout_collection_type.base.is_struct());
+    layout_struct := cast(*Type_Struct) layout_collection_type.base;
+
+    // Depending on whether or not we have a slice or dynamic array, the 'length' field is at a different place inside the layout struct.
+    field_offset_from_end := layout_collection_type.is_slice() ? 1 : 3;
+    length_index := length(layout_struct.fields) - field_offset_from_end;
+    return self.emit_gep_field(builder, routine_context, llvm_layout_collection_type, llvm_layout_collection, length_index);
+  }
+
+  /**
+  * Emit the field pointer for an AoSoA element.
+  *
+  * @param routine_context       The context of the routine.
+  * @param aosoa_collection_type The type of the AoSOA collection.
+  * @param llvm_data_pointer     The LLVM data pointer of the AoSOA collection.
+  * @param llvm_field_type       The LLVM type of the field.
+  * @param llvm_index            The LLVM index into the AoSoA collection.
+  * @param member                The member corresponding to the field.
+  * @return The field pointer for the AoSoA element.
+  */
+  internal proc emit_aosoa_element_field_pointer(
+    routine_context: *Routine_Context,
+    aosoa_collection_type: *Type,
+    llvm_data_pointer: LLVMValueRef,
+    llvm_field_type: LLVMTypeRef,
+    llvm_index: LLVMValueRef,
+    member: Resolved_Member,
+  ) -> LLVMValueRef {
+    type_struct := cast(*Type_Struct) aosoa_collection_type.base;
+    aosoa_collection_array_base := type_struct.fields[0].type.base;
+    items_in_aosoa_chunk := type_struct.layout_info.items_in_aosoa_chunk;
+    llvm_aosoa_collection_array_base := self.type_to_llvm(aosoa_collection_array_base);
+
+    // We always do the calculation with 64-bit integers.
+    llvm_index := LLVMBuildSExt(self.builder, llvm_index, LLVMInt64Type(), make_value_name(routine_context));
+    llvm_items_in_aosoa_chunk := LLVMConstInt(LLVMInt64Type(), cast(u64) items_in_aosoa_chunk, false);
+
+    llvm_outer_index := LLVMBuildUDiv(self.builder, llvm_index, llvm_items_in_aosoa_chunk, make_value_name(routine_context));
+    llvm_outer_pointer := self.emit_gep_pointer(self.builder, routine_context, llvm_aosoa_collection_array_base, llvm_data_pointer, llvm_outer_index);
+    llvm_outer_field_pointer := self.emit_gep_member(self.builder, routine_context, llvm_aosoa_collection_array_base, llvm_outer_pointer, member);
+    llvm_element_index := LLVMBuildURem(self.builder, llvm_index, llvm_items_in_aosoa_chunk, make_value_name(routine_context));
+    return self.emit_gep_pointer(self.builder, routine_context, llvm_field_type, llvm_outer_field_pointer, llvm_element_index);
+  }
+
+  /**
+  * Emit the offset for a self-relative pointer.
+  *
+  * @param routine_context    The context of the routine.
+  * @param pointer_type       The type of the self-relative pointer.
+  * @param llvm_self_pointer  The LLVM pointer to the self-relative pointer.
+  * @param llvm_right_pointer The LLVM pointer to the right to base the offset of.
+  * @return The offset for the self-relative pointer.
+  */
+  internal proc emit_self_relative_pointer_offset(
+    routine_context: *Routine_Context,
+    pointer_type: *Type,
+    llvm_self_pointer: LLVMValueRef,
+    llvm_right_pointer: LLVMValueRef,
+  ) -> LLVMValueRef {
+    if (LLVMIsNull(llvm_right_pointer)) then return llvm_right_pointer;
+    
+    relative_base := (cast(*Type_Relative_Pointer) pointer_type).relative_base;
+
+    llvm_self_int_pointer := LLVMBuildPtrToInt(self.builder, llvm_self_pointer, LLVMInt64Type(), make_value_name(routine_context));
+    llvm_right_int_pointer := LLVMBuildPtrToInt(self.builder, llvm_right_pointer, LLVMInt64Type(), make_value_name(routine_context));
+    llvm_self_relative_offset := LLVMBuildSub(self.builder, llvm_right_int_pointer, llvm_self_int_pointer, make_value_name(routine_context));
+    llvm_self_relative_offset = self.emit_self_relative_pointer_offset_truncation(routine_context, relative_base, llvm_self_relative_offset);
+    llvm_pointer_is_zero := LLVMBuildICmp(self.builder, .EQ, llvm_right_int_pointer, LLVMConstInt(LLVMInt64Type(), 0, false), make_value_name(routine_context));
+    llvm_zero_value := self.default_initializer_value(relative_base);
+    return LLVMBuildSelect(self.builder, llvm_pointer_is_zero, llvm_zero_value, llvm_self_relative_offset, make_value_name(routine_context));
+  }
+
+  /**
+  * Emit the offset truncation for a self-relative pointer.
+  *
+  * @param routine_context The context of the routine.
+  * @param relative_base   The relative base of the self-relative pointer.
+  * @param llvm_offset     The LLVM offset to truncate.
+  * @return The truncated offset.
+  */
+  internal proc emit_self_relative_pointer_offset_truncation(routine_context: *Routine_Context, relative_base: *Type, llvm_offset: LLVMValueRef) -> LLVMValueRef {
+    needs_trunc := self.relative_pointer_base_needs_conversion(relative_base);
+    if (needs_trunc) {
+      return LLVMBuildTrunc(self.builder, llvm_offset, self.type_to_llvm(relative_base), make_value_name(routine_context));
+    } else {
+      return llvm_offset;
+    }
+  }
+
+  /**
+  * Emit the conversion from a self-relative pointer to an absolute pointer.
+  *
+  * @param routine_context       The context of the routine.
+  * @param pointer_type          The type of the self-relative pointer.
+  * @param llvm_relative_pointer The LLVM pointer to the self-relative pointer.
+  * @return The truncated offset.
+  */
+  internal proc emit_self_relative_pointer_to_absolute(routine_context: *Routine_Context, pointer_type: *Type, llvm_relative_pointer: LLVMValueRef) -> LLVMValueRef {
+    if (LLVMIsNull(llvm_relative_pointer)) then return llvm_relative_pointer;
+    
+    relative_base := (cast(*Type_Relative_Pointer) pointer_type).relative_base;
+
+    llvm_self_relative_offset := self.emit_load(routine_context, relative_base, llvm_relative_pointer);
+    llvm_self_relative_offset = self.emit_relative_pointer_base_extension(routine_context, relative_base, llvm_self_relative_offset);
+    llvm_self_relative_int_pointer := LLVMBuildPtrToInt(self.builder, llvm_relative_pointer, LLVMInt64Type(), make_value_name(routine_context));
+    llvm_computed_int_pointer := LLVMBuildAdd(self.builder, llvm_self_relative_int_pointer, llvm_self_relative_offset, make_value_name(routine_context));
+    llvm_pointer_type := self.type_to_llvm(context.storage.get_or_make_type_pointer(pointer_type.base)); 
+    llvm_computed_pointer := LLVMBuildIntToPtr(self.builder, llvm_computed_int_pointer, llvm_pointer_type, make_value_name(routine_context));
+    llvm_zero_value := self.default_initializer_value(context.storage.type_i64);
+    llvm_offset_is_zero := LLVMBuildICmp(self.builder, .EQ, llvm_self_relative_offset, llvm_zero_value, make_value_name(routine_context));
+    return LLVMBuildSelect(self.builder, llvm_offset_is_zero, LLVMConstNull(llvm_pointer_type), llvm_computed_pointer, make_value_name(routine_context));
+  }
+
+  /**
+  * Emit the offset extension for a self-relative pointer.
+  *
+  * @param routine_context The context of the routine.
+  * @param relative_base   The relative base of the self-relative pointer.
+  * @param llvm_offset     The LLVM offset to extend.
+  * @return The extended offset.
+  */
+  internal proc emit_relative_pointer_base_extension(routine_context: *Routine_Context, relative_base: *Type, llvm_offset: LLVMValueRef) -> LLVMValueRef {
+    needs_extend := self.relative_pointer_base_needs_conversion(relative_base);
+    if (needs_extend) {
+      return LLVMBuildSExt(self.builder, llvm_offset, LLVMInt64Type(), make_value_name(routine_context));
+    } else {
+      return llvm_offset;
+    }
+  }
+
+  /**
+  * Emit the access for a member of an element in a layout collection.
+  *
+  * @param routine_context        The context of the routine.
+  * @param layout_collection_type The type of the layout collection.
+  * @param field_type             The type of the field to access.
+  * @param llvm_layout_collection The LLVM layout collection.
+  * @param llvm_index             The LLVM index of the element in the layout collection.
+  * @return The accessed member.
+  */
+  internal proc emit_layout_member_access(
+    routine_context: *Routine_Context,
+    layout_collection_type: *Type,
+    resolved_member: Resolved_Member,
+    value_type: *Type,
+    llvm_layout_collection: LLVMValueRef,
+    llvm_index: LLVMValueRef,
+  ) -> LLVMValueRef {
+    llvm_data_pointer: LLVMValueRef;
+    if (layout_collection_type.is_aosoa()) {
+      llvm_data_pointer = llvm_layout_collection;
+    } else {
+      // This gets us the pointer to the correct field array inside the layout struct.
+      llvm_layout_collection_type := self.type_to_llvm(layout_collection_type);
+      llvm_data_pointer = self.emit_gep_member(self.builder, routine_context, llvm_layout_collection_type, llvm_layout_collection, resolved_member);
+    }
+    // If we are a dynamic array or a slice we have to load the field data pointer first.
+    if (!layout_collection_type.is_array()) {
+      llvm_data_pointer = self.emit_load(routine_context, context.storage.type_rawptr, llvm_data_pointer);
+    }
+    
+    // Now we get the pointer to the actual element inside the array (based on the provided index).
+    llvm_field_type := self.type_to_llvm(value_type);
+    llvm_layout_field_pointer: LLVMValueRef;
+    if (layout_collection_type.is_aosoa()) {
+      llvm_layout_field_pointer = self.emit_aosoa_element_field_pointer(
+        routine_context,
+        layout_collection_type,
+        llvm_data_pointer,
+        llvm_field_type,
+        llvm_index,
+        resolved_member,
+      );
+    } else {
+      llvm_layout_field_pointer = self.emit_gep_pointer(self.builder, routine_context, llvm_field_type, llvm_data_pointer, llvm_index);
+    }
+
+    if (routine_context.current_loading_mode == .Load_Address) {
+      return llvm_layout_field_pointer;
+    } else {
+      return self.emit_load(routine_context, value_type, llvm_layout_field_pointer);
+    }
+  }
+
+  /**
+  * Emit the access for a complete element in a layout collection.
+  *
+  * @param routine_context        The context of the routine.
+  * @param layout_collection_type The type of the layout collection.
+  * @param llvm_layout_collection The LLVM layout collection.
+  * @param llvm_index             The LLVM index of the element in the layout collection.
+  * @return The accessed element.
+  */
+  internal proc emit_layout_index_access(
+    routine_context: *Routine_Context,
+    layout_collection_type: *Type,
+    llvm_layout_collection: LLVMValueRef,
+    llvm_index: LLVMValueRef,
+  ) -> LLVMValueRef {
+    // Here we handle the SoA/AoSoA scenerio where we are trying to read a single complete element at a specific index.
+    // We of course don't have a complete single element in an SoA/AoSoA collection which we can return.
+    // Instead we create a temporary and fill it with the corresponding data by copying over the fields one by one.
+    // When the index expression is being used as an lvalue in an assignment that is handled explicitly when generating an assignment statement.
+    // This means that the 'Load_Adress' loading mode returns here the address of the temporary that is being created.
+
+    element_type := layout_collection_type.base.base;
+    assert(element_type.is_struct());
+    type_struct := cast(*Type_Struct) element_type;
+
+    llvm_element_type := self.type_to_llvm(element_type);
+    llvm_collection_type := self.type_to_llvm(layout_collection_type);
+
+    // This is the temporary that we fill with the single field elements and return.
+    llvm_element := self.emit_temporary(routine_context, element_type, make_temp_name(routine_context));
+
+    is_aosoa := layout_collection_type.is_aosoa();
+
+    foreach (field, i in type_struct.fields) {
+      llvm_data_pointer: LLVMValueRef;
+      if (is_aosoa) {
+        llvm_data_pointer = llvm_layout_collection;
+      } else {
+        llvm_data_pointer = self.emit_gep_field(self.builder, routine_context, llvm_collection_type, llvm_layout_collection, i);
+      }
+      
+      // If we are a dynamic array or a slice we have to load the field data pointer first.
+      if (!layout_collection_type.is_array()) {
+        llvm_data_pointer = self.emit_load(routine_context, context.storage.type_rawptr, llvm_data_pointer);
+      }
+      llvm_field_type := self.type_to_llvm(field.type);
+
+      llvm_layout_element_pointer: LLVMValueRef;
+      if (is_aosoa) {
+        llvm_layout_element_pointer = self.emit_aosoa_element_field_pointer(
+          routine_context,
+          layout_collection_type,
+          llvm_data_pointer,
+          llvm_field_type,
+          llvm_index,
+          {i, {}, field.type},
+        );
+      } else {
+        llvm_layout_element_pointer = self.emit_gep_pointer(self.builder, routine_context, llvm_field_type, llvm_data_pointer, llvm_index);
+      }
+
+      llvm_field_value: LLVMValueRef;
+      if (self.type_requires_loading_address(field.type, field.type)) {
+        llvm_field_value = llvm_layout_element_pointer;
+      } else {
+        llvm_field_value = self.emit_load(routine_context, field.type, llvm_layout_element_pointer);
+      }
+      
+      llvm_element_field_pointer := self.emit_gep_field(self.builder, routine_context, llvm_element_type, llvm_element, i);
+      self.emit_store(routine_context, field.type, llvm_element_field_pointer, llvm_field_value, null);
+    }
+
+    if (routine_context.current_loading_mode == .Load_Address) {
+      return llvm_element;
+    } else {
+      return self.emit_load(routine_context, element_type, llvm_element);
+    }
+  }
+
+  /**
+  * Emit the default context initialization.
+  *
+  * @param llvm_context The LLVM context to initialize.
+  */
+  internal proc emit_default_context_initialization(llvm_context: LLVMValueRef) {
+    llvm_arguments: []LLVMValueRef = {llvm_context, llvm_context};
+    self.emit_call_to_builtin_routine(.Runtime_Init_Default_Context, llvm_arguments, "");
+  }
+
+  /**
+  * Emit a call to a built-in routine.
+  *
+  * @param builtin_routine The built-in routine to call.
+  * @param llvm_arguments  The LLVM arguments to pass along.
+  * @param name            The name of the LLVM return value.
+  * @return The return value.
+  */
+  internal proc emit_call_to_builtin_routine(builtin_routine: Builtin_Routine, llvm_arguments: []LLVMValueRef, name: cstring) -> LLVMValueRef {
+    llvm_builtin_routine := self.llvm_builtin_routines[builtin_routine];
+    return LLVMBuildCall2(
+      self.builder,
+      self.type_to_llvm_without_routine_promotion(llvm_builtin_routine.symbol.type),
+      llvm_builtin_routine.llvm_tuple.llvm_symbol,
+      data(llvm_arguments),
+      cast(u32) length(llvm_arguments),
+      name,
+    );
+  }
+
+  /**
+  * Emit a boolean expression.
+  *
+  * @param routine_context The context of the routine.
+  * @param expression      The boolean expression.
+  * @param type            The type of the boolean expression.
+  * @return The result of the boolean expression.
+  */
+  internal proc emit_boolean_truncation(routine_context: *Routine_Context, expression: *Expression, type: *Type) -> LLVMValueRef {
+    llvm_boolean := self.emit_expression(routine_context, expression, type);
+    return LLVMBuildTrunc(self.builder, llvm_boolean, LLVMInt1Type(), make_value_name(routine_context));
+  }
+
+  /**
+  * Emit a typeid expression for an any.
+  *
+  * @param routine_context The context of the routine.
+  * @param expression      The expression of the typeid expression.
+  * @return The typeid of the any.
+  */
+  internal proc emit_typeid_expression_any(routine_context: *Routine_Context, expression: *Expression) -> LLVMValueRef {
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_any_pointer := self.emit_expression(routine_context, expression, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    llvm_any_type := self.type_to_llvm(context.storage.type_any);
+    llvm_any_typeid_pointer := self.emit_gep_value_length(self.builder, routine_context, llvm_any_type, llvm_any_pointer);
+    return self.emit_load(routine_context, context.storage.type_typeid, llvm_any_typeid_pointer);
+  }
+
+  /**
+  * Emit a typeid expression for a union.
+  *
+  * @param routine_context The context of the routine.
+  * @param expression      The expression of the typeid expression.
+  * @param union_type      The type of the union.
+  * @return The typeid of the union.
+  */
+  internal proc emit_typeid_expression_union(routine_context: *Routine_Context, expression: *Expression, union_type: *Type) -> LLVMValueRef {
+    previous_loading_mode := self.enter_loading_mode(routine_context, .Load_Address);
+    llvm_union_pointer := self.emit_expression(routine_context, expression, null);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    llvm_union_tag_pointer := self.emit_gep_union_tag(self.builder, routine_context, self.type_to_llvm(union_type), llvm_union_pointer);
+    llvm_union_tag := self.emit_load(routine_context, context.storage.type_int, llvm_union_tag_pointer);
+
+    type_union := cast(*Type_Union) union_type;
+    union_variant_count := length(type_union.variants);
+
+    llvm_switch_default := self.append_block(routine_context);
+    llvm_switch_blocks := array_make!(LLVMBasicBlockRef)(0, union_variant_count, context.temporary_allocator);
+    for (i := 0; i < length(type_union.variants); i++) {
+      array_add(&llvm_switch_blocks, self.append_block(routine_context));
+    }
+
+    llvm_after_block := self.append_block(routine_context);
+    llvm_switch := LLVMBuildSwitch(self.builder, llvm_union_tag, llvm_switch_default, cast(u32) union_variant_count);
+    for (i := 0; i < length(type_union.variants); i++) {
+      tag := i + 1;
+      LLVMAddCase(llvm_switch, LLVMConstInt(LLVMInt64Type(), cast(u64) tag, false), llvm_switch_blocks[i]);
+    }
+
+    previous_block := self.enter_llvm_block(routine_context, llvm_switch_default);
+    LLVMBuildBr(self.builder, llvm_after_block);
+    self.leave_llvm_block(routine_context, previous_block);
+    for (i := 0; i < length(type_union.variants); i++) {
+      previous_block := self.enter_llvm_block(routine_context, llvm_switch_blocks[i]);
+      LLVMBuildBr(self.builder, llvm_after_block);
+      self.leave_llvm_block(routine_context, previous_block);
+    } 
+
+    // We use a PHI node to determine where in the switch we came from and what value we need.
+    self.enter_llvm_block(routine_context, llvm_after_block);
+    llvm_phi_value := LLVMBuildPhi(self.builder, self.type_to_llvm(context.storage.type_typeid), make_value_name(routine_context));
+    llvm_phi_blocks := array_make!(LLVMBasicBlockRef)(0, union_variant_count + 1, context.temporary_allocator);
+    array_add(&llvm_phi_blocks, llvm_switch_default);
+    for (i := 0; i < length(type_union.variants); i++) {
+      array_add(&llvm_phi_blocks, llvm_switch_blocks[i]);
+    }
+    llvm_phi_values := array_make!(LLVMValueRef)(0, union_variant_count + 1, context.temporary_allocator);
+    array_add(&llvm_phi_values, LLVMConstInt(LLVMInt64Type(), 0, false));
+    foreach (variant in type_union.variants) {
+      array_add(&llvm_phi_values, LLVMConstInt(LLVMInt64Type(), cast(u64) variant.id, false));
+    }
+    LLVMAddIncoming(llvm_phi_value, data(llvm_phi_values), data(llvm_phi_blocks), cast(u32) union_variant_count + 1);
+    return llvm_phi_value;
+  }
+
+  /**
+  * Emit the conversion for the operands of a shift operation.
+  *
+  * @param routine_context  The context of the routine.
+  * @param left_type        The type of the left shift operand.
+  * @param right_type       The type of the right shift operand.
+  * @param llvm_right_value The value of the right shift operand.
+  * @return The converted right value.
+  */
+  internal proc emit_expression_binary_shit_type_extension(
+    routine_context: *Routine_Context,
+    left_type: *Type,
+    right_type: *Type,
+    llvm_right_value: LLVMValueRef,
+  ) -> LLVMValueRef {
+    llvm_left_type := self.type_to_llvm(left_type);
+    name := make_value_name(routine_context);
+
+    switch (left_type.kind) {
+      case .I8, .U8: {
+        switch (right_type.kind) {
+          case .U8, .U16, .U32, .U64, .UInt, .Untyped_Integer: {
+            return LLVMBuildTrunc(self.builder, llvm_right_value, llvm_left_type, name);
+          }
+        }
+      }
+      case .I16, .U16: {
+        switch (right_type.kind) {
+          case .U8: return LLVMBuildZExt(self.builder, llvm_right_value, llvm_left_type, name);
+          case .U16, .U32, .U64, .UInt, .Untyped_Integer: {
+            return LLVMBuildTrunc(self.builder, llvm_right_value, llvm_left_type, name);
+          }
+        }
+      }
+      case .I32, .U32: {
+        switch (right_type.kind) {
+          case .U8, .U16: return LLVMBuildZExt(self.builder, llvm_right_value, llvm_left_type, name);
+          case .U32, .U64, .UInt, .Untyped_Integer: {
+            return LLVMBuildTrunc(self.builder, llvm_right_value, llvm_left_type, name);
+          }
+        }
+      }
+      case: {
+        switch (right_type.kind) {
+          case .U8, .U16, .U32: return LLVMBuildZExt(self.builder, llvm_right_value, llvm_left_type, name);
+          case .U64, .UInt, .Untyped_Integer: {
+            return LLVMBuildTrunc(self.builder, llvm_right_value, llvm_left_type, name);
+          }
+        }
+      }
+    }
+    
+    assert(false);
+    return null;
+  }
+
+  /**
+  * Emit a cast expression.
+  *
+  * @param routine_context The context of the routine.
+  * @param expression      The cast expression to emit.
+  * @return The result of the expression.
+  */
+  internal proc emit_cast_expression(routine_context: *Routine_Context, expression: *Expression) -> LLVMValueRef {
+    assert(expression.kind == .Cast);
+
+    expression := cast(*Expression_Cast) expression;
+    cast_expression := cast(*Expression) expression.expression;
+
+    destination_type := self.get_resolved_type(cast(*Type_Specification) expression.type);
+    llvm_destination_type := self.type_to_llvm(destination_type);
+    source_type := self.get_resolved_type(cast_expression);
+    llvm_source_type := self.type_to_llvm(source_type);
+
+    needs_to_load_address := self.type_requires_loading_address(source_type, source_type);
+    previous_loading_mode := self.enter_loading_mode(routine_context, needs_to_load_address ? .Load_Address : .Load_Value);
+    llvm_source_value := self.emit_expression(routine_context, cast_expression, source_type);
+    self.leave_loading_mode(routine_context, previous_loading_mode);
+
+    destination_is_offset_relative_pointer := destination_type.is_offset_relative_pointer();
+    relative_base: *Type;
+    if (destination_is_offset_relative_pointer) {
+      relative_base = (cast(*Type_Relative_Pointer) destination_type).relative_base;
+      destination_type = relative_base;
+    }
+
+    // If the types are already the same, we don't need to do anything.
+    if (source_type == destination_type || llvm_source_type == llvm_destination_type) {
+      return llvm_source_value;
+    }
+
+    name := make_value_name(routine_context);
+
+    if (source_type.is_scalar() && destination_type.is_scalar()) {
+      // Convert enums to their base type.
+      if (source_type.is_enumeration()) {
+        source_type = source_type.base;
+      }
+      if (destination_type.is_enumeration()) {
+        destination_type = destination_type.base;
+      }
+
+      // For convenience we treat booleans as their unsigned integer counterpart.
+
+      switch (source_type.kind) {
+        case .Bool, .Untyped_Boolean: {
+          return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+        }
+        case .I8: {
+          switch (destination_type.kind) {
+            case .Bool:                                              return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B8, .B16, .B32, .B64, .I8, .I16, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U8, .U16, .U32, .U64, .UInt:                return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                                         return LLVMBuildSIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .I16: {
+          switch (destination_type.kind) {
+            case .B8, .Bool, .I8:                          return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B16, .B32, .B64, .I16, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8:                                      return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U16, .U32, .U64, .UInt:           return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                               return LLVMBuildSIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .I32: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .Bool, .I8, .I16:  return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B32, .B64, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16:                    return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U32, .U64, .UInt:     return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                   return LLVMBuildSIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .I64: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .B32, .Bool, .I8, .I16, .I32: return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B64, .I64, .Int:                        return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U8, .U16, .U32:                  return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U64, .UInt:                             return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                              return LLVMBuildSIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .Int, .Untyped_Integer: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .B32, .B64, .Bool, .I8, .I16, .I32, .I64, .Int, .U8, .U16, .U32, .U64, .UInt, .Char: return LLVMBuildTrunc(
+              self.builder,
+              llvm_source_value,
+              llvm_destination_type,
+              name,
+            );
+            case .F32, .F64: return LLVMBuildSIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .B8, .U8: {
+          switch (destination_type.kind) {
+            case .Bool:                                         return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B8, .B16, .B32, .B64, .I16, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U8, .U16, .U32, .U64, .UInt:           return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                                    return LLVMBuildUIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .B16, .U16: {
+          switch (destination_type.kind) {
+            case .B8, .Bool, .I8:                          return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B16, .B32, .B64, .I16, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8:                                      return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U16, .U32, .U64, .UInt:           return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                               return LLVMBuildUIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .B32, .U32: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .Bool, .I8, .I16:  return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B32, .B64, .I32, .I64, .Int: return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16:                    return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U32, .U64, .UInt:     return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                   return LLVMBuildUIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .B64, .U64: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .B32, .Bool, .I8, .I16, .I32: return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .B64, .I64, .Int:                        return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16, .U32, .Char:                  return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U64, .UInt:                             return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                              return LLVMBuildUIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .UInt: {
+          switch (destination_type.kind) {
+            case .B8, .B16, .B32, .B64, .Bool,.I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64, .UInt, .Char: return LLVMBuildTrunc(
+              self.builder,
+              llvm_source_value,
+              llvm_destination_type,
+              name,
+            );
+            case .F32, .F64:                               return LLVMBuildUIToFP(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Procedure, .Function, .Pointer, .Rawptr: return LLVMBuildIntToPtr(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .F32: {
+          switch (destination_type.kind) {
+            case .I8, .I16, .I32, .I64, .Int:  return LLVMBuildFPToSI(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16, .U32, .U64, .UInt: return LLVMBuildFPToUI(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                   return LLVMBuildFPExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .F64, .Untyped_Float: {
+          switch (destination_type.kind) {
+            case .I8, .I16, .I32, .I64, .Int:  return LLVMBuildFPToSI(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16, .U32, .U64, .UInt: return LLVMBuildFPToUI(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .F32, .F64:                   return LLVMBuildFPTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case .Char, .Untyped_Char: {
+          switch (destination_type.kind) {
+            case .I8, .I16:                return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .I32, .I64, .Int:         return LLVMBuildSExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .U8, .U16:                return LLVMBuildTrunc(self.builder, llvm_source_value, llvm_destination_type, name);
+            case .Char, .U32, .U64, .UInt: return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+            case: assert(false);
+          }
+        }
+        case: assert(false);
+      }
+    } else if (source_type.is_string() || destination_type.is_string()) {
+      // Here we know we are casting a string literal (or null) to a cstring which means we can just return the source value.
+      if (LLVMIsNull(llvm_source_value)) {
+        return self.default_initializer_value(context.storage.type_string);
+      } else {
+        return llvm_source_value;
+      }
+    } else if (source_type.is_absolute_pointer_like() && destination_type.is_integer()) {
+      return LLVMBuildPtrToInt(self.builder, llvm_source_value, llvm_destination_type, name);
+    } else if (source_type.is_integer() && destination_type.is_absolute_pointer_like()) {
+      return LLVMBuildIntToPtr(self.builder, llvm_source_value, llvm_destination_type, name);
+    } else if (source_type.is_self_relative_pointer()) {
+      assert(destination_type.is_absolute_pointer());
+      return self.emit_self_relative_pointer_to_absolute(routine_context, source_type, llvm_source_value);
+    } else if (destination_is_offset_relative_pointer) {
+      // We know our source type is an untyped integer.
+      return LLVMBuildZExt(self.builder, llvm_source_value, llvm_destination_type, name);
+    }
+
+    assert(false);
+    return null;
+  }
+
+}

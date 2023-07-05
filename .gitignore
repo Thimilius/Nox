@@ -1,0 +1,17 @@
+.vs/
+build/
+
+*.ll
+*.obj
+*.exe
+*.pdb
+*.o
+*.sln
+
+nox
+noxb
+noxs
+noxh
+test
+out
+ols.json

@@ -1,0 +1,290 @@
+/**
+* Checks whether or not a given type is a scalar.
+* 
+* @param !(T) The type to check.
+* @return True if the type is a scalar otherwise false.
+*/
+@intrinsic public pure func "nocontext" type_is_scalar!(T)() -> bool
+/**
+* Checks whether or not a given type is an enum.
+* 
+* @param !(T) The type to check.
+* @return True if the type is an enum otherwise false.
+*/
+@intrinsic public pure func "nocontext" type_is_enum!(T)() -> bool
+/**
+* Checks whether or not a given type is a struct.
+* 
+* @param !(T) The type to check.
+* @return True if the type is a struct otherwise false.
+*/
+@intrinsic public pure func "nocontext" type_is_struct!(T)() -> bool
+/**
+* Checks whether or not a given type is an AoSoA collection.
+* 
+* @param !(T) The type to check.
+* @return True if the type is an AoSoA collection otherwise false.
+*/
+@intrinsic public pure func "nocontext" type_is_aosoa!(T)() -> bool
+/**
+* Checks whether or not a given type is trivial copyable.
+* 
+* @param !(T) The type to check.
+* @return True if the type is trivial copyable otherwise false.
+*/
+@intrinsic public pure func "nocontext" type_is_trivial_copyable!(T)() -> bool
+/**
+* Gets the item count of an enum type.
+* 
+* @param !(T) The enum type.
+* @return The item count of the enum type.
+*/
+@intrinsic public pure func "nocontext" type_enum_item_count!(T)() -> int
+/**
+* Gets the field count of a struct type.
+* 
+* @param !(T) The struct type.
+* @return The field count of the struct type.
+*/
+@intrinsic public pure func "nocontext" type_struct_field_count!(T)() -> int where (type_is_struct!(T))
+/**
+* Gets the AoSoA chunk size of an AoSoA collection type in bytes.
+* 
+* @param !(T) The AoSoA collection type.
+* @return The AoSoA chunk size of the AoSoA collection type in bytes.
+*/
+@intrinsic public pure func "nocontext" type_aosoa_chunk_size!(T)() -> int where (type_is_aosoa!(T))
+/**
+* Gets the number of items in an AoSoA chunk of an AoSoA collection type.
+* 
+* @param !(T) The AoSoA collection type.
+* @return The number of items in the AoSoA chunk of the AoSoA collection type.
+*/
+@intrinsic public pure func "nocontext" type_aosoa_items_in_chunk!(T)() -> int where (type_is_aosoa!(T))
+
+/**
+* Represents a calling convention for routines.
+*/
+public enum Calling_Convention : u8 {
+  Nox,
+  No_Context,
+  C,
+  Std_Call,
+  Fast_Call,
+  Win64,
+}
+
+/**
+* Represents a layout modifier.
+*/
+public enum Layout_Modifier : u8 {
+  None,  // No modifier.
+  SoA,   // SoA modifier.
+  AoSoA, // AoSoA modifier.
+}
+
+/**
+* Represents the kind of a type info.
+*/
+public enum Type_Info_Kind {
+  Invalid,
+  Void,
+  Boolean,
+  Integer,
+  Float,
+  Char,
+  Enumeration,
+  String,
+  Pointer,
+  Relative_Pointer,
+  Layout_Pointer,
+  Dynamic_Pointer,
+  Array,
+  Dynamic_Array,
+  Slice,
+  Map,
+  Tuple,
+  Struct,
+  Union,
+  Routine,
+  Interface,
+  Any,
+  Typeid,
+}
+
+/**
+* Holds the data for an integer type info.
+*/
+public struct Type_Info_Integer { 
+  public is_signed: bool, // Is the integer signed?
+}
+
+/**
+* Holds the data for an enumeration type info.
+*/
+public struct Type_Info_Enumeration {
+  public base: *Type_Info, // The base type of the enumeration.
+  public is_flags: bool,   // Is the enumeration marked with the '@flags' attribute?
+  public names: []string,  // The names of the enumeration items.
+  public values: []int,    // The values of the enumeration items.
+}
+
+/**
+* Holds the data for a string type info.
+*/
+public struct Type_Info_String {
+  public is_cstring: bool, // Is the string a cstring?
+}
+
+/**
+* Holds the data for a pointer type info.
+*/
+public struct Type_Info_Pointer {
+  public base: *Type_Info, // The base type of the pointer.
+}
+
+public enum Type_Info_Relative_Pointer_Kind {
+  Self_Relative,
+  Offset_Relative,
+}
+
+/**
+* Holds the data for a relative pointer type info.
+*/
+public struct Type_Info_Relative_Pointer {
+  public kind: Type_Info_Relative_Pointer_Kind, // The relative pointer kind.
+  public base: *Type_Info,                      // The base type of the relative pointer.
+  public relative_base: *Type_Info,             // The relative base of the relative pointer.
+}
+
+/**
+* Holds the data for a layout pointer type info.
+*/
+public struct Type_Info_Layout_Pointer {
+  public base: *Type_Info,                 // The base type of the layout pointer.
+  public layout_modifier: Layout_Modifier, // The layout modifier of the layout pointer.
+}
+
+/**
+* Holds the data for a dynamic pointer type info.
+*/
+public struct Type_Info_Dynamic_Pointer {
+  public base: *Type_Info, // The base type of the dynamic pointer.
+}
+
+/**
+* Holds the data for an array type info.
+*/
+public struct Type_Info_Array {
+  public base: *Type_Info,                 // The base type of the array.
+  public layout_modifier: Layout_Modifier, // The layout modifier of the array.
+  public number_of_elements: int,          // The number of elements in the array.
+}
+
+/**
+* Holds the data for a dynamic array type info.
+*/
+public struct Type_Info_Dynamic_Array {
+  public base: *Type_Info,                 // The base type of the dynamic array.
+  public layout_modifier: Layout_Modifier, // The layout modifier of the dynamic array.
+}
+
+/**
+* Holds the data for a slice type info.
+*/
+public struct Type_Info_Slice { 
+  public base: *Type_Info,                 // The base type of the slice.
+  public layout_modifier: Layout_Modifier, // The layout modifier of the slice.
+}
+
+/**
+* Holds the data for a map type info.
+*/
+public struct Type_Info_Map {
+  public key: *Type_Info,   // The key type of the map.
+  public value: *Type_Info, // The value type of the map.
+}
+
+/**
+* Holds the data for a tuple type info.
+*/
+public struct Type_Info_Tuple {
+  public types: []*Type_Info, // The types of the tuple elements.
+  public offsets: []uint,     // The offsets in bytes of the tuple elements.
+}
+
+/**
+* Holds the data for a struct type info.
+*/
+public struct Type_Info_Struct {
+  public types: []*Type_Info, // The types of the fields inside the struct.
+  public names: []string,     // The names of the fields inside the struct.
+  public offsets: []uint,     // The offsets in bytes of the fields inside the struct.
+}
+
+/**
+* Holds the data for a union type info.
+*/
+public struct Type_Info_Union {
+  public types: []*Type_Info, // The type variants that are part of the union.
+}
+
+/**
+* Represents the kind of a routine type info.
+*/
+public enum Type_Info_Routine_Kind {
+  Procedure,
+  Function,
+}
+
+/**
+* Holds the data for a routine type info.
+*/
+public struct Type_Info_Routine {
+  public kind: Type_Info_Routine_Kind,           // The kind of the routine.
+  public calling_convention: Calling_Convention, // The calling convention of the routine.
+  public parameters: []*Type_Info,               // The parameters of the routine.
+  public return_type: *Type_Info,                // The return type of the routine (can be null).
+}
+
+/**
+* Holds the data for an interface type info.
+*/
+public struct Type_Info_Interface {
+  public types: []*Type_Info, // The types of the methods that belong to the interface.
+  public names: []string,     // The names of the methods that belong to the interface.
+}
+
+/**
+* The variants of a type info.
+*/
+public union Type_Info_Variant {
+  Type_Info_Integer,
+  Type_Info_Enumeration,
+  Type_Info_String,
+  Type_Info_Pointer,
+  Type_Info_Relative_Pointer,
+  Type_Info_Layout_Pointer,
+  Type_Info_Dynamic_Pointer,
+  Type_Info_Array,
+  Type_Info_Dynamic_Array,
+  Type_Info_Slice,
+  Type_Info_Map,
+  Type_Info_Tuple,
+  Type_Info_Struct,
+  Type_Info_Union,
+  Type_Info_Routine,
+  Type_Info_Interface,
+}
+
+/**
+* Holds information about a type.
+*/
+public struct Type_Info {
+  public kind: Type_Info_Kind,       // The kind of the type.
+  public id: typeid,                 // The id of the type.
+  public size: uint,                 // The size of the type.
+  public alignment: uint,            // The alignment of the type.
+  public name: string,               // The name of the type.
+  public variant: Type_Info_Variant, // The detailed type information based on the kind.
+}

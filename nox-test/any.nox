@@ -1,0 +1,32 @@
+/**
+* Test the functionality of the 'any' type.
+*/
+internal proc test_any() {
+  test_any_simple();
+  test_take_any_int(12);
+  test_take_any_string("Foo");
+  test_take_any_empty(any{});
+}
+
+private proc test_any_simple() {
+  a: any = 123;
+  assert(typeid_of(a) == typeid_of(:int));
+  assert(*(cast(*int) data(a)) == 123);
+
+  s := "Foo";
+  a = s;
+  assert(typeid_of(a) == typeid_of(:string));
+  assert(*(cast(*string) data(a)) == s);
+}
+
+private proc test_take_any_int(a: any) {
+  assert(*cast(*int) data(a) == 12);
+}
+
+private proc test_take_any_string(a: any) {
+  assert(*cast(*string) data(a) == "Foo");
+}
+
+private proc test_take_any_empty(a: any) {
+  assert(data(a) == null);
+}

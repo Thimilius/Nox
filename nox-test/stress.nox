@@ -1,0 +1,28 @@
+/**
+* Do a simple stress test with fibonacci.
+*/
+internal proc test_stress() {
+  assert(fibonacci_iterative(50) == 12_586_269_025);
+  assert(fibonacci_recursive(40) == 102_334_155);
+}
+
+private proc fibonacci_iterative(n: int) -> int {
+  previous := -1;
+  result := 1;
+
+  for (i := 0; i <= n; i++) {
+    sum := result + previous;
+    previous = result;
+    result = sum;
+  }
+
+  return result;
+}
+
+private proc fibonacci_recursive(n: int) -> int {
+  if (n <= 1) {
+    return n;
+  } else {
+    return fibonacci_recursive(n - 1) + fibonacci_recursive(n - 2);
+  }
+}

@@ -1,0 +1,19 @@
+public extern proc puts(str: cstring) -> i32
+public extern proc printf(format: cstring, ...) -> i32
+public extern proc snprintf(buffer: cstring, bufsz: size_t, format: cstring, ... ) -> i32
+
+public struct FILE {}
+
+public extern proc fopen(filename: cstring, mode: cstring) -> *FILE
+public extern proc fclose(stream: *FILE) -> i32
+
+public extern proc fread(buffer: rawptr, size: size_t, count: size_t, stream: *FILE) -> size_t
+
+public const SEEK_SET: i32 = 0;
+public const SEEK_CUR: i32 = 1;
+public const SEEK_END: i32 = 2;
+
+public extern proc ftell(stream: *FILE) -> i32
+public extern proc fseek(stream: *FILE, offset: long, origin: i32) -> i32
+
+public extern proc remove(fname: cstring) -> i32

@@ -1,0 +1,62 @@
+#if (NOX_OS == .Windows) {
+
+  import "std:libc"
+
+  import extern "kernel32.lib"
+
+  public extern proc "stdcall" GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD
+  public extern proc "stdcall" GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: LPWSTR) -> DWORD
+
+  public extern proc "stdcall" GetStdHandle(nStdHandle: DWORD) -> HANDLE
+  public extern proc "stdcall" SetConsoleTextAttribute(hConsoleOutput: HANDLE, wAttributes: WORD) -> BOOL
+  public extern proc "stdcall" SetConsoleOutputCP(CodePage: UINT) -> BOOL
+
+  public extern proc "stdcall" MultiByteToWideChar(
+    CodePage: UINT,
+    dwFlags: DWORD,
+    lpMultiByteStr: LPSTR,
+    cbMultiByte: i32,
+    lpWideCharStr: LPWSTR,
+    cchWideChar: i32,
+  ) -> i32
+  public extern proc "stdcall" WideCharToMultiByte(
+    CodePage: UINT,
+    dwFlags: DWORD,
+    lpWideCharStr: LPCWSTR,
+    cchWideChar: i32,
+    lpMultiByteStr: LPSTR,
+    cbMultiByte: i32,
+    lpDefaultChar: LPCSTR,
+    lpUsedDefaultChar: LPBOOL,
+  ) -> i32
+
+  public extern proc "stdcall" GetFileAttributesW(lpFileName: LPCWSTR) -> DWORD
+
+  public extern proc "stdcall" CreateThread(
+		lpThreadAttributes: LPSECURITY_ATTRIBUTES,
+		dwStackSize: SIZE_T,
+		lpStartAddress: proc "stdcall" (rawptr) -> DWORD,
+		lpParameter: LPVOID,
+		dwCreationFlags: DWORD,
+		lpThreadId: LPDWORD,
+	) -> HANDLE
+  public extern proc "stdcall" ResumeThread(hThread: HANDLE) -> DWORD
+
+  public extern proc "stdcall" WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD
+  public extern proc "stdcall" CloseHandle(hObject: HANDLE) -> BOOL
+
+  public extern proc "stdcall" QueryPerformanceFrequency(lpFrequency: *LARGE_INTEGER) -> BOOL
+  public extern proc "stdcall" QueryPerformanceCounter(lpPerformanceCount: *LARGE_INTEGER) -> BOOL
+
+  public extern proc "stdcall" GetLogicalProcessorInformation(buffer: *SYSTEM_LOGICAL_PROCESSOR_INFORMATION, returnedLength: *DWORD) -> BOOL
+
+  public extern proc "stdcall" AcquireSRWLockExclusive(SRWLock: *SRWLOCK)
+  public extern proc "stdcall" ReleaseSRWLockExclusive(SRWLock: *SRWLOCK)
+
+  public extern proc "stdcall" _wfindfirst64(filespec: *libc.wchar_t, fileinfo: *_wfinddata64_t) -> i64
+  public extern proc "stdcall" _wfindnext64(handle: uint, fileinfo: *_wfinddata64_t) -> i32
+  public extern proc "stdcall" _findclose(handle: uint) -> i32
+
+  public extern proc "stdcall" _wfullpath(absPath: *libc.wchar_t, relPath: *libc.wchar_t, maxLength: libc.size_t) -> *libc.wchar_t
+
+}

@@ -1,0 +1,55 @@
+/**
+* Test the functionality of routine calls.
+*/
+internal proc test_calls() {
+  result := test_argument(12);
+  assert(result == 12);
+
+  assert(test_default_parameter() == 3);
+  assert(test_default_parameter(8) == 8);
+
+  assert(test_default_parameter_compound().i == 0);
+  assert(test_default_parameter_compound({13}).i == 13);
+
+  assert(test_default_parameter_non_constant() == 18);
+  assert(test_default_parameter_non_constant(23) == 23);
+
+  sum := test_params_sum(1, 2, 3, 4);
+  assert(sum == 10);
+
+  values: []int = {5, 5, 10};
+  sum = test_params_sum(values);
+  assert(sum == 20);
+}
+
+private proc test_argument(i: int) -> int {
+  return i;
+}
+
+private proc test_default_parameter(a: int = 3) -> int {
+  return a;
+}
+
+private proc test_default_parameter_compound(f: Default_Parameter_Foo = {}) -> Default_Parameter_Foo {
+  return f;
+}
+
+struct Default_Parameter_Foo {
+  i: int,
+}
+
+private proc test_default_parameter_non_constant(a: int = get_default_parameter()) -> int {
+  return a;
+}
+
+private proc get_default_parameter() -> int {
+  return 18;
+}
+
+proc test_params_sum(params args: []int) -> int {
+  sum := 0;
+  for (i := 0; i < length(args); i++) {
+    sum += args[i];
+  }
+  return sum;
+}

@@ -1,0 +1,31 @@
+/**
+* Test the functionality of type casts.
+*/
+internal proc test_casts() {
+  test_casts_simple();
+  test_pointer_casts();
+}
+
+private proc test_casts_simple() {
+  i := 17.0;
+  k := cast(i8) cast(i32) i;
+  assert(k == 17);
+
+  floating_64: f64 = 42.0;
+  floating_32: f32 = cast(f32) floating_64;
+  assert(floating_32 == 42.0);
+
+  boolean: bool = cast(bool) cast(int) 1;
+  assert(boolean == true);
+}
+
+private proc test_pointer_casts() {
+  v: int = 23;
+  p := &v;
+
+  raw_pointer: rawptr = p;
+
+  integer_pointer := cast(uint) raw_pointer;
+  pointer := cast(*int) integer_pointer;
+  assert(pointer == p);
+}

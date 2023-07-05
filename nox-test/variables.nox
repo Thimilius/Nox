@@ -1,0 +1,78 @@
+/**
+* Test the functionality of local variables.
+*/
+internal proc test_variables() {
+  test_variables_simple();
+  test_variables_shadowing(); 
+  test_variables_assignment();
+}
+
+private proc test_variables_simple() {
+  s: i32;
+  r: i32 = 12;
+  assert(r == 12);
+
+  s = r;
+  assert(s == 12);
+
+  result: i32 = 123;
+  assert(result == 123);
+  result = -s;
+  assert(result == -12);
+
+  big: u64 = 0x1000000000000007;
+  assert(big == 0x1000000000000007);
+
+  b: bool = !false;
+  assert(b == true);
+}
+
+private proc test_variables_shadowing() {
+  i := 3;
+  assert(i == 3);
+  
+  if (true) {
+    i := 8;
+    assert(i == 8);
+  }
+  assert(i == 3);
+
+  for (i := 0; i < 1; i++) {
+    assert(i == 0);
+  }
+  assert(i == 3);
+}
+
+private proc test_variables_assignment() {
+  i := 0;
+
+  i += 2;
+  assert(i == 2);
+
+  i -= 1;
+  assert(i == 1);
+
+  i *= 4;
+  assert(i == 4);
+
+  i /= 2;
+  assert(i == 2);
+
+  i <<= 1;
+  assert(i == 4);
+
+  i >>= 1;
+  assert(i == 2);
+
+  i ^= 1;
+  assert(i == 3);
+
+  i &= 2;
+  assert(i == 2);
+
+  i |= 4;
+  assert(i == 6);
+
+  i %= 2;
+  assert(i == 0);
+}

@@ -1,0 +1,84 @@
+/**
+* Test the functionality of AoSoA collections.
+*/
+internal proc test_aosoa() {
+  test_aosoa_array();
+  test_aosoa_dynamic_array();
+  test_aosoa_pointers();
+}
+
+private struct Bar {
+  i: int,
+  s: string,
+}
+
+private proc test_aosoa_array() {
+  array: aosoa[8]Bar;
+  array[0] = {1, "1"};
+  array[5] = {5, "5"};
+
+  assert(array[0].i == 1);
+  assert(array[0].s == "1");
+  assert(array[5].i == 5);
+  assert(array[5].s == "5");
+
+  pointer_to_array := &array;
+  pointer_to_array[0].i = 13;
+  assert(pointer_to_array[0].i == 13);
+
+  raw_array: aosoa[4]Bar;
+  raw_array[0] = {0, "0"};
+  raw_array[1] = {1, "1"};
+  raw_array[2] = {2, "2"};
+  raw_array[3] = {3, "3"};
+  foreach (element, i in raw_array) {
+    assert(element.i == i);
+  }
+}
+
+private proc test_aosoa_dynamic_array() {
+  dynamic_array: aosoa[dynamic]Bar;
+  array_aosoa_add(&dynamic_array, {0, "0"});
+  array_aosoa_add(&dynamic_array, {1, "1"});
+  array_aosoa_add(&dynamic_array, {2, "2"});
+  array_aosoa_add(&dynamic_array, {3, "3"});
+  array_aosoa_add(&dynamic_array, {4, "4"});
+  array_aosoa_add(&dynamic_array, {5, "5"});
+
+  assert(length(dynamic_array) == 6);
+  for (i := 0; i < length(dynamic_array); i++) {
+    assert(dynamic_array[i].i == i);
+  }
+  foreach (element, i in dynamic_array) {
+    assert(element.i == i);
+  }
+}
+
+private proc test_aosoa_pointers() {
+  array: aosoa[8]Bar;
+  array[0] = {0, "0"};
+  array[1] = {1, "1"};
+  array[2] = {2, "2"};
+
+  p_1 := &array[1];
+  assert(p_1.i == 1);
+  assert(p_1.s == "1");
+
+  p_2 := &array[2];
+  assert(p_2.i == 2);
+  assert(p_2.s == "2");
+
+  dynamic_array: aosoa[dynamic]Bar;
+  array_aosoa_add(&dynamic_array, {0, "0"});
+  array_aosoa_add(&dynamic_array, {1, "1"});
+  array_aosoa_add(&dynamic_array, {2, "2"});
+
+  p_slice := &dynamic_array[1];
+  assert(p_slice.i == 1);
+  assert(p_slice.s == "1");
+
+  *p_slice = {123, "123"};
+  element := *p_slice;
+  assert(element.i == 123);
+  assert(element.s == "123");
+}

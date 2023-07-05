@@ -1,0 +1,152 @@
+import "std:memory"
+
+/**
+* The default capacity for a dynamic array.
+*/
+public const DYNAMIC_ARRAY_DEFAULT_CAPACITY := 8;
+
+/**
+* Makes a new dynamic array.
+* 
+* @param !T        The type of the array data.
+* @param length    The starting length.
+* @param capacity  The starting capacity.
+* @param allocator The allocator to use.
+* @return The new dynamic array.
+*/
+public proc array_make!(T)(length: int = 0, capacity: int = DYNAMIC_ARRAY_DEFAULT_CAPACITY, allocator: Allocator = context.allocator) -> [dynamic]T {
+  array := memory.Raw_Dynamic_Array{null, 0, 0, allocator};
+  dynamic_array := cast(*[dynamic]T) &array;
+  array_reserve(dynamic_array, capacity);
+  array_resize(dynamic_array, length);
+  return *dynamic_array;
+}
+
+/**
+* Adds a new element to the end of a dynamic array.
+* 
+* @param !T      The type of the array data.
+* @param a       The dynamic array to add the element to.
+* @param element The element to add.
+*/
+public proc array_add!(T)(a: *[dynamic]T, element: T) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  if (array.capacity < array.length + 1) {
+    new_capacity := max(array.capacity * 2, DYNAMIC_ARRAY_DEFAULT_CAPACITY);
+    array_reserve(a, new_capacity);
+  }
+
+  data_offset: ^*T = array.length;
+  data_pointer := cast(*T) array.data;
+
+  element_pointer := cast(*T) data_pointer + data_offset;
+  *element_pointer = element;
+
+  array.length++;
+}
+
+/**
+* Pops/Removes the last element of a dynamic array.
+* 
+* @param !T The type of the array data.
+* @param a  The dynamic array to pop the element of.
+* @return The poped/removed array element.
+*/
+public proc array_pop!(T)(a: *[dynamic]T) -> T {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return {};
+  if (array.length == 0) then return {};
+
+  data_offset: ^*T = array.length - 1;
+  data_pointer := cast(*T) array.data;
+
+  element_pointer := cast(*T) data_pointer + data_offset;
+
+  array.length--;
+
+  return *element_pointer;
+}
+
+/**
+* Resizes the contents of a dynamic array.
+* 
+* @param !T       The type of the array data.
+* @param a        The dynamic array to resize.
+* @param new_size The new size of the dynamic array.
+*/
+public proc array_resize!(T)(a: *[dynamic]T, new_size: int) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  array_reserve(a, new_size);
+  array.length = new_size;
+}
+
+/**
+* Reserves more capacity for a dynamic array.
+* 
+* @param !T           The type of the array data.
+* @param a            The dynamic array to reserve more capacity for.
+* @param new_capacity The new capacity of the dynamic array.
+*/
+public proc array_reserve!(T)(a: *[dynamic]T, new_capacity: int) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+  if (new_capacity <= array.capacity) then return;
+
+  if (array.allocator.procedure == null) then array.allocator = context.allocator;
+  assert(array.allocator.procedure != null);
+
+  new_size := cast(uint) new_capacity * size_of(:T);
+  old_size := cast(uint) array.capacity * size_of(:T);
+  old_data := cast(*T) array.data;
+
+  new_data: *T;
+  #if (type_is_trivial_copyable!(T)()) {
+    new_data = cast(*T) memory.resize(old_data, old_size, new_size, array.allocator);
+  } else {
+    // We do manual copying here as that is necessary when dealing with types which are not trivially copyable.
+    // The usage of the '=' operator does the appropriate work in this case.
+    new_data = cast(*T) memory.allocate(new_size, array.allocator);
+    for (i := 0; i < array.length; i++) {
+      data_offset: ^*T = i;
+      old_element_pointer := cast(*T) old_data + data_offset;
+      new_element_pointer := cast(*T) new_data + data_offset;
+      *new_element_pointer = *old_element_pointer;
+    }
+    memory.free(old_data, array.allocator);
+  }
+  
+  array.data = new_data;
+  array.capacity = cast(int) new_capacity;
+}
+
+/**
+* Clears the elements of a dynamic array.
+* 
+* @param !T The type of the array data.
+* @param a  The dynamic array to clear.
+*/
+public proc array_clear!(T)(a: *[dynamic]T) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array != null) then array.length = 0;
+}
+
+/**
+* Destroys the resources of a dynamic array.
+* 
+* @param !T The type of the array data.
+* @param a  The dynamic array to destroy.
+*/
+public proc array_destroy!(T)(a: *[dynamic]T) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  memory.free(array.data, array.allocator);
+
+  array.data = null;
+  array.length = 0;
+  array.capacity = 0;
+}

@@ -1,0 +1,13 @@
+/**
+* Test the functionality of types aliases.
+*/
+internal proc test_type_aliases() {
+  i: Integer = 123;
+  assert(i == 123);
+
+  pointer: Procedure_Type = null;
+  assert(pointer == null);
+}
+
+private type_alias Integer := int;
+private type_alias Procedure_Type := proc "c" (arg: int) -> i32;

@@ -1,0 +1,167 @@
+import "std:memory"
+import "std:libc"
+
+/**
+* Adds a new element to the end of a dynamic SoA array.
+* 
+* @param !T      The type of the array data (must be trivial copyable).
+* @param array   The dynamic SoA array to add the element to.
+* @param element The element to add.
+*/
+public proc array_soa_add!(T)(array: *soa[dynamic]T, element: T) where (type_is_trivial_copyable!(T)()) where (!NOX_RTTR_DISABLED) {
+  if (array == null) then return;
+
+  current_capacity := capacity(array);
+  if (current_capacity < length(array) + 1) {
+    new_capacity := max(current_capacity * 2, DYNAMIC_ARRAY_DEFAULT_CAPACITY);
+    array_soa_reserve(array, new_capacity);
+  }
+
+  footer := array_soa_footer(array);
+
+  struct_type := type_info_of(typeid_of(:T));
+  field_count := type_struct_field_count!(T)();
+  field_types := struct_type.variant.(Type_Info_Struct).types;
+  field_offsets := struct_type.variant.(Type_Info_Struct).offsets;
+
+  element_copy := element;
+  element_pointer := cast(*byte) &element_copy;
+
+  data_pointer := cast(*byte) *cast(*rawptr) array;
+
+  // We loop over all fields of the element as we need to copy them over individually.
+  soa_offset := 0;
+  for (i := 0; i < field_count; i++) {
+    field_size := cast(int) field_types[i].size;
+
+    // We need to setup the proper destination and source pointers of the memory we need to copy.
+    data_pointer_offset: ^*byte = soa_offset + field_size * footer.length;
+    destination := data_pointer + data_pointer_offset;
+
+    item_offset := cast(int) field_offsets[i];
+    element_pointer_offset: ^*byte = item_offset;
+    source := element_pointer + element_pointer_offset;
+
+    memory.copy(destination, source, cast(uint) field_size);
+
+    soa_offset += field_size * capacity(array);
+  }
+
+  footer.length += 1;
+}
+
+/**
+* Reserves more capacity for a dynamic SoA array.
+* 
+* @param !T           The type of the array data.
+* @param array        The dynamic SoA array to reserve more capacity for.
+* @param new_capacity The new capacity of the dynamic SoA array.
+*/
+public proc array_soa_reserve!(T)(array: *soa[dynamic]T, new_capacity: int) where (type_is_trivial_copyable!(T)()) where (!NOX_RTTR_DISABLED) {
+  if (array == null) then return;
+
+  old_capacity := capacity(array);
+  if (new_capacity <= old_capacity) then return;
+
+  footer := array_soa_footer(array);
+  footer.capacity = new_capacity;
+  if (footer.allocator.procedure == null) then footer.allocator = context.allocator;
+
+  struct_type := type_info_of(typeid_of(:T));
+  field_count := type_struct_field_count!(T)();
+  field_types := struct_type.variant.(Type_Info_Struct).types;
+
+  old_size := 0;
+  new_size := 0;
+
+  for (i := 0; i < field_count; i++) {
+    field_size := cast(int) field_types[i].size;
+    old_size += field_size * old_capacity;
+    new_size += field_size * new_capacity;
+  }
+
+  old_data := cast(*byte) *cast(*rawptr) array;
+  new_data := cast(*byte) memory.allocate(cast(uint) new_size, footer.allocator);
+
+  // We loop over all fields of the element we need to relocate individually.
+  // We can't simply copy over the whole memory region as it is divided up in each field.
+  old_offset := 0;
+  new_offset := 0;
+  for (i := 0; i < field_count; i++) {
+    field_size := cast(int) field_types[i].size;
+
+    old_byte_offset: ^*byte = old_offset;
+    new_byte_offset: ^*byte = new_offset;
+
+    old_data_element := old_data + old_byte_offset;
+    new_data_element := new_data + new_byte_offset;
+
+    if (old_data != null) {
+      memory.copy(new_data_element, old_data_element, cast(uint) (field_size * old_capacity));
+    }
+
+    array_field_data_offset: ^*rawptr = i;
+    array := cast(*rawptr) array;
+    array[array_field_data_offset] = new_data_element;
+
+    old_offset += field_size * old_capacity;
+    new_offset += field_size * new_capacity;
+  }
+
+  memory.free(old_data, footer.allocator);
+}
+
+/**
+* Clears the elements of a dynamic SoA array.
+* 
+* @param !T    The type of the array data.
+* @param array The dynamic SoA array to clear.
+*/
+public proc array_soa_clear!(T)(array: *soa[dynamic]T) {
+  if (array == null) then return;
+
+  footer := array_soa_footer(array);
+  footer.length = 0;
+}
+
+/**
+* Destroys the resources of a dynamic SoA array.
+* 
+* @param !T    The type of the array data.
+* @param array The dynamic SoA array to destroy.
+*/
+public proc array_soa_destroy!(T)(array: *soa[dynamic]T) {
+  if (array == null) then return;
+
+  footer := array_soa_footer(array);
+
+  data := cast(*byte) *cast(*rawptr) array;
+  memory.free(data, footer.allocator);
+
+  // For now we skip setting every data pointer to 'null' explicitly.
+
+  footer.length = 0;
+  footer.capacity = 0;
+}
+
+/**
+* Represents the footer of a dynamic SoA array.
+*/
+private struct Raw_SoA_Dynamic_Array_Footer {
+  length: int,          // The length of the dynamic SoA array.
+  capacity: int,        // The cpacity of the dynamic SoA array.
+  allocator: Allocator, // The allocator used the dynamic SoA array.
+}
+
+/**
+* Gets a pointer to the footer of a dynamic SoA array.
+*
+* @param !T    The type of the array data.
+* @param array The dynamic SoA array to get the footer of.
+* @return The footer of the dynamic SoA array.
+*/
+private proc array_soa_footer!(T)(array: *soa[dynamic]T) -> *Raw_SoA_Dynamic_Array_Footer {
+  byte_pointer := cast(*byte) array;
+  offset: ^*byte = cast(int) size_of(:rawptr) * type_struct_field_count!(T)();
+  return cast(*Raw_SoA_Dynamic_Array_Footer) (byte_pointer + offset);
+}

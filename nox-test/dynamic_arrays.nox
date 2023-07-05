@@ -1,0 +1,18 @@
+/**
+* Test the functionality of dynamic arrays.
+*/
+internal proc test_dynamic_arrays() {
+  array: [dynamic]int;
+  array_add(&array, 27);
+  array_add(&array, 74);
+  array_add(&array, 98);
+
+  assert(length(array) == 3);
+  assert(array[0] == 27);
+  assert(array[1] == 74);
+  assert(array[2] == 98);
+
+  p := &array[1];
+  *p = 32;
+  assert(array[1] == 32);
+}

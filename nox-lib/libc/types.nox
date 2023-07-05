@@ -1,0 +1,13 @@
+public type_alias size_t := uint;
+
+#if (NOX_OS == .Windows || size_of(:rawptr) == 4) {
+  public type_alias long := i32;
+} else {
+  public type_alias long := i64;
+}
+
+#if (NOX_OS == .Windows) {
+  public type_alias wchar_t := u16;
+} else {
+  public type_alias wchar_t := u32;
+}

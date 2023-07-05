@@ -1,0 +1,46 @@
+#expand_context(data, int)
+
+/**
+* Test the functionality of the implicit context.
+*/
+public proc test_context() {
+  test_context_simple();
+  test_no_context();
+}
+
+private proc test_context_simple() {
+  assert(context.data == 0);
+
+  new_context := *context;
+  new_context.data = 13;
+  push_context (new_context) {
+    nested_new_context := *context;
+    nested_new_context.data = 17;
+    push_context (nested_new_context) {
+      assert(context.data == 17);  
+
+      test_context_nested();
+    }
+
+    assert(context.data == 13);
+  }
+
+  assert(context.data == 0);
+}
+
+private proc test_context_nested() {
+  assert(context.data == 17);
+}
+
+private proc "nocontext" test_no_context() {
+  new_context: Context;
+  new_context.data = 10;
+  push_context (new_context) {
+    assert(context.data == 10);
+    test_with_context();
+  }
+}
+
+private proc test_with_context() {
+  assert(context.data == 10);
+}

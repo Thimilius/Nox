@@ -1,0 +1,122 @@
+import "std:libc"
+import "std:memory"
+import "std:strings"
+import "std:system"
+
+/**
+* Reads the contents of a file as a string.
+*
+* @param path The path to the file to read.
+* @return 1. The contents of the file as a string; 2. True if the reading was successful otherwise false.
+*/
+public proc read_file(path: string) -> (string, bool) {
+  cpath := strings.clone_to_cstring(path, context.temporary_allocator);
+
+  file := libc.fopen(cast(cstring) cpath, "rb");
+  if (file == null) {
+    return {"", false};  
+  }
+  defer libc.fclose(file);
+
+  libc.fseek(file, 0, libc.SEEK_END);
+  length := libc.ftell(file);
+  if (length == 0) {
+    return {"", true};
+  }
+
+  buffer := memory.allocate(cast(uint) length);
+  
+  libc.fseek(file, 0, libc.SEEK_SET);
+  if (libc.fread(buffer, cast(libc.size_t) length, 1, file) != 1) {
+    memory.free(buffer);
+    return {"", false};
+  }
+
+  return {strings.string_from_pointer(buffer, cast(int) length), true};
+}
+
+/**
+* Removes a file from disk.
+* 
+* @param path The path of the file to remove.
+*/
+public proc remove_file(path: string) {
+  cpath := strings.clone_to_cstring(path, context.temporary_allocator);
+  libc.remove(cpath);
+}
+
+/**
+* Checks whether or not a file path as a given extension.
+*
+* @param path      The path to check.
+* @param extension The extension to check for.
+* @return True if the path has the given extension otherwise false.
+*/
+public proc has_extension(path: string, extension: string) -> bool {
+  last_index_of_dot := strings.last_index_of(path, ".");
+  if (last_index_of_dot < 0) then return false;
+  extension_in_path := path[last_index_of_dot:];
+  return extension_in_path == extension;
+}
+
+#if (NOX_OS == .Windows) {
+
+  import "std:system/windows"
+
+  /**
+  * Gets the absolute path of a relative path.
+  *
+  * @param relative_path The relative path.
+  * @return The absolute path.
+  */
+  public proc get_absolute_path(relative_path: string) -> string {
+    buffer: [system.MAX_PATH_WIDE]libc.wchar_t;
+
+    wide_path := system.utf8_to_utf16(relative_path, context.temporary_allocator);
+
+    windows._wfullpath(data(buffer), wide_path, cast(uint) system.MAX_PATH_WIDE);
+    return system.utf16_to_utf8((data(buffer)));
+  }
+
+  /**
+  * Checks whether or not a file exists on disk.
+  *
+  * @param path The path of the file to check.
+  * @return True if the file exists on disk otherwise false.
+  */
+  public proc file_exists(path: string) -> bool {
+    wide_path := system.utf8_to_utf16(path, context.temporary_allocator);
+    attributes := windows.GetFileAttributesW(wide_path);
+    return attributes != windows.INVALID_FILE_ATTRIBUTES;
+  }
+
+} else #if (NOX_OS == .Linux) {
+
+  import "std:system/unix"
+
+  /**
+  * Gets the absolute path of a relative path.
+  *
+  * @param relative_path The relative path.
+  * @return The absolute path.
+  */
+  public proc get_absolute_path(relative_path: string) -> string {
+    c_path := strings.clone_to_cstring(relative_path, context.temporary_allocator);
+    buffer: [system.MAX_PATH]u8;
+    unix.realpath(c_path  , &buffer);
+    return strings.clone_from_cstring(cast(cstring) data(buffer));
+  }
+
+  /**
+  * Checks whether or not a file exists on disk.
+  *
+  * @param path The path of the file to check.
+  * @return True if the file exists on disk otherwise false.
+  */
+  public proc file_exists(path: string) -> bool {
+    c_path := strings.clone_to_cstring(path, context.temporary_allocator);
+    result := unix.access(c_path, unix.O_RDONLY);
+    return result == 0;
+  }
+
+}

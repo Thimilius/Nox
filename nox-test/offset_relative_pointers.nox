@@ -1,0 +1,19 @@
+/**
+* Test the functionality of offset relative pointers.
+*/
+internal proc test_offset_relative_pointers() {
+  slice: []int = {1, 2, 3, 4};
+  offset: ^*int = 0;
+  base := data(slice);
+  assert(base[offset] == 1);
+
+  offset = 1;
+  assert(base[offset] == 2);
+
+  offset = 2;
+  new_base := base + offset;
+  assert(*new_base == 3);
+
+  difference := new_base - base;
+  assert(difference == 2);
+}

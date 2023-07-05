@@ -1,0 +1,99 @@
+/**
+* The minimum value of an i8.
+*/
+public const I8_MIN: i8 = -128;
+/**
+* The minimum value of an i8.
+*/
+public const I8_MAX: i8 = 127;
+/**
+* The minimum value of an i16.
+*/
+public const I16_MIN: i16 = -32768;
+/**
+* The minimum value of an i16.
+*/
+public const I16_MAX: i16 = 32767;
+/**
+* The minimum value of an i32.
+*/
+public const I32_MIN: i32 = -2147483648;
+/**
+* The minimum value of an i32.
+*/
+public const I32_MAX: i32 = 2147483647;
+/**
+* The minimum value of an i64.
+*/
+public const I64_MIN: i64 = -9223372036854775808;
+/**
+* The minimum value of an i64.
+*/
+public const I64_MAX: i64 = 9223372036854775807;
+/**
+* The minimum value of an int.
+*/
+public const INT_MIN: int = -9223372036854775808;
+/**
+* The minimum value of an int.
+*/
+public const INT_MAX: int = 9223372036854775807;
+/**
+* The minimum value of an u8.
+*/
+public const U8_MIN: u8 = 0;
+/**
+* The minimum value of an u8.
+*/
+public const U8_MAX: u8 = 255;
+/**
+* The minimum value of an u16.
+*/
+public const U16_MIN: u16 = 0;
+/**
+* The minimum value of an u16.
+*/
+public const U16_MAX: u16 = 65535;
+/**
+* The minimum value of an u32.
+*/
+public const U32_MIN: u32 = 0;
+/**
+* The minimum value of an u32.
+*/
+public const U32_MAX: u32 = 4294967295;
+/**
+* The minimum value of an u64.
+*/
+public const U64_MIN: u64 = 0;
+/**
+* The minimum value of an u64.
+*/
+public const U64_MAX: u64 = 18446744073709551615;
+/**
+* The minimum value of an uint.
+*/
+public const UINT_MIN: uint = 0;
+/**
+* The minimum value of an uint.
+*/
+public const UINT_MAX: uint = 18446744073709551615;
+
+/**
+* Rounds up a given integer to the next power of 2.
+*
+* @param v The integer to round up.
+* @return The round up integer.
+*/
+public pure func round_up_to_next_power_of_2(v: int) -> int {
+  // Implementation derived from: http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+  v := v;
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  v++;
+  return v;
+}

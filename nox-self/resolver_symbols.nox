@@ -1,0 +1,1028 @@
+import "std:memory"
+
+/**
+* Represents a constant value.
+*/
+internal union Value {
+  b8,
+  b16,
+  b32,
+  b64,
+  bool,
+  i8,
+  i16,
+  i32,
+  i64,
+  int,
+  u8,
+  u16,
+  u32,
+  u64,
+  uint,
+  f32,
+  f64,
+  char,
+  string,
+
+  // HACK: Those are strictly not an actual valid value but it is quite convenient to save on space in 'Symbol'.
+  *Package, // Necessary for 'Package' symbols.
+  *Type,    // Used for accessing the implemented type in symbols that are flagged as 'Routine_Method_Implemented'.
+}
+
+/**
+* Creates the default value for a type.
+* 
+* @param type The type whose default value to get.
+* @return The default value.
+*/
+internal proc value_default(type: *Type) -> Value {
+  type := type.unqualify();
+  if (type.is_enumeration()) {
+    type = type.base;
+  }
+
+  switch (type.kind) {
+    case .B8:     return cast(b8)     false;
+    case .B16:    return cast(b16)    false;
+    case .B32:    return cast(b32)    false;
+    case .B64:    return cast(b64)    false;
+    case .Bool:   return cast(bool)   false;
+    case .I8:     return cast(i8)     0;
+    case .I16:    return cast(i16)    0;
+    case .I32:    return cast(i32)    0;
+    case .I64:    return cast(i64)    0;
+    case .Int:    return cast(int)    0;
+    case .U8:     return cast(u8)     0;
+    case .U16:    return cast(u16)    0;
+    case .U32:    return cast(u32)    0;
+    case .U64:    return cast(u64)    0;
+    case .UInt:   return cast(uint)   0;
+    case .F32:    return cast(f32)    0;
+    case .F64:    return cast(f64)    0;
+    case .Char:   return cast(char)   0;
+    case .String: return cast(string) "";
+  }
+
+  return {};
+}
+
+/**
+* The kind of a symbol.
+*/
+internal enum Symbol_Kind {
+  None,     // No/Invalid symbol.
+
+  // Regular global declarations.
+  Constant,  // A constant symbol ('const').
+  Global,    // A global symbol ('global').
+  Type,      // A type symbol ('struct', 'union', 'enum').
+  Routine,   // A routine symbol ('proc', 'func').
+
+  // Special symbols with limited scope.
+  Local,     // A local symbol inside a routine.
+  Parameter, // A parameter symbol of a routine.
+
+  // Special symbol referring to a different package.
+  Package,   // A package symbol (defined by an import).
+}
+
+/**
+* The state of a symbol.
+*/
+internal enum Symbol_State {
+  Unresolved,                 // The symbol is still unresolved.
+  Resolving,                  // The symbol is currently being resolved.
+  Resolved,                   // The symbol got fully resolved.
+  Resolved_But_Not_Reachable, // The symbol got resolved but is not yet determined reachable.
+}
+
+/**
+* The flags for a symbol
+*/
+@flags internal enum Symbol_Flags : u16 {
+  Reachable,                  // The symbol is reachable inside the user program.
+  
+  Uninstantiated_Generic,     // The symbol is an uninstantiated generic (type or routine).
+  
+  Enum_Flags,                 // The enumeration is marked with the attribute 'flags'.
+
+  Global_Thread_Local,        // The global is marked with the attribute 'threadlocal'.
+
+  Routine_Function,           // The routine is a function.
+  Routine_Function_Pure,      // The function routine is marked with the attribute 'pure'.
+  Routine_Builtin,            // The routine is marked with the attribute 'builtin'.
+  Routine_Intrinsic,          // The routine is marked with the attribute 'intrinsic'.
+  Routine_Disabled,           // The routine is marked with the attribute 'disabled' (Added only when the symbol got resolved).
+  Routine_Instantiated,       // The routine has instantiated generic type parameters (Added only when the symbol got resolved).
+  Routine_Method_Interface,   // The routine is part of an interface declaration (Added only when the symbol got resolved).
+  Routine_Method_Implemented, // The routine is part of an implementation (Added only when the symbol got resolved).
+
+  Local_Declared,             // The local got declared through a dedicated initialize statement.
+  Local_Used,                 // The local got used after being declared.
+  Local_Immutable,            // The local symbol is immutable.
+}
+
+/**
+* Represents a symbol referred to by name.
+*/
+internal struct Symbol {
+  kind: Symbol_Kind,                // The kind of the symbol.
+  state: Symbol_State,              // The state of the symbol.
+  flags: Symbol_Flags,              // The flags of the symbol.
+  access_modifier: Access_Modifier, // The access modifier of the symbol
+
+  name: string,                     // The name of the symbol
+  package_file: *Package_File,      // The package file the symbol belongs to.
+
+  declaration: *Declaration,        // The AST declaration that defines the symbol (can be null for built-in types).
+
+  type: *Type,                      // The type of the symbol (gets filled in after resolving).
+  value: Value,                     // The value of constant symbols (gets filled in after resolving) but can also holds special values for certain symbols.
+}
+
+/**
+* Represents a local symbol
+*/
+internal struct Local_Symbol {
+  symbol: Symbol,            // The symbol of the local variable.
+  position: Source_Position, // The position the local variable is declared.
+}
+
+/**
+* Represents intrinsic routines the compiler handles directly.
+*/
+internal enum Intrinsic_Routine {
+  Invalid,                   // No/Ivalid routine.
+
+  Entry_Point,               // The 'entry_point' routine.
+
+  Data,                      // The 'data' routine.
+  Length,                    // The 'length' routine.
+  Capacity,                  // The 'capacity' routine.
+
+  Hash_Function_Of_Type,     // The 'hash_function_of_type' routine.
+  Compare_Function_Of_Type,  // The 'compare_function_of_type' routine.
+
+  Trap,                      // The 'trap' routine.
+
+  Type_Is_Scalar,            // The 'hash_function_of_type' routine.
+  Type_Is_Enum,              // The 'type_is_enum' routine.
+  Type_Is_Struct,            // The 'type_is_struct' routine.
+  Type_Is_AoSoA,             // The 'type_is_aosoa' routine.
+  Type_Is_Trivial_Copyable,  // The 'type_is_trivial_copyable' routine.
+  Type_Enum_Item_Count,      // The 'type_enum_item_count' routine.
+  Type_Struct_Field_Count,   // The 'type_struct_field_count' routine.
+  Type_AoSoA_Chunk_Size,     // The 'type_aosoa_chunk_size' routine.
+  Type_AoSoA_Items_In_Chunk, // The 'type_aosoa_items_in_chunk' routine.
+}
+
+/**
+* The mappings of routine names to their intrinsic routine type.
+*/
+internal global INTRINSIC_ROUTINES: map[string]Intrinsic_Routine;
+
+/**
+* Makes a new symbol.
+*
+* @param resolver        The reference to the resolver.
+* @param kind            The kind of the symbol.
+* @param access_modifier The access modifier of the symbol.
+* @param package_file    The package file the symbol belongs to.
+* @param name            The name of the symbol.
+* @param declaration     The declaration that defines the symbol.
+* @return The new symbol.
+*/
+internal proc symbol_make(
+  resolver: *Resolver,
+  kind: Symbol_Kind,
+  access_modifier: Access_Modifier,
+  package_file: *Package_File,
+  name: string,
+  declaration: *Declaration,
+) -> *Symbol {
+  symbol := memory.new!(Symbol)(resolver.symbol_allocator);
+  symbol.kind = kind;
+  symbol.state = .Unresolved;
+  symbol.access_modifier = access_modifier;
+  symbol.name = name;
+  symbol.package_file = package_file;
+  symbol.declaration = declaration;
+  return symbol;
+}
+
+/**
+* Makes a symbol from a declaration.
+*
+* @param resolver     The reference to the resolver.
+* @param package_file The package file the symbol belongs to.
+* @param declaration  The declaration that defines the symbol.
+* @return The new symbol.
+*/
+internal proc symbol_make_declaration(resolver: *Resolver, package_file: *Package_File, declaration: *Declaration) -> *Symbol {
+  kind := Symbol_Kind.None;
+  switch (declaration.kind) {
+    case .Constant: kind = .Constant;
+    case .Global: kind = .Global;
+    case .Enumeration, .Struct, .Union, .Interface, .Type_Alias, .Type_Define: kind = .Type;
+    case .Procedure, .Function: kind = .Routine;
+
+    case .Import, .Implementation, .Directive: fallthrough;
+    case: assert(false);
+  }
+  symbol := symbol_make(resolver, kind, declaration.access_modifier, package_file, declaration.name, declaration);
+  symbol.flags = symbol_get_flags_from_declaration(declaration);
+  return symbol;
+}
+
+/**
+* Get symbol flags from a declaration.
+* 
+* @param declaration The declaration to get the flags for.
+* @return The symbol flags.
+*/
+private proc symbol_get_flags_from_declaration(declaration: *Declaration) -> Symbol_Flags {
+  flags: Symbol_Flags;
+  if (has_flag(declaration.flags, .Generic)) {
+    set_flag(&flags, .Uninstantiated_Generic);
+  }
+  if (declaration.kind == .Function) {
+    set_flag(&flags, .Routine_Function);
+  }
+  if (has_flag(declaration.flags, .Routine_Is_Pure_Function)) {
+    set_flag(&flags, .Routine_Function_Pure);
+  }
+  return flags;
+}
+
+implement Resolver {
+  
+  /**
+  * Imports symbols from a package .
+  *
+  * @param file             The package file to import the symbols into.
+  * @param position         The position of the import.
+  * @param imported_package The package whose symbols to import.
+  */
+  internal proc import_package_symbols(file: *Package_File, position: Source_Position, imported_package: *Package) {
+    foreach (_, imported_file in imported_package.files) {
+      foreach (_, symbol in imported_file.symbols) {
+        if (symbol.access_modifier == .Public) {
+          self.add_imported_symbol(position, file, symbol.name, symbol);
+        }
+      }
+    }
+  }
+
+  /**
+  * Adds a global symbol.
+  *
+  * @param file     The package file the symbol belongs to.
+  * @param name     The name of the symbol.
+  * @param symbol   The symbol to add.
+  */
+  internal proc add_global_symbol(file: *Package_File, name: string, symbol: *Symbol) {
+    current_package := context.compiler.current_package;
+    old_symbol := package_get_symbol_without_checks(current_package, file, name, .All);
+
+    if (old_symbol != null) {
+      is_duplicate := false;
+      if (symbol.access_modifier == .Private || old_symbol.access_modifier == .Private) {
+        is_duplicate = old_symbol.package_file == file;
+      } else {
+        is_duplicate = symbol.package_file.package == current_package;
+      }
+
+      if (is_duplicate) {
+        position := symbol.declaration == null ? SOURCE_POSITION_BUILTIN : symbol.declaration.position;
+        old_declaration := old_symbol.declaration;
+        if (old_declaration == null) {
+          report_error_fatal(position, "Duplicate definition of symbol '%'", name);
+        } else {
+          old_position := old_declaration.position;
+          report_error_fatal(
+            position,
+            "Duplicate definition of symbol '%'\nPrevious definition at %(%:%)",
+            name,
+            old_position.file,
+            old_position.line,
+            old_position.column,
+          );
+        }
+      }
+    }
+
+    map_set(&file.symbols, symbol.name, symbol);
+    map_set(&self.unreachable_symbols, symbol, {});
+  }  
+
+  /**
+  * Adds a global package symbol.
+  *
+  * @param imported_package The package that got imported.
+  * @param file             The package file the symbol belongs to.
+  * @param name             The name of the symbol.
+  * @param declaration      The import declaration.
+  */
+  internal proc add_package_symbol(imported_package: *Package, file: *Package_File, name: string, declaration: *Declaration) {
+    symbol := symbol_make(self, .Package, .Private, file, name, declaration);
+    symbol.value = imported_package;
+    symbol.state = .Resolved;
+    set_flag(&symbol.flags, .Reachable);
+
+    // Check that we might have already imported a package with the same name in the same file.
+    old_symbol, found := map_get(&file.imported_symbols, name);
+    if (found && old_symbol.kind == .Package) {
+      package_with_the_same_name := old_symbol.value.(*Package);
+      report_error_fatal(
+        declaration.position,
+        "A package with the name '%' was already imported through '%'. Try using a package alias",
+        name,
+        package_with_the_same_name.import_path,
+      );
+    }
+
+    self.add_imported_symbol(declaration.position, file, name, symbol);
+  }
+
+  /**
+  * Adds an imported symbol.
+  *
+  * @param position The position of the import.
+  * @param file     The package file the symbol belongs to.
+  * @param name     The name of the symbol.
+  * @param symbol   The imported symbol to add.
+  */
+  internal proc add_imported_symbol(position: Source_Position, file: *Package_File, name: string, symbol: *Symbol) {
+    current_package := context.compiler.current_package;
+    old_symbol := package_get_symbol_without_checks(current_package, file, name, .All);
+
+    if (old_symbol != null) {
+      report_error_fatal(position, "Conflicting import of symbol '%' into '%' from '%'", name, current_package.name, symbol.package_file.package.name);
+    }
+
+    map_set(&file.imported_symbols, symbol.name, symbol);
+    map_set(&self.unreachable_symbols, symbol, {});
+  }
+
+  /**
+  * Adds a parameter symbol.
+  *
+  * @param position The position of the symbol.
+  * @param name     The name of the symbol.
+  * @param type     The type of the symbol.
+  * @param flags    The flags of the symbol.
+  */
+  internal proc add_parameter_symbol(position: Source_Position, name: string, type: *Type, flags: Symbol_Flags = {}) {
+    package_file := package_get_package_file_by_name(context.compiler.current_package, position.file);
+    flags := flags;
+    set_flag(&flags, .Reachable);
+    symbol := Symbol{.Parameter, .Resolved, flags, .Private, name, package_file, null, type, {}};
+    map_set(&self.local_scope.symbols, name, {symbol, position});
+  }
+
+  /**
+  * Adds a local symbol.
+  *
+  * @param position The position of the symbol.
+  * @param name     The name of the symbol.
+  * @param type     The type of the symbol.
+  * @param flags    The flags of the symbol.
+  * @param value    The value of the symbol.
+  */
+  internal proc add_local_symbol(position: Source_Position, name: string, type: *Type, flags: Symbol_Flags = {}, value: Value = {}) {
+    local_symbol, found := map_get(&self.local_scope.symbols, name);
+    if (found) {
+      report_error_fatal(position, "Duplicate definition of local '%'", local_symbol.symbol.name);
+    }
+
+    package_file := package_get_package_file_by_name(context.compiler.current_package, position.file);
+    flags := flags;
+    set_flag(&flags, .Reachable);
+    symbol := Symbol{.Local, .Resolved, flags, .Private, name, package_file, null, type, value};
+    map_set(&self.local_scope.symbols, name, {symbol, position});
+  }
+
+  /** 
+  * Resolves a symbol.
+  * 
+  * @param symbol   The symbol to resolve.
+  */
+  internal proc resolve_symbol(symbol: *Symbol) {
+    if (symbol.state == .Resolved) {
+      assert(has_flag(symbol.flags, .Reachable));
+      return;
+    } else if (symbol.state == .Resolving) {
+      report_error_fatal(symbol.declaration.position, "Cyclic dependency");
+      return;
+    }
+
+    assert(!has_flag(symbol.flags, .Reachable));
+    set_flag(&symbol.flags, .Reachable);
+    if (symbol.kind != .Local && symbol.kind != .Parameter) {
+      array_add(&self.reachable_symbols, symbol);
+      map_remove(&self.unreachable_symbols, symbol);
+    }
+
+    declaration := symbol.declaration;
+
+    // We add the symbol to the list of sorted symbols AFTER it got properly resolved depending on its kind.
+    // This also needs to happen in case of 'Resolved_But_Not_Reachable'.
+    defer if (declaration != null && declaration.kind != .Struct && declaration.kind != .Union) {
+      array_add(&self.sorted_symbols, symbol);
+    }
+
+    if (symbol.state == .Resolved_But_Not_Reachable) {
+      symbol.state = .Resolved;
+      return;
+    }
+
+    assert(symbol.state == .Unresolved);
+    symbol.state = .Resolving;
+
+    previous_packge := package_enter(symbol.package_file.package);
+
+    switch (symbol.kind) {
+      case .Constant: symbol.type = self.resolve_symbol_constant(declaration, symbol);
+      case .Global: symbol.type = self.resolve_symbol_global(declaration);
+      case .Type: symbol.type = self.resolve_symbol_type(declaration, symbol);
+      case .Routine: symbol.type = self.resolve_symbol_routine(declaration, symbol);
+      case .Package: // We don't need to do anything.
+
+      case .Local, .Parameter: fallthrough;
+      case: assert(false);
+    }
+
+    package_leave(previous_packge);
+
+    symbol.state = .Resolved;
+  }
+
+  /**
+  * Resolves a constant symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The constant symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  private proc resolve_symbol_constant(declaration: *Declaration, symbol: *Symbol) -> *Type {
+    assert(declaration.kind == .Constant);
+    declaration := cast(*Declaration_Constant) declaration;
+
+    result := self.resolve_expression_constant(cast(*Expression) declaration.expression, statement_context_default());
+    constant_type := result.type.unqualify();
+
+    if (!constant_type.is_scalar() && !constant_type.is_string_like()) {
+      report_error_fatal(declaration.position, "Constants must have a scalar or string type");
+    }
+
+    if (declaration.type != null) {
+      type := self.resolve_type_specification(cast(*Type_Specification) declaration.type);
+      if (!self.operand_convert(declaration.expression.position, &result, type)) {
+        report_error_fatal(declaration.position, "Invalid types in constant declaration. Expected '%' got '%'", type.name, result.type.name);
+      }
+    } else {
+      operand_remove_untyped(declaration.position, &result);
+    }
+
+    symbol.value = result.value;
+    return context.storage.get_or_make_type_constant(result.type);
+  }
+
+  /**
+  * Resolves a global symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The global symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  private proc resolve_symbol_global(declaration: *Declaration) -> *Type {
+    assert(declaration.kind == .Global);
+    declaration := cast(*Declaration_Global) declaration;
+
+    if (has_flag(declaration.flags, .Extern) && declaration.expression != null) {
+      report_error_fatal(declaration.position, "Extern global cannot have an initializer expression");
+    }
+
+    return self.resolve_initializer(
+      declaration.position,
+      statement_context_default(),
+      cast(*Type_Specification) declaration.type,
+      cast(*Expression) declaration.expression,
+    );
+  }
+
+  /**
+  * Resolves a type symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The type symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  private proc resolve_symbol_type(declaration: *Declaration, symbol: *Symbol) -> *Type {
+    storage := context.storage;
+
+    switch (declaration.kind) {
+      case .Enumeration: return self.resolve_symbol_type_enumeration(declaration, symbol);
+
+      case .Struct, .Union: {
+        if (has_flag(symbol.flags, .Uninstantiated_Generic)) {
+          generic_type_names := (cast(*Declaration_Struct) declaration).generic_type_names;
+          self.check_for_duplicate_generic_type_names(declaration.position, generic_type_names);
+        }
+        return storage.make_type_incomplete(declaration.kind == .Struct ? .Struct : .Union, symbol);
+      }
+
+      case .Interface: return self.resolve_symbol_type_interface(declaration, symbol);
+
+      case .Type_Alias: {
+        declaration := cast(*Declaration_Type_Alias) declaration;
+        generic_context: Generic_Context;
+        generic_context.type_names = declaration.generic_type_names;
+        generic_context.generic_types = array_make!(*Type)(0, length(declaration.generic_type_names), context.temporary_allocator);
+        foreach (generic_type_name in declaration.generic_type_names) {
+          array_add(&generic_context.generic_types, storage.get_or_make_type_generic(generic_type_name));
+        }
+        aliased_type := self.resolve_type_specification(cast(*Type_Specification) declaration.type, generic_context);
+        if (aliased_type.is_array_and_incomplete()) {
+          report_error_fatal(declaration.position, "Type '%' is not allowed in type alias", aliased_type.name);
+        }
+        return aliased_type;
+      }
+      case .Type_Define: {
+        declaration := cast(*Declaration_Type_Define) declaration;
+        base := self.resolve_type_specification(cast(*Type_Specification) declaration.type);
+        // Currently we disallow enumerations in type defines as that would require a bit more work to support.
+        // If we would allow them right now, there would be no easy way to refer to the enum constants.
+        if (base.is_array_and_incomplete() || base.is_enumeration()) {
+          report_error_fatal(declaration.position, "Type '%' is not allowed in type define", base.name);
+        }
+        return storage.make_type_distinct(declaration.name, base);
+      }
+    }
+
+    assert(false);
+    return null;
+  }
+
+  /**
+  * Resolves a type enumeration symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The type enumeration symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  private proc resolve_symbol_type_enumeration(declaration: *Declaration, symbol: *Symbol) -> *Type {
+    declaration := cast(*Declaration_Enumeration) declaration;
+
+    storage := context.storage;
+
+    base_type := storage.type_int;
+    if (declaration.type != null) {
+      base_type = self.resolve_type_specification(cast(*Type_Specification) declaration.type);
+    }
+    if (!base_type.is_integer()) {
+      report_error_fatal(declaration.position, "Base type of an enumeration must be an integer type. Got '%'", base_type.name);
+    }
+
+    is_flags := has_flag(symbol.flags, .Enum_Flags);
+
+    item_value := value_default(base_type);
+    // Flags start at '1' and not '0', so we increment it accordingly.
+    if (is_flags) {
+      self.resolve_symbol_type_enumeration_increment_regular(&item_value, base_type);
+    }
+
+    // We are entering a local scope, so that we can refer to our own enum names.
+    // NOTE: Currently we do NOT resolve those out-of-order meaning they have to be forward declared.
+    self.enter_local_scope();
+
+    enumeration_items: aosoa[dynamic]Type_Enumeration_Item;
+    foreach (item in declaration.items) {
+      item_position := item.position;
+
+      if (item.initializer != null) {
+        if (is_flags) {
+          report_error_fatal(item.initializer.position, "Enum item initializer not allowed for enum flags");
+        }
+        constant_operand := self.resolve_expression_constant(item.initializer, statement_context_default());
+        if (!self.operand_convert(item_position, &constant_operand, base_type)) {
+          report_error_fatal(item_position, "Invalid type in enum item initializer. Expected '%' got '%'", base_type.name, constant_operand.type.name);
+        }
+        item_value = constant_operand.value;
+      }
+
+      // We add our item as a local constant by making the type constant and explicitly setting the value.
+      constant_local_type := storage.get_or_make_type_constant(base_type);
+      self.add_local_symbol(item_position, item.name, constant_local_type, {}, item_value);
+
+      array_aosoa_add(&enumeration_items, {item.name, item_value});
+
+      if (is_flags) {
+        self.resolve_symbol_type_enumeration_increment_flags(&item_value, base_type);
+      } else {
+        self.resolve_symbol_type_enumeration_increment_regular(&item_value, base_type);
+      }
+    }
+
+    self.leave_local_scope();
+
+    return storage.make_type_enumeration(symbol, base_type, enumeration_items, is_flags);
+  }
+
+  /**
+  * Regularly increment the value of an enum.
+  *
+  * @param The value to increment.
+  * @param The base type of the enum.
+  */
+  private proc resolve_symbol_type_enumeration_increment_regular(value: *Value, base_type: *Type) {
+    switch (base_type.kind) {
+      case .I8:   *value = value.(i8)   + 1;
+      case .I16:  *value = value.(i16)  + 1;
+      case .I32:  *value = value.(i32)  + 1;
+      case .I64:  *value = value.(i64)  + 1;
+      case .Int:  *value = value.(int)  + 1;
+      case .U8:   *value = value.(u8)   + 1;
+      case .U16:  *value = value.(u16)  + 1;
+      case .U32:  *value = value.(u32)  + 1;
+      case .U64:  *value = value.(u64)  + 1;
+      case .UInt: *value = value.(uint) + 1;
+    }
+  }
+
+  /**
+  * Increment the value of an enum flag.
+  *
+  * @param The value to increment.
+  * @param The base type of the enum flag.
+  */
+  private proc resolve_symbol_type_enumeration_increment_flags(value: *Value, base_type: *Type) {
+    switch (base_type.kind) {
+      case .I8:   *value = value.(i8)   << 1;
+      case .I16:  *value = value.(i16)  << 1;
+      case .I32:  *value = value.(i32)  << 1;
+      case .I64:  *value = value.(i64)  << 1;
+      case .Int:  *value = value.(int)  << 1;
+      case .U8:   *value = value.(u8)   << 1;
+      case .U16:  *value = value.(u16)  << 1;
+      case .U32:  *value = value.(u32)  << 1;
+      case .U64:  *value = value.(u64)  << 1;
+      case .UInt: *value = value.(uint) << 1;
+    }
+  }
+
+  /**
+  * Resolves a type interface symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The type interface symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  private proc resolve_symbol_type_interface(declaration: *Declaration, symbol: *Symbol) -> *Type {
+    declaration := cast(*Declaration_Interface) declaration;
+
+    methods: aosoa[dynamic]Type_Method;
+    foreach (declaration_method in declaration.methods) {
+      name := declaration_method.name;
+      foreach (method in methods) {
+        if (method.name == name) {
+          report_error_fatal(declaration_method.position, "Duplicate interface method named '%'", declaration_method.name);
+        }
+      }
+
+      method_symbol := symbol_make_declaration(self, symbol.package_file, declaration_method);
+      method_symbol.state = .Resolved;
+      set_flag(&method_symbol.flags, .Reachable);
+      set_flag(&method_symbol.flags, .Routine_Method_Interface);
+      if (has_flag(method_symbol.flags, .Uninstantiated_Generic)) {
+        report_error_fatal(declaration_method.position, "Interface method '%' can not be generic", declaration_method.name);
+      }
+
+      method_type := self.resolve_symbol_routine(declaration_method, method_symbol);
+      array_aosoa_add(&methods, {declaration_method.access_modifier, symbol.package_file.package, declaration_method.position.file, name, method_type});
+
+      if (method_symbol.access_modifier > declaration.access_modifier) {
+        report_error_fatal(declaration_method.position, "Method '%' has a higher access modifier than '%'", name, declaration.name);
+      }
+    }
+
+    return context.storage.make_type_interface(symbol, methods);
+  }
+
+  /**
+  * Resolves a routine symbol.
+  * 
+  * @param declaration The declaration that defines the symbol.
+  * @param symbol      The routine symbol to resolve.
+  * @return The resolved type of the symbol.
+  */
+  internal proc resolve_symbol_routine(declaration: *Declaration, symbol: *Symbol) -> *Type {
+    assert(declaration.kind == .Procedure || declaration.kind == .Function);
+    declaration := cast(*Declaration_Routine) declaration;
+
+    calling_convention := declaration.calling_convention;
+    self.resolve_symbol_routine_attributes(symbol, declaration);
+    is_implemented_method := has_flag(symbol.flags, .Routine_Method_Implemented);
+    is_method := is_implemented_method || has_flag(symbol.flags, .Routine_Method_Interface);
+    is_pure := has_flag(symbol.flags, .Routine_Function_Pure);
+    is_intrinsic := has_flag(symbol.flags, .Routine_Intrinsic);
+
+    type_kind := declaration.kind == .Procedure ? Type_Kind.Procedure : Type_Kind.Function;
+    has_params := has_flag(declaration.flags, .Routine_Has_Params);
+    has_c_varargs := has_flag(declaration.flags, .Routine_Has_C_Varargs);
+
+    is_generic := has_flag(symbol.flags, .Uninstantiated_Generic);
+    is_instantiated := has_flag(symbol.flags, .Routine_Instantiated);
+    generic_context: Generic_Context;
+    generic_context.generic_types = array_make!(*Type)(0, length(declaration.generic_type_names), context.temporary_allocator);
+    if (is_generic) {
+      self.check_for_duplicate_generic_type_names(declaration.position, declaration.generic_type_names);
+      generic_context.type_names = declaration.generic_type_names;
+      foreach (generic_type_name in declaration.generic_type_names) {
+        array_add(&generic_context.generic_types, context.storage.get_or_make_type_generic(generic_type_name));
+      }
+    }
+
+    parameters: aosoa[dynamic]Type_Routine_Parameter;
+    parameter_names := array_make!(string)(0, length(declaration.parameters), context.temporary_allocator);
+    foreach (parameter in declaration.parameters) {
+      parameter_position := parameter.position;
+      parameter_name := parameter.name;
+      parameter_type := self.resolve_type_specification(parameter.type, generic_context);
+      if (has_flag(parameter_type.flags, .Not_Allowed_As_Parameter_Or_Return_Type)) {
+        report_error_fatal(parameter_position, "Type '%' is not allowed as parameter type", parameter_type.name);
+      }
+      if (is_pure) {
+        if (has_flag(parameter_type.flags, .Not_Allowed_As_Parameter_In_Pure_Function)) {
+          report_error_fatal(parameter_position, "Parameter '%' of type '%' is not allowed in a pure function", parameter_name, parameter_type.name);
+        }
+      }
+
+      if (!is_instantiated && parameter_type.symbol != null) {
+        if (parameter_type.symbol.access_modifier < declaration.access_modifier) {
+          report_error_fatal(
+            parameter_position,
+            "Parameter '%' exposes type '%' with a higher access modifier than '%'",
+            parameter_name,
+            parameter_type.name,
+            declaration.name,
+          );
+        }
+      }
+
+      is_default := parameter.initializer != null;
+      array_aosoa_add(&parameters, {parameter_type, is_default});
+
+      if (is_implemented_method && parameter_name == SPECIAL_NAME_SELF) {
+        report_error_fatal(parameter_position, "Implemented method cannot have a paramter named 'self'");
+      }
+      if ((calling_convention == .Nox && !is_pure) && parameter_name == SPECIAL_NAME_CONTEXT) {
+        report_error_fatal(parameter_position, "Routine with 'Nox' calling convention cannot have a paramter named 'context'");
+      }
+
+      foreach (name in parameter_names) {
+        if (name == parameter_name) {
+          report_error_fatal(parameter_position, "Duplicate paramter name '%' in routine", name);
+        }
+      }
+
+      if (parameter_name != SPECIAL_NAME_DISCARD) {
+        array_add(&parameter_names, parameter_name);
+      }
+    }
+
+    return_type := context.storage.type_void;
+    if (declaration.return_type != null) {
+      return_type = self.resolve_type_specification(cast(*Type_Specification) declaration.return_type, generic_context);
+      if (has_flag(return_type.flags, .Not_Allowed_As_Parameter_Or_Return_Type)) {
+        report_error_fatal(declaration.return_type.position, "Type '%' is not allowed as return type", return_type.name);
+      }
+      if (!is_instantiated && return_type.symbol != null) {
+        if (return_type.symbol.access_modifier < declaration.access_modifier) {
+          report_error_fatal(declaration.position, "Return type '%' has a higher access modifier than '%'", return_type.name, declaration.name);
+        }
+      }
+    }
+    if (declaration.kind == .Function && return_type.is_void()) {
+      report_error_fatal(declaration.position, "Function '%' has no return value", declaration.name);
+    }
+
+    if (has_params) {
+      params_index := length(parameters) - 1;
+      params_type := parameters[params_index].type;
+      if (!params_type.is_slice()) {
+        report_error_fatal(declaration.parameters[params_index].type.position, "Parameter marked 'params' must be a slice type. Got '%'", params_type.name);
+      }
+    }
+
+    needs_block := !is_intrinsic && !has_flag(declaration.flags, .Extern) && !has_flag(symbol.flags, .Routine_Method_Interface);
+    if (needs_block && !has_flag(declaration.flags, .Routine_Has_Block)) {
+      if (has_flag(declaration.flags, .Extern)) {
+        report_error_fatal(declaration.position, "Routine '%' can't have a body because its marked as 'extern'", declaration.name);
+      } else {
+        report_error_fatal(declaration.position, "Interface method '%' can't have a body", declaration.name);
+      }
+    }
+
+    routine_flags := make_routine_flags(has_params, has_c_varargs, is_intrinsic, is_method, is_pure);
+    if (is_generic) {
+      // For generic routines we will always create a new routine type.
+      // That way we can associate the uninstantiated symbol with them.
+      generic_routine_type := context.storage.make_type_routine(type_kind, calling_convention, parameters, return_type, routine_flags);
+      generic_routine_type.symbol = symbol; 
+      return generic_routine_type;
+    } else {
+      self.enter_routine_scope(symbol, declaration, calling_convention, is_pure);
+      statement_context := self.get_routine_statement_context(symbol, calling_convention);
+      self.resolve_symbol_routine_default_parameters(declaration, parameters, statement_context);
+      self.leave_routine_scope();
+
+      return context.storage.get_or_make_type_routine(type_kind, calling_convention, parameters, return_type, routine_flags);
+    }
+  }
+
+  /**
+  * Resolves a routines attributes.
+  * 
+  * @param symbol      The routine symbol to resolve.
+  * @param declaration The declaration that defines the symbol.
+  */
+  private proc resolve_symbol_routine_attributes(symbol: *Symbol, declaration: *Declaration_Routine) {
+    disabled_attribute, has_disabled_attribute := self.try_get_attribute(cast(*Declaration) declaration, .Disabled);
+    if (has_disabled_attribute) {
+      attribute_name := ATTRIBUTE_NAMES[Attribute_Kind.Disabled];
+
+      if (length(disabled_attribute.arguments) != 1) {
+        report_error_fatal(
+          disabled_attribute.position,
+          "Invalid number of arguments for attribute '%'. Expected 1 got %",
+          attribute_name,
+          length(disabled_attribute.arguments),
+        );
+      }
+      condition_expression := disabled_attribute.arguments[0].expression;
+      disabled_operand := self.resolve_expression_constant(condition_expression, statement_context_default());
+      if (!self.operand_convert(condition_expression.position, &disabled_operand, context.storage.type_bool)) {
+        report_error_fatal(condition_expression.position, "Expected boolean type in argument for attribute '%'. Got %", attribute_name, disabled_operand.type.name);
+      }
+
+      if (declaration.return_type != null) {
+        report_error_fatal(declaration.position, "The attribute '%' is not allowed on routines that return a value", attribute_name);
+      }
+
+      is_disabled := disabled_operand.value.(bool);
+      if (is_disabled) {
+        set_flag(&symbol.flags, .Routine_Disabled);
+      }
+    }
+  }
+
+  /**
+  * Finalize a symbol.
+  * 
+  * @param symbol The symbol to finalize.
+  */
+  internal proc finalize_symbol(symbol: *Symbol) {
+    if (symbol.kind == .Type) {
+      position := symbol.declaration == null ? SOURCE_POSITION_BUILTIN : symbol.declaration.position;
+      self.complete_type(position, symbol.type);
+    } else if (symbol.kind == .Routine) {
+      should_finalize_body := !has_flag(symbol.declaration.flags, .Extern) &&
+        !has_flag(symbol.flags, .Uninstantiated_Generic) &&
+        !has_flag(symbol.flags, .Routine_Method_Interface);
+      if (should_finalize_body) {
+        self.finalize_routine_body(symbol);
+        memory.free_all(context.temporary_allocator);
+      }
+    }
+  }
+
+  /**
+  * Finalize the body of a routine symbol.
+  * 
+  * @param symbol The routine symbol whose body to finalize.
+  */
+  private proc finalize_routine_body(symbol: *Symbol) {
+    assert(symbol.kind == .Routine && symbol.state == .Resolved);
+    
+    self.current_routine = symbol;
+
+    previous_package := package_enter(symbol.package_file.package);
+
+    declaration := cast(*Declaration_Routine) symbol.declaration;
+    type_routine := cast(*Type_Routine) symbol.type;
+
+    assert(length(declaration.parameters) == length(type_routine.parameters));
+
+    foreach (parameter, i in declaration.parameters) {
+      parameter_type := type_routine.parameters[i].type;
+      self.complete_type(parameter.position, parameter_type);
+    }
+    
+    statement_context := self.get_routine_statement_context(symbol, type_routine.calling_convention);
+    self.enter_routine_scope(symbol, declaration, type_routine.calling_convention, has_flag(type_routine.routine_flags, .Is_Pure_Function));
+
+    if (has_flag(symbol.flags, .Routine_Instantiated)) {
+      self.resolve_symbol_routine_default_parameters(declaration, type_routine.parameters, statement_context);
+    }
+
+    // We add the parameter symbols AFTER resolving the default parameters as we can't access them in a parameter initializer.
+    foreach (parameter, i in declaration.parameters) {
+      parameter_type := type_routine.parameters[i].type;
+      if (parameter.name != SPECIAL_NAME_DISCARD) {
+        self.add_parameter_symbol(parameter.position, parameter.name, parameter_type, .Local_Declared);
+      }
+    }
+
+    return_type := type_routine.return_type;
+    self.complete_type(declaration.return_type == null ? declaration.position : declaration.return_type.position, return_type);
+    
+    returns := self.resolve_statement_block(declaration.block, statement_context, return_type, .New_Scope);
+    self.leave_routine_scope();
+
+    // We need to check that our procedure properly returns on all code paths.
+    if (!return_type.is_void() && !returns) {
+      report_error_fatal(symbol.declaration.position, "Not all control paths return a value");
+    }
+
+    package_leave(previous_package);
+  }
+    
+  /**
+  * Enters the scope of a routine.
+  * 
+  * @param symbol             The routine symbol.
+  * @param declaration        The declaration that defines the routine.
+  * @param calling_convention The calling convention of the routine.
+  * @param is_pure            Is the routine a pure function?
+  */
+  private proc enter_routine_scope(symbol: *Symbol, declaration: *Declaration_Routine, calling_convention: Calling_Convention, is_pure: bool) {
+    self.enter_local_scope();
+    // We may have an implicit context pointer.
+    if (calling_convention == .Nox && !is_pure) {
+      context_type := context.storage.get_or_make_type_pointer(context.storage.cached_runtime_types.context_struct);
+      self.add_parameter_symbol(declaration.position, SPECIAL_NAME_CONTEXT, context_type, .Local_Immutable);
+    }
+    // Methods get a special pointer parameter 'self' that gets implicitly passed in.
+    if (has_flag(symbol.flags, .Routine_Method_Implemented)) {
+      self_type := context.storage.get_or_make_type_pointer(symbol.value.(*Type));
+      self.add_parameter_symbol(declaration.position, SPECIAL_NAME_SELF, self_type);
+    }
+  }
+
+  /**
+  * Leavs the scope of a routine.
+  * 
+  * @param resolver The reference to the resolver.
+  */
+  private proc leave_routine_scope() {
+    self.leave_local_scope();
+  }
+
+  /**
+  * Gets the statement context for a routine.
+  * 
+  * @param symbol             The symbol of the routine.
+  * @param calling_convention The calling convention of the routine.
+  * @return The statement context.
+  */
+  private proc get_routine_statement_context(symbol: *Symbol, calling_convention: Calling_Convention) -> Statement_Context {
+    statement_context := statement_context_default();
+    if (has_flag(symbol.flags, .Routine_Function) || has_flag(symbol.flags, .Routine_Function_Pure)) {
+      statement_context.statement_restriction = .Allow_Only_Pure;
+    }
+    if (calling_convention != .Nox) {
+      remove_flag(&statement_context.legal_statements, .Can_Call_Routine_With_Nox_Calling_Convention);
+    }
+    return statement_context;
+  }
+
+  /**
+  * Resolves the default parameters of a routine.
+  * 
+  * @param declaration_routine The routine declaration.
+  * @param parameters          The parameters of the routine.
+  * @param statement_context   The statement context to use.
+  */
+  private proc resolve_symbol_routine_default_parameters(
+    declaration: *Declaration_Routine,
+    parameters: aosoa[dynamic]Type_Routine_Parameter,
+    statement_context: Statement_Context,
+  ) {
+    foreach (parameter, i in declaration.parameters) {
+      parameter_type := parameters[i].type;
+      
+      if (parameter.initializer != null) {
+        initializer := self.resolve_expression_expected(parameter.initializer, statement_context, parameter_type);
+        if (!self.operand_convert(parameter.position, &initializer, parameter_type)) {
+          report_error_fatal(parameter.position, "Invalid type in default parameter initializer. Expected '%' got '%'", parameter_type.name, initializer.type.name);
+        }
+
+        if (has_flag(initializer.flags, .Is_Constant)) {
+          self.set_resolved_constant(parameter.initializer, initializer);
+        }
+      }
+    }
+  }
+
+}

@@ -1,0 +1,338 @@
+import "std:libc"
+import "std:memory"
+
+/**
+* Converts a cstring to a string whose lifetime is bound to the cstring.
+*
+* @param cstr The cstring to convert.
+* @return The converted string.
+*/
+public proc cstring_to_string(cstr: cstring) -> string {
+  raw_string: memory.Raw_String = {cast(rawptr) cstr, cast(int) libc.strlen(cstr)};
+  return *(cast(*string) (&raw_string));
+}
+
+/**
+* Creates a string from a given pointer and length.
+*
+* @param pointer The pointer to the data of the string.
+* @param length  The length of the string.
+* @return The created string.
+*/
+public pure func string_from_pointer(pointer: rawptr, length: int) -> string {
+  raw_string: memory.Raw_String = {pointer, length};
+  return *(cast(*string) (&raw_string));
+}
+
+/**
+* Clones a given string.
+*
+* @param str       The string to clone.
+* @param allocator The allocator to use.
+* @return The cloned string.
+*/
+public proc clone(str: string, allocator: Allocator = context.allocator) -> string {
+  buffer := cast(*byte) memory.allocate(cast(uint) length(str), allocator);
+  memory.copy(buffer, data(str), cast(uint) length(str));
+  raw_string: memory.Raw_String = {buffer, length(str)};
+  return *(cast(*string) (&raw_string));
+}
+
+/**
+* CLones a string to a cstring.
+*
+* @param str       The string to clone.
+* @param allocator The allocator to use.
+* @return The cloned cstring.
+*/
+public proc clone_to_cstring(str: string, allocator: Allocator = context.allocator) -> cstring {
+  buffer := cast(*byte) memory.allocate(cast(uint) (length(str) + 1), allocator);
+  zero_terminator_offset: ^*byte = length(str);
+  memory.copy(buffer, data(str), cast(uint) length(str));
+  buffer[zero_terminator_offset] = 0;
+  return cast(cstring) buffer;
+}
+
+/**
+* CLones a cstring to a string.
+*
+* @param str       The cstring to clone.
+* @param allocator The allocator to use.
+* @return The cloned string.
+*/
+public proc clone_from_cstring(str: cstring, allocator: Allocator = context.allocator) -> string {
+  length := libc.strlen(str);
+  buffer := cast(*byte) memory.allocate(length, allocator);
+  memory.copy(buffer, cast(rawptr) str, length);
+  raw_string: memory.Raw_String = {buffer, cast(int) length};
+  return *(cast(*string) (&raw_string));
+}
+
+/**
+* Concatenates strings together.
+*
+* @param strings   The strings to concatenate.
+* @param allocator The allocator to use.
+* @return The concatenated string.
+*/
+public proc concatenate(strings: []string, allocator: Allocator = context.allocator) -> string {
+  length_sum := 0;
+  foreach (str in strings) {
+    length_sum += length(str);
+  }
+
+  builder := builder_make(allocator);
+  builder.reserve(length_sum);
+  foreach (str in strings) {
+    builder.write_string(str);
+  }
+
+  return builder.to_string();
+}
+
+/**
+* Gets the first index of a substring inside a string.
+*
+* @param str       The string to look in.
+* @param substring The substring to look for.
+* @return The first index of the substring (will be -1 if not found).
+*/
+public pure func first_index_of(str: string, substring: string) -> int {
+  n := length(substring);
+  if (n == 0) {
+    return -1;
+  } else if (n == length(str)) {
+    return str == substring ? 0 : -1;
+  } else if (n > length(str)) {
+    return -1;
+  }
+
+  // This is painfully unoptimized but gets the job done for now...
+  for (i := 0; i < length(str) - n; i++) {
+    s := str[i:i + n];
+    if (s == substring) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+/**
+* Gets the last index of a substring inside a string.
+*
+* @param str       The string to look in.
+* @param substring The substring to look for.
+* @return The last index of the substring (will be -1 if not found).
+*/
+public pure func last_index_of(str: string, substring: string) -> int {
+  n := length(substring);
+  if (n == 0) {
+    return -1;
+  } else if (n == length(str)) {
+    return str == substring ? 0 : -1;
+  } else if (n > length(str)) {
+    return -1;
+  }
+
+  // This is painfully unoptimized but gets the job done for now...
+  for (i := length(str) - n; i >= 0; i--) {
+    s := str[i:i + n];
+    if (s == substring) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+/**
+* Checks whether or not a string has a given prefix.
+*
+* @param str    The string to check.
+* @param prefix The prefix to check for.
+* @return True if the string has the given prefix otherwise false.
+*/
+public pure func has_prefix(str: string, prefix: string) -> bool {
+  return length(str) >= length(prefix) && str[:length(prefix)] == prefix;
+}
+
+/**
+* Checks whether or not a string has a given suffix.
+*
+* @param str    The string to check.
+* @param suffix The suffix to check for.
+* @return True if the string has the given suffix otherwise false.
+*/
+public pure func has_suffix(str: string, suffix: string) -> bool {
+	return length(str) >= length(suffix) && str[length(str) - length(suffix):] == suffix;
+}
+
+/**
+* The following helpers currently only work properly for ASCII.
+* TODO: Add full unicode support for these functions.
+*/
+
+/**
+* Checks whether or not a given character is a digit.
+* 
+* @return True if the character is a digit otherwise false.
+*/
+public pure func is_digit(c: char) -> bool {
+  return c >= '0' && c <= '9';
+}
+
+/**
+* Checks whether or not a given character is space.
+* 
+* @return True if the character is space otherwise false.
+*/
+public pure func is_space(c: char) -> bool {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/**
+* Checks whether or not a given character is a lower letter.
+* 
+* @return True if the character is a lower letter otherwise false.
+*/
+public pure func is_lower(c: char) -> bool {
+  return c >= 'a' && c <= 'z';
+}
+
+/**
+* Checks whether or not a given character is an upper letter.
+* 
+* @return True if the character is an upper letter otherwise false.
+*/
+public pure func is_upper(c: char) -> bool {
+  return c >= 'A' && c <= 'Z';
+}
+
+/**
+* Checks whether or not a given character is a letter.
+* 
+* @return True if the character is a letter otherwise false.
+*/
+public pure func is_letter(c: char) -> bool {
+  return is_lower(c) || is_upper(c);
+}
+
+/**
+* Gets the lower version of a given character.
+* 
+* @param c The character to get the lower version of.
+* @return The lower version of the character.
+*/
+public pure func to_lower(c: char) -> char {
+  if (is_upper(c)) {
+    return cast(char) (cast(u32) c + 32);
+  }
+  return c;
+}
+
+/**
+* Gets the upper version of a given character.
+* 
+* @param c The character to get the upper version of.
+* @return The upper version of the character.
+*/
+public pure func to_upper(c: char) -> char {
+  if (is_lower(c)) {
+    return cast(char) (cast(u32) c - 32);
+  }
+  return c;
+}
+
+/**
+* The implementation of the following UTF-8 procedures is taken from:
+* https://github.com/sheredom/utf8.h/blob/master/utf8.h
+*/
+
+/**
+* Gets the character of a string at a given byte position.
+*
+* @param str         The string to get the character of (needs to be a valid UTF-8 string).
+* @param byte_offset The offset in bytes of the character to get.
+* @param 1. The character of the given; 2. The number of bytes needed to encode the character.
+*/
+public pure func char_at_byte_position(str: string, byte_offset: ^*byte) -> (char, int) {
+  if (length(str) == 0) then return {};
+
+  // This assumes a valid UTF-8 string.
+
+  string_data := cast(*byte) data(str);
+  first_byte := string_data[byte_offset];
+
+  if (0xF0 == (0xF8 & first_byte)) {
+    first_decoded  := (cast(u32) (0x07 & first_byte)) << 18;
+    second_decoded := (cast(u32) (0x3F & string_data[byte_offset + 1])) << 12;
+    third_decoded  := (cast(u32) (0x3F & string_data[byte_offset + 2])) << 6;
+    fourth_decoded := (cast(u32) (0x3F & string_data[byte_offset + 3]));
+    return {cast(char) (first_decoded | second_decoded | third_decoded | fourth_decoded), 4};
+  } else if (0xE0 == (0xF0 & first_byte)) {
+    first_decoded  := (cast(u32) (0x0F & first_byte)) << 12;
+    second_decoded := (cast(u32) (0x3F & string_data[byte_offset + 1])) << 6;
+    third_decoded  := (cast(u32) (0x3F & string_data[byte_offset + 2]));
+    return {cast(char) (first_decoded | second_decoded | third_decoded), 3};
+  } else if (0xC0 == (0xE0 & first_byte)) {
+    first_decoded  := (cast(u32) (0x1F & first_byte)) << 6;
+    second_decoded := (cast(u32) (0x3F & string_data[byte_offset + 1]));
+    return {cast(char) (first_decoded | second_decoded), 2};
+  } else {
+    return {cast(char) first_byte, 1};
+  }
+}
+
+/**
+* Decodes a given character codepoint into the corresponding UTF-8 bytes.
+*
+* @parma c      The character codepoint to decode.
+* @return 1. An array containing the decoded UTF-8 bytes; 2. The number of bytes that were needed to decode the character codepoint.
+*/
+public pure func char_to_utf8(c: char) -> ([4]byte, int) {
+  result: [4]byte;
+  codepoint := cast(u32) c;
+  if ((0xffffff80 & codepoint) == 0) {
+    result[0] = cast(byte) codepoint;
+    return {result, 1};
+  } else if ((0xfffff800 & codepoint) == 0) {
+    result[0] = 0xC0 | (cast(byte) ((codepoint >> 6) & 0x1F));
+    result[1] = 0x80 | (cast(byte) ((codepoint)      & 0x3F));
+    return {result, 2};
+  } else if ((0xffff0000 & codepoint) == 0) {
+    result[0] = 0xE0 | (cast(byte) ((codepoint >> 12) & 0x0F));
+    result[1] = 0x80 | (cast(byte) ((codepoint >> 6)  & 0x3F));
+    result[2] = 0x80 | (cast(byte) ((codepoint)       & 0x3F));
+    return {result, 3};
+  } else if ((0xffe00000 & codepoint) == 0) {
+    result[0] = 0xF0 | (cast(byte) ((codepoint >> 18) & 0x07));
+    result[1] = 0x80 | (cast(byte) ((codepoint >> 12) & 0x3F));
+    result[2] = 0x80 | (cast(byte) ((codepoint >> 6)  & 0x3F));
+    result[3] = 0x80 | (cast(byte) ((codepoint)       & 0x3F));
+    return {result, 4};
+  } else {
+    return {result, 0};
+  }
+}
+
+/**
+* Gets the size in bytes for a given character codepoint.
+*
+* @param c The character codepoint to get the byte size of.
+* @return The size in bytes of the given character codepoint.
+*/
+public pure func char_byte_size(c: char) -> int {
+  codepoint := cast(u32) c;
+  if ((0xffffff80 & codepoint) == 0) {
+    return 1;
+  } else if ((0xfffff800 & codepoint) == 0) {
+    return 2;
+  } else if ((0xffff0000 & codepoint) == 0) {
+    return 3;
+  } else if ((0xffe00000 & codepoint) == 0) {
+    return 4;
+  } else {
+    return 0;
+  }
+}

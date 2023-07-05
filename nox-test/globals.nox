@@ -1,0 +1,14 @@
+/**
+* Test the functionality of globals.
+*/
+internal proc test_globals() {
+  assert(var == 23);
+  assert(global_with_procedure_initializer == 9);
+}
+
+private global var := 23;
+private global global_with_procedure_initializer := global_initializer();
+
+private proc global_initializer() -> int {
+  return 9;
+}

@@ -1,0 +1,46 @@
+/**
+* Test the functionality of unions.
+*/
+internal proc test_unions() {
+  u: My_Union = cast(int) 23;
+  assert(u.(int) == 23);
+
+  u = 1.0;
+  assert(u.(f32) == 1.0);
+
+  v: int = 17;
+  p := &v;
+  u = p;
+  assert(*u.(*int) == 17);
+
+  s: My_Struct;
+  s.i = 23;
+  containing: Struct_Containing_Union = {s};
+  assert(containing.u.(My_Struct).i == 23);
+
+  u = cast(int) 23;
+  u2 := procedure_taking_and_returning_union(u);
+  assert(u2.(int) == 23);
+}
+
+private struct My_Struct {
+  i: int,
+}
+
+private union My_Union {
+  int,
+  i32,
+  f32,
+  cstring,
+  *int,
+  My_Struct,
+}
+
+private struct Struct_Containing_Union {
+  u: My_Union,
+}
+
+private proc procedure_taking_and_returning_union(u: My_Union) -> My_Union {
+  assert(u.(i32) == 23);
+  return u;
+}

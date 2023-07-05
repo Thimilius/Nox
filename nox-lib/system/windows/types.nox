@@ -1,0 +1,103 @@
+#if (NOX_OS == .Windows) {
+
+  import "std:libc"
+
+  public type_alias HMODULE   := rawptr;
+  public type_alias LPVOID    := rawptr;
+  public type_alias BYTE      := u8;
+  public type_alias WORD      := u16;
+  public type_alias DWORD     := u32;
+  public type_alias HANDLE    := LPVOID;
+  public type_alias BOOL      := b32;
+  public type_alias UINT      := u32;
+  public type_alias CHAR      := u8;
+  public type_alias WCHAR     := u16;
+  public type_alias LONG      := u32;
+  public type_alias LONGLONG  := u64;
+  public type_alias ULONG_PTR := uint;
+  public type_alias SIZE_T    := uint;
+  public type_alias LPBOOL    := *BOOL;
+  public type_alias LPSTR     := *CHAR;
+  public type_alias LPCSTR    := cstring;
+  public type_alias LPWSTR    := *WCHAR;
+  public type_alias LPCWSTR   := *WCHAR;
+  public type_alias LPDWORD   := *DWORD;
+
+  public type_alias LPSECURITY_ATTRIBUTES := *SECURITY_ATTRIBUTES;
+  public type_alias LARGE_INTEGER         := LONGLONG;
+
+  public const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFF_FFFF;
+
+  public const STD_INPUT_HANDLE  : DWORD = 0xFFFF_FFF6;
+  public const STD_OUTPUT_HANDLE : DWORD = 0xFFFF_FFF5;
+  public const STD_ERROR_HANDLE  : DWORD = 0xFFFF_FFF4;
+
+  public const FOREGROUND_BLUE      : WORD = 0x0001;
+  public const FOREGROUND_GREEN     : WORD = 0x0002;
+  public const FOREGROUND_RED       : WORD = 0x0004;
+  public const FOREGROUND_INTENSITY : WORD = 0x0008;
+
+  public const _A_SUBDIR: i32 = 0x010;
+  
+  public const CP_UTF8: u32 = 65001;
+
+  public const CREATE_SUSPENDED: DWORD = 0x00000004;
+  
+  public const INFINITE: DWORD = 0xFFFF_FFFF;
+
+  public struct SRWLOCK {
+    ptr: LPVOID,
+  }
+
+  public struct SECURITY_ATTRIBUTES {
+    nLength: DWORD,
+    lpSecurityDescriptor: LPVOID,
+    bInheritHandle: BOOL,
+  }
+
+  public struct _wfinddata64_t {
+    attrib: i32,
+    time_create: i64,
+    time_access: i64,
+    time_write: i64,
+    size: i64,
+    name: [260]libc.wchar_t,
+  }
+
+  public enum LOGICAL_PROCESSOR_RELATIONSHIP : i32 {
+    RelationProcessorCore,
+    RelationNumaNode,
+    RelationCache,
+    RelationProcessorPackage,
+    RelationGroup,
+    RelationProcessorDie,
+    RelationNumaNodeEx,
+    RelationProcessorModule,
+    RelationAll = 0xffff,
+  }
+
+  public enum PROCESSOR_CACHE_TYPE : i32 {
+    CacheUnified,
+    CacheInstruction,
+    CacheData,
+    CacheTrace,
+  }
+
+  public struct CACHE_DESCRIPTOR {
+    Level: BYTE,
+    Associativity: BYTE,
+    LineSize: WORD,
+    Size: DWORD,
+    Type: PROCESSOR_CACHE_TYPE,
+  }
+
+  public struct SYSTEM_LOGICAL_PROCESSOR_INFORMATION {
+    ProcessorMask: ULONG_PTR,
+    Relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
+
+    _padding: i32,
+    // NOTE: This should actually be part of a union but we have no proper support for raw unions right now.
+    Cache: CACHE_DESCRIPTOR,
+  }
+
+}

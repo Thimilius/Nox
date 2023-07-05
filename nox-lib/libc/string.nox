@@ -1,0 +1,6 @@
+public extern proc strlen(str: cstring) -> size_t
+public extern proc strcmp(s1: cstring, s2: cstring) -> i32
+
+public extern proc memset(destination: rawptr, character: i32, count: size_t) -> rawptr
+public extern proc memcpy(destination: rawptr, source: rawptr, count: size_t) -> rawptr
+public extern proc memmove(destination: rawptr, source: rawptr, count: size_t) -> rawptr

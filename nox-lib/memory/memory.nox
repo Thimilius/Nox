@@ -1,0 +1,170 @@
+import "std:libc"
+
+/**
+* Copies one region of memory to another.
+*
+* @param destination A pointer to the destination memory region.
+* @param source      A pointer to the source memory region.
+* @param size        The size of the memory region to copy.
+*/
+public proc copy(destination: rawptr, source: rawptr, size: uint) {
+  libc.memcpy(destination, source, cast(libc.size_t) size);
+}
+
+/**
+* Allocates a region of memory of a given size.
+*
+* @param size      The size of the region of memory to allocate.
+* @param allocator The allocator to use.
+* @param location  The source location of the allocation.
+* @return The allocated region of memory.
+*/
+public proc allocate(size: uint, allocator: Allocator = context.allocator, location: Source_Location = #location) -> rawptr {
+  bytes := allocate_bytes(size, allocator, location);
+  return data(bytes);
+}
+
+/**
+* Allocates a region of memory of a given size.
+*
+* @param size      The size of the region of memory to allocate.
+* @param allocator The allocator to use.
+* @param location  The source location of the allocation.
+* @return A slice of the allocated region of memory.
+*/
+public proc allocate_bytes(size: uint, allocator: Allocator = context.allocator, location: Source_Location = #location) -> []byte {
+  if (allocator.procedure == null) {
+    return {};
+  }
+  return allocator.procedure(allocator.data, Allocator_Mode.Allocate, size, 0, null, 0, location);
+}
+
+/**
+* Resizes a region of memory of a given size to a new size.
+*
+* @param old_ptr   The pointer to the region of memory to resize.
+* @param old_size  The old size of the region of memory to resize.
+* @param new_size  The new size the region of memory should have.
+* @param allocator The allocator to use.
+* @param location  The source location of the resize.
+* @return The resized region of memory.
+*/
+public proc resize(old_ptr: rawptr, old_size: uint, new_size: uint, allocator: Allocator = context.allocator, location: Source_Location = #location) -> rawptr {
+  bytes := resize_bytes(old_ptr, old_size, new_size, allocator, location);
+  return data(bytes);
+}
+
+/**
+* Resizes a region of memory of a given size to a new size.
+*
+* @param old_ptr   The pointer to the region of memory to resize.
+* @param old_size  The old size of the region of memory to resize.
+* @param new_size  The new size the region of memory should have.
+* @param allocator The allocator to use.
+* @param location  The source location of the resize.
+* @return A slice of the resized region of memory.
+*/
+public proc resize_bytes(old_ptr: rawptr, old_size: uint, new_size: uint, allocator: Allocator = context.allocator, location: Source_Location = #location) -> []byte {
+  if (allocator.procedure == null) {
+    return {};
+  }
+  return allocator.procedure(allocator.data, Allocator_Mode.Resize, new_size, 0, old_ptr, old_size, location);
+}
+
+/**
+* Frees a given pointer.
+*
+* @param pointer   The pointer to be freed.
+* @param allocator The allocator to use.
+* @param location  The source location of the free.
+*/
+public proc free(pointer: rawptr, allocator: Allocator = context.allocator, location: Source_Location = #location) {
+  if (allocator.procedure == null) {
+    return;
+  }
+  allocator.procedure(allocator.data, Allocator_Mode.Free, 0, 0, pointer, 0, location);
+}
+
+/**
+* Frees all allocations of an allocator.
+*
+* @param allocator The allocator to free all allocations of.
+* @param location  The source location of the free.
+*/
+public proc free_all(allocator: Allocator, location: Source_Location = #location) {
+  allocator.procedure(allocator.data, Allocator_Mode.Free_All, 0, 0, null, 0, location);
+}
+
+/**
+* Allocates memory for an object of a given type.
+*
+* @param !T        The type of the object to allocate.
+* @param allocator The allocator to be used.
+* @param location  The source location of the allocation.
+* @return The pointer to the allocated object of the given type.
+*/
+public proc new!(T)(allocator: Allocator = context.allocator, location: Source_Location = #location) -> *T {
+  return cast(*T) allocate(size_of(:T), allocator, location);
+}
+
+/**
+* Counts the number of bits in a number that are set to 1.
+*
+* @param n The number to get the count of.
+* @return The number of 1s in the number.
+*/
+public proc count_ones(n: uint) -> int {
+  n := n;
+  count := 0;
+  for (n > 0) {
+    count += 1;
+    n = n & (n - 1);
+  }
+  return count;
+}
+
+/**
+* Represents the raw memory layout for a string.
+*/
+public struct Raw_String {
+  public data: rawptr, // The data of the string.
+  public length: int,  // The length of the string.
+}
+
+/**
+* Represents the raw memory layout for a dynamic array.
+*/
+public struct Raw_Dynamic_Array {
+  public data: rawptr,         // The data of the dynamic array.
+  public length: int,          // The length of the dynamic array.
+  public capacity: int,        // The capacity of the dynamic array.
+  public allocator: Allocator, // The allocator of the dynamic array.
+}
+
+/**
+* Represents the raw memory layout for a slice.
+*/
+public struct Raw_Slice {
+  public data: rawptr, // The data of the slice.
+  public length: int,  // The length of the slice.
+}
+
+/**
+* Represents the raw memory layout for a map.
+*/
+public struct Raw_Map {
+  public data: rawptr,              // The data of the map.
+  public length: int,               // The length of the map.
+  public capacity: int,             // The capacity of the map.
+  public allocator: Allocator,      // The allocator of the map.
+  public hash_procedure: rawptr,    // The hash procedure of the map key.
+  public compare_procedure: rawptr, // The compare procedure of the map key.
+}
+
+/**
+* Represents the raw memory layout for an any.
+*/
+public struct Raw_Any {
+  public data: rawptr, // The pointer to the value the any holds.
+  public id: typeid,   // The type id of the value the any holds.
+}

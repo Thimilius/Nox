@@ -1,0 +1,122 @@
+import "std:libc"
+import "std:system"
+
+/**
+* Main entry point to the test framework.
+*/
+internal proc main() {
+  run_tests();
+}
+
+/**
+* Runs all tests included in the framework.
+*/
+private proc run_tests() {
+  run_test("Any", test_any);
+  run_test("AoSoA", test_aosoa);
+  run_test("Array", test_arrays);
+  run_test("Call", test_calls);
+  run_test("Cast", test_casts);
+  run_test("Character", test_characters);
+  run_test("Constant", test_constants);
+  run_test("Context", test_context);
+  run_test("Control Flow", test_control_flow);
+  run_test("Defer", test_defer);
+  run_test("Dynamic Array", test_dynamic_arrays);
+  run_test("Enum", test_enums);
+  run_test("Expression", test_expressions);
+  run_test("Function Pointer", test_function_pointers);
+  run_test("Generic", test_generics);
+  run_test("Global", test_globals);
+  run_test("Implementation Block", test_implementations);
+  run_test("Interface", test_interfaces);
+  run_test("Map", test_maps);
+  run_test("Offset Relative Pointer", test_offset_relative_pointers);
+  run_test("Pointer", test_pointers);
+  run_test("RTTR", test_rttr);
+  run_test("Self Relative Pointer", test_self_relative_pointers);
+  run_test("Slice", test_slices);
+  run_test("SoA", test_soa);
+  run_test("Static If", test_static_ifs);
+  run_test("Stress", test_stress);
+  run_test("Struct", test_structs);
+  run_test("Tuple", test_tuples);
+  run_test("Type Alias", test_type_aliases);
+  run_test("Type Define", test_type_defines);
+  run_test("Union", test_unions);
+  run_test("Variable", test_variables);
+}
+
+/**
+* Runs the given procedure as a test.
+*
+* @param name           The name of the test.
+* @param test_procedure The test procedure to run.
+*/
+private proc run_test(name: string, test_procedure: proc()) {
+  g_current_test.failed = false;
+
+  new_context := *context;
+  new_context.assert_failed_procedure = test_failed_procedure;
+  push_context (new_context) {
+    test_procedure();
+  }
+
+  test_print_header(name);
+  if (g_current_test.failed) {
+    system.set_console_color(.Red);
+    defer system.set_console_color(.White);
+
+    libc.printf("FAILED at %s(%llu)\n", data(g_current_test.failed_location.file), g_current_test.failed_location.line);
+  } else {
+    system.set_console_color(.Green);
+    defer system.set_console_color(.White);
+    
+    libc.printf("PASSED\n");
+  }
+}
+
+/**
+* The procedure that is being run when a test fails.
+*
+* @param location The source location where the test failed.
+*/
+private proc test_failed_procedure(_: string, _: string, location: Source_Location) {
+  g_current_test.failed = true;
+  g_current_test.failed_location = location;
+}
+
+/**
+* Prints the test header info to the console.
+*
+* @param name The name of the test.
+*/
+private proc test_print_header(name: string) {
+  string_length := length(name) + length(" test:");
+
+  difference := PRINT_SPACE - string_length;
+  assert(difference > 0);
+
+  libc.printf("%s:", data(name));
+  for (i := 0; i < difference; i++) {
+    libc.printf(" ");  
+  } 
+}
+
+/**
+* Represents data for a single test run.
+*/
+private struct Test {
+  failed: bool,
+  failed_location: Source_Location,
+}
+
+/**
+* Holds the currently running test.
+*/
+private global g_current_test: Test;
+
+/**
+* Spacing for the test output.
+*/
+private const PRINT_SPACE := 30;

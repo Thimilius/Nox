@@ -1,0 +1,91 @@
+#if (NOX_OS == .Windows) {
+
+  import "std:system/windows"
+
+  /**
+  * Represent a mutex as a synchronization primitive.
+  */
+  public struct Mutex {
+    private lock: windows.SRWLOCK,
+  }
+
+  /**
+  * Initializes the given mutex.
+  * 
+  * @param mutex The mutex to initialize.
+  */
+  public proc mutex_init(_: *Mutex) { }
+
+  /**
+  * Locks the given mutex.
+  *
+  * @param mutex The mutex to lock.
+  */
+  public proc mutex_lock(mutex: *Mutex) {
+    windows.AcquireSRWLockExclusive(&mutex.lock);
+  }
+
+  /**
+  * Unlock the given mutex.
+  *
+  * @param mutex The mutex to unlock.
+  */
+  public proc mutex_unlock(mutex: *Mutex) {
+    windows.ReleaseSRWLockExclusive(&mutex.lock);
+  }
+
+  /**
+  * Destroys the given mutex.
+  * 
+  * @param mutex The mutex to destroy.
+  */
+  public proc mutex_destroy(_: *Mutex) { }
+
+} else #if (NOX_OS == .Linux) {
+
+  import "std:system/unix"
+
+  /**
+  * Represent a mutex as a synchronization primitive.
+  */
+  public struct Mutex {
+    private lock: unix.pthread_mutex_t,
+  }
+
+  /**
+  * Initializes the given mutex.
+  * 
+  * @param mutex The mutex to initialize.
+  */
+  public proc mutex_init(mutex: *Mutex) {
+    unix.pthread_mutex_init(&mutex.lock, null);
+  }
+
+  /**
+  * Locks the given mutex.
+  *
+  * @param mutex The mutex to lock.
+  */
+  public proc mutex_lock(mutex: *Mutex) {
+    unix.pthread_mutex_lock(&mutex.lock);
+  }
+
+  /**
+  * Unlock the given mutex.
+  *
+  * @param mutex The mutex to unlock.
+  */
+  public proc mutex_unlock(mutex: *Mutex) {
+    unix.pthread_mutex_unlock(&mutex.lock);
+  }
+
+  /**
+  * Destroys the given mutex.
+  * 
+  * @param mutex The mutex to destroy.
+  */
+  public proc mutex_destroy(mutex: *Mutex) {
+    unix.pthread_mutex_destroy(&mutex.lock);
+  }
+
+}

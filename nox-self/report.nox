@@ -1,0 +1,90 @@
+import "std:format"
+import "std:libc"
+import "std:system"
+
+/**
+* Reports a formatted warning message for a provided source position.
+* 
+* @param position The source position.
+* @param format   The format of the message.
+* @param args     The format arguments.
+*/
+public proc report_warning(position: Source_Position, fmt: string, params args: []any) {
+  system.set_console_color(.Yellow);
+  format.printf("%(%:%): ", position.file, position.line, position.column);
+  format.printf(fmt, args);
+  format.printf("\n");
+  system.set_console_color(.White);
+}
+
+/**
+* Reports a simple formatted warning message.
+* 
+* @param fmt  The format of the message.
+* @param args The format arguments.
+*/
+public proc report_warning_simple(fmt: string, params args: []any) {
+  system.set_console_color(.Yellow);
+  format.printf("Warning: ");
+  format.printf(fmt, args);
+  format.printf("\n");
+  system.set_console_color(.White);
+}
+
+/**
+* Reports a fatal formatted lexer error message.
+* 
+* @param lexer The lexer.
+* @param fmt   The format of the message.
+* @param args  The format arguments.
+*/
+public proc report_error_fatal_lexer(lexer: *Lexer, fmt: string, params args: []any) {
+  report_error_fatal(lexer.token.position, fmt, args);
+}
+
+/**
+* Reports a fatal formatted error message for a provided source position.
+* 
+* @param position The source position.
+* @param format   The format of the message.
+* @param args     The format arguments.
+*/
+public proc report_error_fatal(position: Source_Position, fmt: string, params args: []any) {
+  system.set_console_color(.Red);
+  format.printf("%(%:%): ", position.file, position.line, position.column);
+  format.printf(fmt, args);
+  format.printf("\n");
+  system.set_console_color(.White);
+
+  libc.exit(-1);
+}
+
+/**
+* Reports a simple fatal formatted error message.
+* 
+* @param fmt  The format of the message.
+* @param args The format arguments.
+*/
+public proc report_error_fatal_simple(fmt: string, params args: []any) {
+  system.set_console_color(.Red);
+  format.printf("Error: ");
+  format.printf(fmt, args);
+  format.printf("\n");
+  system.set_console_color(.White);
+
+  libc.exit(-1);
+}
+
+/**
+* Reports a colored message.
+* 
+* @param color The color of the message.
+* @param fmt   The format of the message.
+* @param args  The format arguments.
+*/
+public proc report_colored(color: system.Console_Color, fmt: string, params args: []any) {
+  system.set_console_color(color);
+  format.printf(fmt, args);
+  format.printf("\n");
+  system.set_console_color(.White);
+}

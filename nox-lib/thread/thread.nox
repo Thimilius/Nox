@@ -1,0 +1,175 @@
+import "std:memory"
+
+/**
+* Represents the starting procedure for a thread.
+*
+* @param data The data that gets passed in.
+*/
+public type_alias Thread_Procedure := proc(data: rawptr);
+
+/**
+* Represents a thread as a seperate execution unit.
+*/
+public struct Thread {
+  private procedure: Thread_Procedure,     // The starting procedure associated with the thread.
+  private creation_allocator: Allocator,   // The allocator used to create the thread.
+
+  private data: rawptr,                    // The data parameter being passed in at start.
+
+  private composite system: Thread_System, // The additional data required by the underlying system.
+}
+
+#if (NOX_OS == .Windows) {
+
+  import "std:system/windows"
+
+  /**
+  * Additional thread data required by the system.
+  */
+  public struct Thread_System {
+    handle: windows.HANDLE, // The native handle of the thread.
+  }
+
+  /**
+  * Creates and starts a new thread.
+  *
+  * @param procedure The starting procedure of the thread.
+  * @param data      The data parameter to pass along.
+  * @return The created thread.
+  */
+  public proc thread_create_and_start(procedure: Thread_Procedure, data: rawptr) -> *Thread {
+    thread := memory.new!(Thread)();
+    thread.creation_allocator = context.allocator;
+    thread.procedure = procedure;
+    thread.data = data;
+
+    win32_thread_id: windows.DWORD;
+    handle := windows.CreateThread(null, 0, thread_procedure, thread, windows.CREATE_SUSPENDED, &win32_thread_id);
+    if (handle == null) {
+      memory.free(thread, thread.creation_allocator);
+      return null;
+    }
+    thread.handle = handle;
+
+    windows.ResumeThread(thread.handle);
+
+    return thread;
+  }
+
+  /**
+  * Joins the thread and waits for its execution.
+  * 
+  * @param thread The thread to join.
+  */
+  public proc thread_join(thread: *Thread) {
+    windows.WaitForSingleObject(thread.handle, windows.INFINITE);
+    windows.CloseHandle(thread.handle);
+  }
+
+  /**
+  * Destroys a given thread.
+  * 
+  * @param thread The thread to destroy.
+  */
+  public proc thread_destroy(thread: *Thread) {
+    thread_join(thread);
+    memory.free(thread, thread.creation_allocator);
+  }
+
+  /*
+  * The native thread procedure.
+  *
+  * @param data The data parameter being passed in.
+  * @return The exit code of the thread.
+  */
+  private proc "stdcall" thread_procedure(data: rawptr) -> windows.DWORD {
+    thread := cast(*Thread) data;
+
+    thread_context := runtime_default_context();
+    push_context (thread_context) {
+      thread.procedure(thread.data);
+    }
+
+    runtime_destroy_temporary_allocator();
+
+    return 0;
+  }
+
+} else {
+
+  import "std:system/unix"
+
+  /**
+  * Additional thread data required by the system.
+  */
+  public struct Thread_System {
+    handle: unix.pthread_t, // The native handle of the thread.
+  }
+
+  /**
+  * Creates and starts a new thread.
+  *
+  * @param procedure The starting procedure of the thread.
+  * @param data      The data parameter to pass along.
+  * @return The created thread.
+  */
+  public proc thread_create_and_start(procedure: Thread_Procedure, data: rawptr) -> *Thread {
+    thread := memory.new!(Thread)();
+    thread.creation_allocator = context.allocator;
+    thread.procedure = procedure;
+    thread.data = data;
+
+    attributes: unix.pthread_attr_t;
+    unix.pthread_attr_init(&attributes);
+    defer unix.pthread_attr_destroy(&attributes);
+
+    unix.pthread_attr_setdetachstate(&attributes, unix.PTHREAD_CREATE_JOINABLE);
+
+    result := unix.pthread_create(&thread.handle, &attributes, thread_procedure, thread);
+    if (result != 0) {
+      memory.free(thread, thread.creation_allocator);
+      return null;
+    }
+
+    return thread;
+  }
+
+  /**
+  * Joins the thread and waits for its execution.
+  * 
+  * @param thread The thread to join.
+  */
+  public proc thread_join(thread: *Thread) {
+    unix.pthread_join(thread.handle, null);
+  }
+
+  /**
+  * Destroys a given thread.
+  * 
+  * @param thread The thread to destroy.
+  */
+  public proc thread_destroy(thread: *Thread) {
+    thread_join(thread);
+    memory.free(thread, thread.creation_allocator);
+  }
+
+  /*
+  * The native thread procedure.
+  *
+  * @param data The data parameter being passed in.
+  * @return The return value of the thread.
+  */
+  private proc "c" thread_procedure(data: rawptr) -> rawptr {
+    thread := cast(*Thread) data;
+
+    thread_context := runtime_default_context();
+    push_context (thread_context) {
+      thread.procedure(thread.data);
+    }
+
+    runtime_destroy_temporary_allocator();
+
+    return null;
+  }
+
+}

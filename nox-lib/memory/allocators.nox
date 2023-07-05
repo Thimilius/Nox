@@ -1,0 +1,381 @@
+import "std:libc"
+
+/**
+* Creates a general heap allocator.
+*
+* @return The created general heap allocator.
+*/
+public proc general_allocator() -> Allocator {
+  return {general_allocator_procedure, null};
+}
+
+/**
+* The allocation procedure for a general heap allocator.
+*
+* @param mode       The allocation mode.
+* @param size       The size of the allocation.
+* @param old_memory The old allocation (can be null).
+* @param old_size   The size of the old allocation.
+* @return The allocated data.
+*/
+public proc general_allocator_procedure(_: rawptr, mode: Allocator_Mode, size: uint, _: uint, old_memory: rawptr, old_size: uint, _: Source_Location) -> []byte {
+  switch (mode) {
+    case .Allocate: {
+      return slice_make(cast(*byte) libc.calloc(1, size), cast(int) size);
+    }
+    case .Resize: {
+      bytes := cast(*byte) libc.realloc(old_memory, size);
+      // We gurantee zero-initialized memory. 
+      if (old_size < size) {
+        offset: ^uint*byte = old_size;
+        new_data := bytes + offset;
+        libc.memset(new_data, 0, size - old_size);
+      }
+      return slice_make(bytes, cast(int) size);
+    }
+    case .Free: {
+      libc.free(old_memory);
+    }
+    case .Free_All: // Nothing.
+  }
+
+  return {};
+}
+
+/**
+* Represents the data for a dynamic memory pool.
+*/
+public struct Pool {
+  block_size: uint,                 // The size of a single block inside the pool.
+  big_allocation_size: uint,        // The size of an allocation that is deemed 'too big'.
+
+  unused_blocks: [dynamic]rawptr,   // Holds all currently unused blocks.
+  used_blocks: [dynamic]rawptr,     // Holds all currently used blocks.
+  big_allocations: [dynamic]rawptr, // Holds all allocations that are deemed 'too big'.
+
+  current_block: rawptr,            // Holds a reference to the currently active block.
+  current_offset: ^uint*byte,       // The current position in the currently active block.
+  bytes_left: uint,                 // Holds the number of bytes left in the currently active block.
+
+  backing_allocator: Allocator,     // The backing allocator that is used for the dynamic arrays and allocations that are deemed 'too big'.
+}
+
+/**
+* The default block size for a pool allocator.
+*/
+public const POOL_DEFAULT_BLOCK_SIZE: uint = 65536;
+/**
+* The default size for allocations that are deemed 'too big' in a pool allocator.
+*/
+public const POOL_BIG_ALLOCATION_SIZE: uint = 6554;
+
+/**
+* Creates a pool allocator.
+*
+* @param pool A pointer to the pool to be used by the allocator.
+* @return The pool allocator.
+*/
+public proc pool_allocator(pool: *Pool) -> Allocator {
+  return {pool_allocator_procedure, pool};
+}
+
+/**
+* Initializes a memory pool.
+* 
+* @param pool                The pool to initialize.
+* @param backing_allocator   The backing allocator to be used.
+* @param block_size          The size of a single block inside the pool.
+* @param big_allocation_size The size of allocations that are deemed 'too big'.
+*/
+public proc pool_init(
+  pool: *Pool,
+  backing_allocator: Allocator = context.allocator,
+  block_size: uint = POOL_DEFAULT_BLOCK_SIZE,
+  big_allocation_size: uint = POOL_BIG_ALLOCATION_SIZE,
+) {
+  pool.block_size = block_size;
+  pool.big_allocation_size = big_allocation_size;
+  pool.backing_allocator = backing_allocator;
+  pool.unused_blocks = array_make!(rawptr)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, backing_allocator);
+  pool.used_blocks = array_make!(rawptr)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, backing_allocator);
+  pool.big_allocations = array_make!(rawptr)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, backing_allocator);
+}
+
+/**
+* The allocation procedure for a pool allocator.
+*
+* @param data       The data of the allocator.
+* @param mode       The allocation mode.
+* @param size       The size of the allocation.
+* @param old_memory The old allocation (can be null).
+* @param old_size   The size of the old allocation.
+* @return The allocated data.
+*/
+public proc pool_allocator_procedure(
+  allocator_data: rawptr,
+  mode: Allocator_Mode,
+  size: uint,
+  _: uint,
+  old_memory: rawptr,
+  old_size: uint,
+  _: Source_Location,
+) -> []byte {
+  pool := cast(*Pool) allocator_data;
+
+  switch (mode) {
+    case .Allocate: {
+      return pool_allocate_bytes(pool, size);
+    }
+    case .Resize: {
+      if (old_size >= size) {
+        return slice_make(cast(*byte) old_memory, cast(int) size);
+      }
+
+      new_bytes := pool_allocate_bytes(pool, size);
+      copy(data(new_bytes), old_memory, old_size);
+      return new_bytes;
+    }
+    case .Free: // We don't do anything on simple free.
+    case .Free_All: {
+      pool_free_all(pool);
+    }
+  }
+
+  return {};
+}
+
+/**
+* Allocates a memory region of a given size from a pool.
+* 
+* @param pool     The memory pool to allocate from.
+* @param size     The size of the memory region to allocate.
+* @param location The source location of the allocation.
+* @return The allocated region of memory.
+*/
+public proc pool_allocate_bytes(pool: *Pool, size: uint, location: Source_Location = #location) -> []byte {
+  ALIGNMENT: uint = 8;
+
+  n := size;
+  extra := ALIGNMENT - (n % ALIGNMENT);
+  n += extra;
+  if (n > pool.big_allocation_size) {
+    big_allocation := pool.backing_allocator.procedure(pool.backing_allocator.data, .Allocate, n, 0, null, 0, location);
+    array_add(&pool.big_allocations, data(big_allocation));
+    return big_allocation;
+  }
+
+  if (pool.bytes_left < n) {
+    pool_cycle_new_block(pool);
+  }
+
+  memory := cast(*byte) pool.current_block + pool.current_offset;
+  pool.current_offset = pool.current_offset + n;
+  pool.bytes_left -= n;
+  
+  return slice_make(memory, cast(int) size);
+}
+
+/**
+* Cycles through the next block to be used by a memory pool.
+* 
+* @param pool The memory pool to cycle the next block of.
+*/
+private proc pool_cycle_new_block(pool: *Pool) {
+  if (pool.current_block != null) {
+    array_add(&pool.used_blocks, pool.current_block);
+  }
+
+  new_block: rawptr;
+  if (length(pool.unused_blocks) > 0) {
+    new_block = array_pop(&pool.unused_blocks);
+  } else {
+    bytes := pool.backing_allocator.procedure(pool.backing_allocator.data, .Allocate, pool.block_size, 0, null, 0, #location);
+    new_block = data(bytes);
+  }
+
+  pool.current_block = new_block;
+  pool.current_offset = 0;
+  pool.bytes_left = pool.block_size;
+}
+
+/**
+* Resets the state of a memory pool.
+* 
+* @param pool The memory pool to reset the state of.
+*/
+public proc pool_reset(pool: *Pool) {
+  if (pool.current_block != null) {
+    array_add(&pool.unused_blocks, pool.current_block);
+  }
+  pool.current_block = null;
+
+   foreach (block in pool.used_blocks) {
+    array_add(&pool.unused_blocks, block);
+  }
+  array_clear(&pool.used_blocks);
+
+  foreach (big_allocation in pool.big_allocations) {
+    free(big_allocation, pool.backing_allocator);
+  }
+  array_clear(&pool.big_allocations);
+
+  pool.bytes_left = 0;
+}
+
+/**
+* Frees all allocations of a memory pool.
+* 
+* @param pool The memory pool to free all allocations of.
+*/
+public proc pool_free_all(pool: *Pool) {
+  pool_reset(pool);
+
+  foreach (block in pool.unused_blocks) {
+    free(block, pool.backing_allocator);
+  }
+  array_clear(&pool.unused_blocks);
+} 
+
+/**
+* Destroys all resources of a memory pool.
+* 
+* @param pool The memory pool to destroy.
+*/
+public proc pool_destroy(pool: *Pool) {
+  pool_free_all(pool);
+  array_destroy(&pool.unused_blocks);
+  array_destroy(&pool.used_blocks);
+  array_destroy(&pool.big_allocations);
+}
+
+/**
+* A single allocation entry in a tracking allocator.
+*/
+public struct Tracking_Allocator_Allocation_Entry {
+  public pointer: rawptr,
+  public size: uint,
+  public location: Source_Location,
+}
+
+/**
+* An entry for a badly freed pointer in a tracking allocator.
+*/
+public struct Tracking_Allocator_Bad_Free_Entry {
+  public pointer: rawptr,
+  public location: Source_Location,
+}
+
+/**
+* Represents a allocator that tracks its allocations.
+*/
+public struct Tracking_Allocator {
+  public allocations: map[rawptr]Tracking_Allocator_Allocation_Entry, // All currently active allocations.
+  public bad_frees: [dynamic]Tracking_Allocator_Bad_Free_Entry,       // All bad frees of pointers that do not belong to the allocator.
+  private backing_allocator: Allocator,                               // The backing allocator that is used for the actual allocations.
+}
+
+/**
+* Creates a tracking allocator.
+*
+* @param tracking_allocator The data for the tracking allocator to be used.
+* @return The tracking allocator.
+*/
+public proc tracking_allocator(tracking_allocator: *Tracking_Allocator) -> Allocator {
+  return {tracking_allocator_procedure, tracking_allocator};
+}
+
+/**
+* Initializes a tracking allocator.
+*
+* @param tracking_allocator The tracking allocator to initialize.
+* @param backing_allocator  The backing allocator to used for the actual allocations.
+* @param internal_allocator The allocator to be used internally.
+*/
+public proc tracking_allocator_init(
+  tracking_allocator: *Tracking_Allocator,
+  backing_allocator: Allocator = context.allocator,
+  internal_allocator: Allocator = context.allocator,
+) {
+  tracking_allocator.allocations = map_make!(rawptr, Tracking_Allocator_Allocation_Entry)(internal_allocator);
+  tracking_allocator.bad_frees = array_make!(Tracking_Allocator_Bad_Free_Entry)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, internal_allocator);
+  tracking_allocator.backing_allocator = backing_allocator;
+}
+
+/**
+* Destroys all resources of a tracking allocator.
+* 
+* @param tracking_allocator The tracking allocator to destroy.
+*/
+public proc tracking_allocator_destroy(tracking_allocator: *Tracking_Allocator) {
+  map_destroy(&tracking_allocator.allocations);
+  array_destroy(&tracking_allocator.bad_frees);
+}
+
+/**
+* The allocation procedure for a tracking allocator.
+*
+* @param data       The data of the allocator.
+* @param mode       The allocation mode.
+* @param size       The size of the allocation.
+* @param alignment  The alignment for the allocation.
+* @param old_memory The old allocation (can be null).
+* @param old_size   The size of the old allocation.
+* @param location   The source location of the allocation.
+* @return The allocated data.
+*/
+public proc tracking_allocator_procedure(
+  allocator_data: rawptr,
+  mode: Allocator_Mode,
+  size: uint,
+  alignment: uint,
+  old_memory: rawptr,
+  old_size: uint,
+  location: Source_Location,
+) -> []byte {
+  tracking_allocator := cast(*Tracking_Allocator) allocator_data;
+  backing_allocator := tracking_allocator.backing_allocator;
+
+  switch (mode) {
+    case .Allocate: {
+      bytes := backing_allocator.procedure(backing_allocator.data, .Allocate, size, alignment, old_memory, old_size, #location);
+
+      pointer := data(bytes);
+      allocation := Tracking_Allocator_Allocation_Entry{pointer, size, location};
+      map_set(&tracking_allocator.allocations, pointer, allocation);
+
+      return bytes;
+    }
+    case .Resize: {
+      bytes := backing_allocator.procedure(backing_allocator.data, .Resize, size, alignment, old_memory, old_size, #location);
+
+      if (old_memory != null) {
+        removed := map_remove(&tracking_allocator.allocations, old_memory);
+        if (!removed) {
+          array_add(&tracking_allocator.bad_frees, {old_memory, location});
+        }
+      }
+      
+      pointer := data(bytes);
+      allocation := Tracking_Allocator_Allocation_Entry{pointer, size, location};
+      map_set(&tracking_allocator.allocations, pointer, allocation);
+
+      return bytes;
+    }
+    case .Free: {
+      if (old_memory == null) then return {};
+
+      removed := map_remove(&tracking_allocator.allocations, old_memory);
+      if (!removed) {
+        array_add(&tracking_allocator.bad_frees, {old_memory, location});
+      } 
+
+      backing_allocator.procedure(backing_allocator.data, .Free, size, alignment, old_memory, old_size, #location);
+    }
+    case .Free_All: {
+      // We can't properly track freeing everything.
+      assert(false, "Tracking allocator does not support 'Allocator_Mode.Free_All'");
+    }
+  }
+
+  return {};
+}

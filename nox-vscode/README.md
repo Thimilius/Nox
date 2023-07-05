@@ -1,0 +1,1 @@
+# Visual Studio Code extension supporting syntax highlighting for Nox

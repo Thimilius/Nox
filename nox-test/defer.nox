@@ -1,0 +1,50 @@
+/**
+* Test the functionality of the defer statement.
+*/
+internal proc test_defer() {
+  test_defer_simple();
+  test_defer_block();
+  test_defer_complex();
+}
+
+private proc test_defer_simple() {
+  x := 123;
+  defer assert(x == 234);
+  assert(x == 123);
+  {
+    defer x = 4;
+    x = 2;
+    assert(x == 2);
+  }
+  assert(x == 4);
+  x = 234;
+}
+
+private proc test_defer_block() {
+  i := 123;
+  defer {
+    i = 12;
+    assert(i == 12);
+  }
+
+  defer if (true) {
+    assert(i == 123);
+  }
+}
+
+private proc test_defer_complex() {
+  x := 0;
+  for (i := 0; i < 10; i++) {
+    defer x = x + i;
+    if (i > 3) {
+      assert(x == 6);
+      for (i := 0; i < 1; i++) {
+        defer x = x + 6;
+        break;
+      }
+      assert(x == 12);
+      break;
+    }
+  }
+  assert(x == 16);
+}

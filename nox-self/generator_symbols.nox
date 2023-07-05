@@ -1,0 +1,458 @@
+import "std:memory"
+
+/**
+* Holds all possible built-in routines.
+*/
+internal enum Builtin_Routine {
+  Invalid,                      // Invalid built-in routine.
+  
+  Main,                         // The 'main' routine.
+
+  Compare_String,               // The 'compare_string' routine.
+  Compare_CString,              // The 'compare_cstring' routine.
+  Hash_Data,                    // The 'hash_data' routine.
+
+  Runtime_Init_Default_Context, // The 'runtime_init_default_context' routine.
+}
+
+internal const BUILTIN_ROUTINE_MAIN := "main";
+internal const BUILTIN_ROUTINE_COMPARE_STRING := "compare_string";
+internal const BUILTIN_ROUTINE_COMPARE_CSTRING := "compare_cstring";
+internal const BUILTIN_ROUTINE_HASH_DATA := "hash_data";
+internal const BUILTIN_ROUTINE_RUNTIME_INIT_DEFAULT_CONTEXT := "runtime_init_default_context";
+
+implement Generator {
+
+  /**
+  * Initializes all symbols.
+  */
+  internal proc init_symbols() {
+    foreach (symbol in self.resolver_output.reachable_sorted_symbols) {
+      self.init_symbol(symbol);
+    }
+
+    self.init_interface_vtables();
+  }
+
+  /**
+  * Initialize a symbol.
+  *
+  * @param symbol    The symbol to initialize.
+  */
+  private proc init_symbol(symbol: *Symbol) {
+    declaration := symbol.declaration;
+
+    is_extern := false;
+    if (declaration != null) {
+      is_extern = has_flag(declaration.flags, .Extern);
+    }
+
+    llvm_symbol: LLVMValueRef;
+    switch (symbol.kind) {
+      case .Constant, .Global: {
+        needs_to_mangle_name := symbol.kind == .Constant ? true : !is_extern;
+        
+        llvm_name: cstring;
+        if (needs_to_mangle_name) {
+          llvm_name = make_mangled_name(symbol);
+        } else {
+          llvm_name = to_cstring(symbol.name); 
+        }
+
+        constant_type := self.type_to_llvm(symbol.type);
+        llvm_symbol = LLVMAddGlobal(self.module, constant_type, llvm_name);
+        if (symbol.kind == .Constant) {
+          LLVMSetGlobalConstant(llvm_symbol, true);
+        }
+      }
+
+      case .Routine: {
+        type := cast(*Type_Routine) symbol.type;
+
+        // There are a few instances in which we can skip generating the routine.
+        //   1. The routine is an intrinsic.
+        //   2. The routine is an uninstantiated generic.
+        //   3. The routine got disabled through the corresponding attribute.
+        if (has_flag(type.routine_flags, .Is_Intrinsic) || has_flag(symbol.flags, .Uninstantiated_Generic) || has_flag(symbol.flags, .Routine_Disabled)) {
+          return;
+        }
+
+        needs_to_mangle_name := !is_extern;
+
+        llvm_name: cstring;
+        if (needs_to_mangle_name) {
+          llvm_name = make_mangled_name(symbol);
+        } else {
+          llvm_name = to_cstring(symbol.name);
+        }
+
+        llvm_type := self.type_to_llvm_without_routine_promotion(cast(*Type) type);
+        llvm_symbol = LLVMAddFunction(self.module, llvm_name, llvm_type);
+        calling_convention := type.calling_convention;
+        llvm_calling_convention := self.calling_convention_to_llvm(calling_convention);
+        LLVMSetFunctionCallConv(llvm_symbol, llvm_calling_convention);
+
+        // NOTE: We would like to have the 'nounwind' attribute on every function as we do not have exceptions.
+        // However it seems that the attribute causes weird issues with the call stack in the debug info (it makes it pretty much unreadable which is very annoying).
+        // Currently there is no obvious way of fixing this other than removing the attribute.
+        // As the attribute does not really have an impact on performance, it should not really matter.
+        // LLVM is smart enough to figure out itself that our routines do not use exceptions.
+        //LLVMAddAttributeAtIndex(llvm_symbol, cast(u32) LLVMAttributeFunctionIndex, self.create_llvm_enum_attribute("nounwind"));
+
+        self.init_symbol_routine_attributes(llvm_symbol, type);
+
+        if (has_flag(symbol.flags, .Routine_Builtin)) {
+          builtin_routine := Builtin_Routine.Invalid;
+          if (symbol.name == BUILTIN_ROUTINE_MAIN) {
+            builtin_routine = .Main;
+          } else if (symbol.name == BUILTIN_ROUTINE_COMPARE_STRING) {
+            builtin_routine = .Compare_String;
+          } else if (symbol.name == BUILTIN_ROUTINE_COMPARE_CSTRING) {
+            builtin_routine = .Compare_CString;
+          } else if (symbol.name == BUILTIN_ROUTINE_HASH_DATA) {
+            builtin_routine = .Hash_Data;
+          } else if (symbol.name == BUILTIN_ROUTINE_RUNTIME_INIT_DEFAULT_CONTEXT) {
+            builtin_routine = .Runtime_Init_Default_Context;
+          } else {
+            assert(false);
+          }
+
+          // We don't want a mangled name for the builtin 'main'.
+          if (builtin_routine == .Main) {
+            LLVMSetValueName2(llvm_symbol, "main", 4);
+            symbol.access_modifier = .Public; // HACK: This is a weird way to force the symbol to be properly linked.
+          }
+
+          self.llvm_builtin_routines[builtin_routine] = {symbol, {llvm_symbol, llvm_type}};
+        }
+      }
+
+      case .Type, .Package: return; // Don't need to do anything here.
+
+      case .Local, .Parameter, .None: fallthrough;
+      case: assert(false);
+    }
+
+    if (is_extern) {
+      LLVMSetLinkage(llvm_symbol, .External);
+    } else {
+      switch (symbol.access_modifier) {
+        case .Private: LLVMSetLinkage(llvm_symbol, .Private);
+        case .Internal: LLVMSetLinkage(llvm_symbol, .Internal);
+        case .Public, .Member_Unspecified, .None: fallthrough;
+        case: LLVMSetLinkage(llvm_symbol, .External);
+      }
+    }
+
+    map_set(&self.llvm_symbols, symbol, llvm_symbol);
+  }
+
+  /**
+  * Initialize the attributes for a routine symbol.
+  *
+  * @param llvm_symbol The LLVM symbol.
+  * @param type        The type of the routine.
+  */
+  private proc init_symbol_routine_attributes(llvm_symbol: LLVMValueRef, type: *Type_Routine) {
+    llvm_noalias_attribute := self.create_llvm_enum_attribute("noalias");
+    llvm_noundef_attribute := self.create_llvm_enum_attribute("noundef");
+
+    return_type := type.return_type;
+
+    parameter_offset: u32 = 1; // Index '0' would be the return value (aka things not being passed as pointers).
+    if (self.type_is_passed_as_pointer(return_type)) {
+      llvm_attribute_index: u32 = parameter_offset;
+
+      llvm_return_type := self.type_to_llvm(return_type);
+      llvm_sret_attribute := self.create_llvm_enum_attribute_type("sret", llvm_return_type);
+
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_sret_attribute);
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noalias_attribute);
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noundef_attribute);
+
+      parameter_offset += 1;
+    }
+    
+    if (type.has_context()) {
+      llvm_attribute_index := parameter_offset;
+
+      llvm_nonnull_attribute := self.create_llvm_enum_attribute("nonnull");
+      llvm_nocapture_attribute := self.create_llvm_enum_attribute("nocapture");
+
+      // The 'context' pointer can always be marked with special attributes.
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noalias_attribute);
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noundef_attribute);
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_nonnull_attribute);
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_nocapture_attribute);
+
+      parameter_offset += 1;
+    }
+    
+    if (has_flag(type.routine_flags, .Is_Method)) {
+      parameter_offset += 1;
+    }
+
+    foreach (parameter, i in type.parameters) {
+      llvm_attribute_index: u32 = parameter_offset + cast(u32) i;
+
+      LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noundef_attribute);
+
+      parameter_type := parameter.type;
+      if (self.type_is_passed_as_pointer(parameter_type)) {
+        LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_noalias_attribute);
+        
+        // HACK: We would really like to add the 'byval' attribute to mark the parameters correctly.
+        // But for some reason when doing so, LLVM will generate incorrect code and I can't figure out why...
+        //llvm_parameter_type := generator_type_to_llvm(generator, parameter_type);
+        //llvm_byval_attribute := generator_create_llvm_enum_attribute_type("byval", llvm_parameter_type);
+        //LLVMAddAttributeAtIndex(llvm_symbol, llvm_attribute_index, llvm_byval_attribute);
+      }
+    }
+  }
+  
+  /**
+  * Initializes the vtables for all reachable interfaces.
+  */
+  private proc init_interface_vtables() {
+    foreach (key, reachable_implementations in self.resolver_output.reachable_interface_implementations) {
+      interface_type := key.interface_type;
+      implementation_type := key.implementation_type;
+
+      llvm_vtable_type := self.type_to_llvm(interface_type);
+      assert(length(reachable_implementations) == 1); 
+      resolved_implementation := reachable_implementations[0];
+
+      llvm_vtable_elements := array_make!(LLVMValueRef)(0, length(interface_type.methods), context.temporary_allocator);
+      foreach (method in interface_type.methods) {
+        method_symbol, found := map_get(&resolved_implementation.symbols, method.name);
+        assert(found);
+        array_add(&llvm_vtable_elements, self.symbol_to_llvm(method_symbol));
+      }
+      llvm_vtable_value := LLVMConstNamedStruct(llvm_vtable_type, data(llvm_vtable_elements), cast(u32) length(llvm_vtable_elements));
+
+      llvm_name := to_cstring_f(
+        "vtable-%-%",
+        make_mangled_name_from_type(interface_type, interface_type.symbol),
+        make_mangled_name_from_type(implementation_type, implementation_type.symbol),
+      );
+      llvm_vtable := LLVMAddGlobal(self.module, llvm_vtable_type, llvm_name);
+      LLVMSetInitializer(llvm_vtable, llvm_vtable_value);
+
+      vtable_key := VTable_Key{interface_type, implementation_type};
+      map_set(&self.llvm_vtables, vtable_key, llvm_vtable);
+    }
+  }
+
+  /**
+  * Emit all symbols.
+  */
+  internal proc emit_symbols() {
+    foreach (symbol in self.resolver_output.reachable_sorted_symbols) {
+      self.emit_symbol(symbol);
+    }
+  }
+
+  /**
+  * Emit a symbol.
+  *
+  * @param symbol    The symbol to emit.
+  */
+  private proc emit_symbol(symbol: *Symbol) {
+    // Here seems a good spot to clear our temporary allocator
+    // which we use to allocate LLVM names among other things.
+    memory.free_all(context.temporary_allocator);
+
+    switch (symbol.kind) {
+      case .Constant: self.emit_symbol_constant(symbol);
+      case .Global: self.emit_symbol_global(symbol);
+      case .Routine: self.emit_symbol_routine(symbol);
+
+      case .Type, .Package: break; // Don't need to do anything here.
+
+      case .Local, .Parameter: fallthrough;
+      case .None: assert(false);
+    }
+  }
+
+  /**
+  * Emit a constant symbol.
+  *
+  * @param symbol    The constant symbol to emit.
+  */
+  private proc emit_symbol_constant(symbol: *Symbol) {
+    llvm_constant := self.symbol_to_llvm(symbol);
+    llvm_value := self.constant_to_llvm(symbol.value, symbol.type);
+    LLVMSetInitializer(llvm_constant, llvm_value);
+  }
+
+  /**
+  * Emit a global symbol.
+  *
+  * @param symbol    The global symbol to emit.
+  */
+  private proc emit_symbol_global(symbol: *Symbol) {
+    declaration := cast(*Declaration_Global) symbol.declaration;
+    if (has_flag(declaration.flags, .Extern)) then return;
+
+    llvm_global := self.symbol_to_llvm(symbol);
+    type := symbol.type;
+    llvm_value := self.default_initializer_value(type);
+    LLVMSetInitializer(llvm_global, llvm_value);
+    LLVMSetThreadLocal(llvm_global, cast(LLVMBool) has_flag(symbol.flags, .Global_Thread_Local));
+
+    if (declaration.expression != null) {
+      routine_context := &self.initializer_routine_context;
+
+      self.enter_local_scope(routine_context, .Block, declaration.position);
+      previous_block := self.enter_llvm_block(routine_context, self.initializer_block);
+      
+      context_type := context.storage.cached_runtime_types.context_struct;
+      llvm_context_type := self.type_to_llvm(context_type);
+      self.add_local_symbol(SPECIAL_NAME_CONTEXT, self.initializer_context, llvm_context_type, context_type, false, routine_context.local_scope);
+
+      declaration_expression := cast(*Expression) declaration.expression;
+      expression_type := self.get_resolved_type(declaration_expression);
+      needs_to_load_address := self.type_requires_loading_address(type, expression_type);
+      previous_loading_mode := self.enter_loading_mode(routine_context, needs_to_load_address ? .Load_Address : .Load_Value);
+      llvm_initializer_value := self.emit_expression(routine_context, declaration_expression, symbol.type);
+      self.leave_loading_mode(routine_context, previous_loading_mode);
+
+      self.emit_store(routine_context, symbol.type, llvm_global, llvm_initializer_value, declaration_expression);
+
+      self.leave_local_scope(routine_context, false, false);
+      self.leave_llvm_block(routine_context, previous_block);
+    }
+  }
+
+  /**
+  * Emit a routine symbol.
+  *
+  * @param symbol    The routine symbol to emit.
+  */
+  private proc emit_symbol_routine(symbol: *Symbol) {
+    type := cast(*Type_Routine) symbol.type;
+
+    // There are a few instances where we can skip generating a body for a routine.
+    //   - The routine is an intrinsic
+    //   - The routine is an uninstantiated generic
+    //   - The routine got disabled through the corresponding attribute
+    //   - The routine is marked extern
+    declaration := cast(*Declaration_Routine) symbol.declaration;
+    if (has_flag(type.routine_flags, .Is_Intrinsic) ||
+      has_flag(symbol.flags, .Uninstantiated_Generic) ||
+      has_flag(symbol.flags, .Routine_Disabled) ||
+      has_flag(declaration.flags, .Extern)) {
+      return;
+    }
+
+    llvm_symbol := self.symbol_to_llvm(symbol);
+    type_routine := cast(*Type_Routine) symbol.type;
+    return_type := type_routine.return_type;
+
+    routine_context: Routine_Context;
+    routine_context.symbol = symbol;
+    routine_context.llvm_symbol = llvm_symbol;
+    routine_context.return_type = return_type;
+    routine_context.needs_after_block = return_type.is_void() || self.type_is_passed_as_pointer(return_type);
+
+    self.debug_init_routine(&routine_context);
+
+    self.enter_local_scope(&routine_context, .Block, declaration.position);
+    
+    // We first want to define a declaration block in which all local variables will be allocated.
+    declaration_block := self.append_block(&routine_context);
+    routine_context.declaration_block = declaration_block;
+    self.init_routine_parameters(&routine_context, symbol, declaration, return_type, type_routine);
+
+    // We append a second block for our actual statements and emit them.
+    statement_block := self.append_block(&routine_context);
+    previous_block := self.enter_llvm_block(&routine_context, statement_block);
+
+    returns, leaves := self.emit_statement_block(&routine_context, declaration.block, .New_Scope);
+    if (routine_context.needs_after_block && !returns) {
+      self.debug_emit_location(&routine_context, declaration.block.end_position);
+      LLVMBuildRetVoid(self.builder);
+    }
+    self.leave_local_scope(&routine_context, returns, leaves);
+    self.leave_llvm_block(&routine_context, previous_block);
+
+    // Now that we are done with all statements, we need to finish our declaration block, by jumping from it into the statement block.
+    {
+      previous_block := self.enter_llvm_block(&routine_context, declaration_block);
+      self.debug_emit_no_location();
+      LLVMBuildBr(self.builder, statement_block);
+      self.leave_llvm_block(&routine_context, previous_block);
+    }
+  }
+
+  /**
+  * Initialize the parameters for a routine symbol.
+  *
+  * @param routine_context     The context of the routine.
+  * @param symbol              The routine symbol.
+  * @param declaration_routine The declaration of the routine.
+  * @param return_type         The return type of the routine.
+  * @param type_routine        The type of the routine.
+  */
+  private proc init_routine_parameters(
+    routine_context: *Routine_Context,
+    symbol: *Symbol,
+    declaration: *Declaration_Routine,
+    return_type: *Type,
+    type_routine: *Type_Routine,
+  ) {
+    parameter_offset := 0;
+
+    if (self.type_is_passed_as_pointer(return_type)) {
+      llvm_parameter_symbol := LLVMGetParam(routine_context.llvm_symbol, cast(u32) parameter_offset);
+      LLVMSetValueName2(llvm_parameter_symbol, "return", 6);
+      parameter_offset += 1;
+    }
+
+    if (type_routine.has_context()) {
+      parameter_type := context.storage.get_or_make_type_pointer(context.storage.cached_runtime_types.context_struct);
+      self.init_routine_parameter(routine_context, symbol.declaration.position, SPECIAL_NAME_CONTEXT, parameter_type, cast(u32) parameter_offset);
+      parameter_offset += 1;
+    }
+
+    if (has_flag(symbol.flags, .Routine_Method_Implemented)) {
+      implementation_type := symbol.value.(*Type); // This gets us the type the method belongs to.
+      parameter_type := context.storage.get_or_make_type_pointer(implementation_type);
+      self.init_routine_parameter(routine_context, symbol.declaration.position, SPECIAL_NAME_SELF, parameter_type, cast(u32) parameter_offset);
+      parameter_offset += 1;
+    }
+
+    // We need to add all routine parameters to the local symbol table.
+    foreach (parameter, i in declaration.parameters) {
+      index := parameter_offset + i;
+      parameter_type := self.get_resolved_type(parameter.type);
+      self.init_routine_parameter(routine_context, parameter.position, parameter.name, parameter_type, cast(u32) index);
+    }
+  }
+
+  /**
+  * Initialize a parameter for a routine symbol.
+  *
+  * @param routine_context     The context of the routine.
+  * @param position            The source position of the parameter.
+  * @param parameter_name      The name of the parameter.
+  * @param parameter_type      The type of the parameter.
+  * @param parameter_offset    The offset of the parameter.
+  */
+  private proc init_routine_parameter(
+    routine_context: *Routine_Context,
+    position: Source_Position,
+    parameter_name: string,
+    parameter_type: *Type,
+    parameter_offset: u32,
+  ) {
+    llvm_parameter_type := self.type_to_llvm(parameter_type);
+    llvm_parameter_symbol := LLVMGetParam(routine_context.llvm_symbol, cast(u32) parameter_offset);
+    LLVMSetValueName2(llvm_parameter_symbol, to_cstring(parameter_name), cast(uint) length(parameter_name));
+    
+    self.add_local_symbol(parameter_name, llvm_parameter_symbol, llvm_parameter_type, parameter_type, true, routine_context.local_scope);
+
+    self.debug_emit_parameter(routine_context, position, parameter_type, parameter_name, llvm_parameter_symbol, parameter_offset + 1);
+  }
+
+}

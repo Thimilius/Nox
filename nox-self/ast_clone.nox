@@ -1,0 +1,447 @@
+import "std:memory"
+import "std:strings"
+
+/**
+* Clones the AST of a routine declaration.
+*
+* @param original The original routine declaration to clone
+* @param allocator The allocator to use in the process.
+* @return The cloned routine declaration.
+*/
+internal proc ast_clone_declaration_routine(original: *Declaration, allocator: Allocator) -> *Declaration {
+  assert(original.kind == .Procedure || original.kind == .Function);
+
+  original := cast(*Declaration_Routine) original;
+
+  new_context := *context;
+  new_context.allocator = allocator;
+  push_context (new_context) {
+    clone := ast_make_clone!(Declaration_Routine)(original);
+
+    clone_parameters: aosoa[dynamic]Declaration_Routine_Parameter;
+    original_parameters := original.parameters;
+    foreach (parameter in original_parameters) {
+      parameter_type := ast_clone_type_specification(parameter.type);
+      parameter_initializer := ast_clone_expression(parameter.initializer);
+      array_aosoa_add(&clone_parameters, {parameter.position, parameter.name, parameter_type, parameter_initializer});
+    }
+    clone.parameters = clone_parameters;
+    clone.return_type = ast_clone_type_specification(cast(*Type_Specification) original.return_type);
+
+    // NOTE: We deliberatly don't clone generic type names as they are not going to be needed after the clone.
+    // The reason for this is that we currently only ever clone routines when we are dealing with instantiation of generic routines.
+    clone.generic_type_names = {};
+
+    // We do clone generic constraints however as they can contain expression we might need to instantiate.
+    generic_constraints: aosoa[dynamic]Declaration_Routine_Generic_Constraint;
+    foreach (original_generic_constraint in original.generic_constraints) {
+      clone_generic_constraint := *original_generic_constraint;
+      switch (original_generic_constraint.kind) {
+        case .Expression: {
+          generic_constraint_expression := original_generic_constraint.value.(Declaration_Routine_Generic_Constraint_Expression).expression;
+          clone_generic_constraint.value = Declaration_Routine_Generic_Constraint_Expression{ast_clone_expression(generic_constraint_expression)};
+        }
+        case .Interface: {
+          generic_constraint_interface := original_generic_constraint.value.(Declaration_Routine_Generic_Constraint_Interface);
+          generic_constraint_type := generic_constraint_interface.type;
+          clone_generic_constraint.value = Declaration_Routine_Generic_Constraint_Interface{
+            generic_constraint_interface.generic_type_name,
+            ast_clone_type_specification(generic_constraint_type)
+          };
+        }
+      }
+      array_aosoa_add(&generic_constraints, clone_generic_constraint);
+    }
+    clone.generic_constraints = generic_constraints;
+
+    clone.block = ast_clone_statement_block(original.block);
+
+    return cast(*Declaration) clone;
+  }
+}
+
+/**
+* Clones the AST of a type specification.
+*
+* @param original The original type specification to clone.
+* @return The cloned type specification.
+*/
+internal proc ast_clone_type_specification(original: *Type_Specification) -> *Type_Specification {
+  if (original == null) then return null;
+
+  switch (original.kind) {
+    case .Name: {
+      original := cast(*Type_Specification_Name) original;
+      clone := ast_make_clone!(Type_Specification_Name)(original);
+      clone_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in original.generic_types) {
+        array_add(&clone_generic_types, ast_clone_type_specification(generic_type));
+      }
+      clone.generic_types = clone_generic_types;
+      return cast(*Type_Specification) clone;
+    }
+    case .Pointer: {
+      original := cast(*Type_Specification_Pointer) original;
+      clone := ast_make_clone!(Type_Specification_Pointer)(original);
+      clone.base = ast_clone_type_specification(cast(*Type_Specification) original.base);
+      clone.relative_base = ast_clone_type_specification(cast(*Type_Specification) original.relative_base);
+      return cast(*Type_Specification) clone;
+    }
+    case .Array: {
+      original := cast(*Type_Specification_Array) original;
+      clone := ast_make_clone!(Type_Specification_Array)(original);
+      clone.base = ast_clone_type_specification(cast(*Type_Specification) original.base);
+      clone.size = ast_clone_expression(cast(*Expression) original.size);
+      return cast(*Type_Specification) clone;
+    }
+    case .Slice: {
+      original := cast(*Type_Specification_Slice) original;
+      clone := ast_make_clone!(Type_Specification_Slice)(original);
+      clone.base = ast_clone_type_specification(cast(*Type_Specification) original.base);
+      return cast(*Type_Specification) clone;
+    }
+    case .Map: {
+      original := cast(*Type_Specification_Map) original;
+      clone := ast_make_clone!(Type_Specification_Map)(original);
+      clone.key = ast_clone_type_specification(cast(*Type_Specification) original.key);
+      clone.value = ast_clone_type_specification(cast(*Type_Specification) original.value);
+      return cast(*Type_Specification) clone;
+    }
+    case .Tuple: {
+      original := cast(*Type_Specification_Tuple) original;
+      clone := ast_make_clone!(Type_Specification_Tuple)(original);
+      clone_elements: [dynamic]*Type_Specification;
+      foreach (element in original.elements) {
+        array_add(&clone_elements, ast_clone_type_specification(element));
+      }
+      clone.elements = clone_elements;
+      return cast(*Type_Specification) clone;
+    }
+    case .Procedure, .Function: {
+      original := cast(*Type_Specification_Routine) original;
+      clone := ast_make_clone!(Type_Specification_Routine)(original);
+      clone.return_type = ast_clone_type_specification(cast(*Type_Specification) original.return_type);
+      clone_parameters: [dynamic]*Type_Specification;
+      foreach (parameter in original.parameters) {
+        array_add(&clone_parameters, ast_clone_type_specification(parameter));
+      }
+      clone.parameters = clone_parameters;
+      return cast(*Type_Specification) clone;
+    }
+
+    case .None: fallthrough;
+    case: assert(false);
+  }
+
+  assert(false);
+  return null;
+}
+
+/**
+* Clones the AST of a statement.
+*
+* @param original The original statement to clone.
+* @return The cloned statement.
+*/
+internal proc ast_clone_statement(original: *Statement) -> *Statement {
+  if (original == null) then return null;
+
+  switch (original.kind) {
+    case .Return: {
+      original := cast(*Statement_Return) original;
+      clone := ast_make_clone!(Statement_Return)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Statement) clone;
+    }
+    case .Break, .Continue, .Fallthrough: {
+      original := cast(*Statement) original;
+      clone := ast_make_clone!(Statement)(original);
+      return cast(*Statement) clone;
+    }
+    case .Push_Context: {
+      original := cast(*Statement_Push_Context) original;
+      clone := ast_make_clone!(Statement_Push_Context)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone.block = ast_clone_statement_block(original.block);
+      return cast(*Statement) clone;
+    }
+
+    case .Scope: {
+      original := cast(*Statement_Scope) original;
+      clone := ast_make_clone!(Statement_Scope)(original);
+      clone.block = ast_clone_statement_block(original.block);
+      return cast(*Statement) clone;
+    }
+    case .If, .Static_If: {
+      original := cast(*Statement_If) original;
+      clone := ast_make_clone!(Statement_If)(original);
+      clone.condition = ast_clone_expression(cast(*Expression) original.condition);
+      clone.then_block = ast_clone_statement_block(original.then_block);
+      clone_else_ifs: soa[dynamic]Statement_If_Else;
+      foreach (else_if in original.else_ifs) {
+        array_soa_add(&clone_else_ifs, {ast_clone_expression(else_if.condition), ast_clone_statement_block(else_if.block)});
+      }
+      clone.else_ifs = clone_else_ifs;
+      clone.else_block = ast_clone_statement_block(original.else_block);
+      return cast(*Statement) clone;
+    }
+    case .For: {
+      original := cast(*Statement_For) original;
+      clone := ast_make_clone!(Statement_For)(original);
+      clone.initializer = ast_clone_statement(cast(*Statement) original.initializer);
+      clone.condition = ast_clone_expression(cast(*Expression) original.condition);
+      clone.next = ast_clone_statement(cast(*Statement) original.next);
+      clone.block = ast_clone_statement_block(original.block);
+      return cast(*Statement) clone;
+    }
+    case .Foreach: {
+      original := cast(*Statement_Foreach) original;
+      clone := ast_make_clone!(Statement_Foreach)(original);
+      clone.collection = ast_clone_expression(cast(*Expression) original.collection);
+      clone.block = ast_clone_statement_block(original.block);
+      return cast(*Statement) clone;
+    }
+    case .Switch: {
+      original := cast(*Statement_Switch) original;
+      clone := ast_make_clone!(Statement_Switch)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone_cases: soa[dynamic]Statement_Switch_Case;
+      foreach (switch_case in original.cases) {
+        clone_patterns: [dynamic]*Expression;
+        foreach (pattern in switch_case.patterns) {
+          array_add(&clone_patterns, ast_clone_expression(pattern));
+        }
+        array_soa_add(&clone_cases, {clone_patterns, ast_clone_statement_block(switch_case.block)});
+      }
+      clone.cases = clone_cases;
+      return cast(*Statement) clone;
+    }
+
+    case .Assign: {
+      original := cast(*Statement_Assign) original;
+      clone := ast_make_clone!(Statement_Assign)(original);
+      clone_left_expressions: [dynamic]*Expression;
+      foreach (left_expression in original.left_expressions) {
+        array_add(&clone_left_expressions, ast_clone_expression(left_expression));
+      }
+      clone.left_expressions = clone_left_expressions;
+      clone.right_expression = ast_clone_expression(cast(*Expression) original.right_expression);
+      return cast(*Statement) clone;
+    }
+    case .Initialize: {
+      original := cast(*Statement_Initialize) original;
+      clone := ast_make_clone!(Statement_Initialize)(original);
+      clone_names: [dynamic]string;
+      foreach (name in original.names) {
+        array_add(&clone_names, name);
+      }
+      clone.names = clone_names;
+      clone.type = ast_clone_type_specification(cast(*Type_Specification) original.type);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Statement) clone;
+    }
+    case .Expression: {
+      original := cast(*Statement_Expression) original;
+      clone := ast_make_clone!(Statement_Expression)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Statement) clone;
+    }
+
+    case .None: fallthrough;
+    case: assert(false);
+  }
+
+  assert(false);
+  return null;
+}
+
+/**
+* Clones the AST of a statement block.
+*
+* @param original The original statement block to clone.
+* @return The cloned statement block.
+*/
+internal proc ast_clone_statement_block(original: Statement_Block) -> Statement_Block {
+  clone := original;
+  clone.statements = array_make!(*Statement)(0, length(original.statements));
+  foreach (statement in original.statements) {
+    array_add(&clone.statements, ast_clone_statement(statement));
+  }
+  return clone;
+}
+
+/**
+* Clones the AST of an expression.
+*
+* @param original The original expression to clone.
+* @return The cloned expression.
+*/
+internal proc ast_clone_expression(original: *Expression) -> *Expression {
+  if (original == null) then return null;
+
+  switch (original.kind) {
+    case .Parenthesized: {
+      original := cast(*Expression_Parenthesized) original;
+      clone := ast_make_clone!(Expression_Parenthesized)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Expression) clone;
+    }
+
+    case .Boolean, .Integer, .Float, .Character: {
+      original := cast(*Expression_Literal) original;
+      clone := ast_make_clone!(Expression_Literal)(original);
+      return cast(*Expression) clone;
+    }
+    case .String: {
+      original := cast(*Expression_Literal) original;
+      clone := ast_make_clone!(Expression_Literal)(original);
+      clone.value = strings.clone(original.value.(string));
+      return cast(*Expression) clone;
+    }
+    case .Name: {
+      original := cast(*Expression_Name) original;
+      clone := ast_make_clone!(Expression_Name)(original);
+      clone_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in original.generic_types) {
+        array_add(&clone_generic_types, ast_clone_type_specification(generic_type));
+      }
+      clone.generic_types = clone_generic_types;
+      return cast(*Expression) clone;
+    }
+
+    case .Cast: {
+      original := cast(*Expression_Cast) original;
+      clone := ast_make_clone!(Expression_Cast)(original);
+      clone.type = ast_clone_type_specification(cast(*Type_Specification) original.type);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Expression) clone;
+    }
+    case .Call: {
+      original := cast(*Expression_Call) original;
+      clone := ast_make_clone!(Expression_Call)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone_arguments: [dynamic]*Expression;
+      foreach (argument in original.arguments) {
+        array_add(&clone_arguments, ast_clone_expression(argument));
+      }
+      clone.arguments = clone_arguments;
+      return cast(*Expression) clone;
+    }
+    case .Index: {
+      original := cast(*Expression_Index) original;
+      clone := ast_make_clone!(Expression_Index)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone.index = ast_clone_expression(cast(*Expression) original.index);
+      return cast(*Expression) clone;
+    }
+    case .Slice: {
+      original := cast(*Expression_Slice) original;
+      clone := ast_make_clone!(Expression_Slice)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone.lower = ast_clone_expression(cast(*Expression) original.lower);
+      clone.higher = ast_clone_expression(cast(*Expression) original.higher);
+      return cast(*Expression) clone;
+    }
+    case .Member: {
+      original := cast(*Expression_Member) original;
+      clone := ast_make_clone!(Expression_Member)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone_generic_types: [dynamic]*Type_Specification;
+      foreach (generic_type in original.generic_types) {
+        array_add(&clone_generic_types, ast_clone_type_specification(generic_type));
+      }
+      clone.generic_types = clone_generic_types;
+      return cast(*Expression) clone;
+    }
+    case .Compound: {
+      original := cast(*Expression_Compound) original;
+      clone := ast_make_clone!(Expression_Compound)(original);
+      clone.type = ast_clone_type_specification(cast(*Type_Specification) original.type);
+      clone_fields: aosoa[dynamic]Expression_Compound_Field;
+      foreach (field in original.fields) {
+        clone_field := *field;
+        clone_field.initializer = ast_clone_expression(field.initializer);
+        if (clone_field.kind == .Index) {
+          clone_field.value = ast_clone_expression(field.value.(*Expression));
+        }
+        array_aosoa_add(&clone_fields, clone_field);
+      }
+      clone.fields = clone_fields;
+      return cast(*Expression) clone;
+    }
+    case .Selector: {
+      original := cast(*Expression_Selector) original;
+      clone := ast_make_clone!(Expression_Selector)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      clone.type = ast_clone_type_specification(cast(*Type_Specification) original.type);
+      return cast(*Expression) clone;
+    }
+    case .Implicit_Selector: {
+      original := cast(*Expression_Implicit_Selector) original;
+      clone := ast_make_clone!(Expression_Implicit_Selector)(original);
+      return cast(*Expression) clone;
+    }
+
+    case .Unary: {
+      original := cast(*Expression_Unary) original;
+      clone := ast_make_clone!(Expression_Unary)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Expression) clone;
+    }
+    case .Binary: {
+      original := cast(*Expression_Binary) original;
+      clone := ast_make_clone!(Expression_Binary)(original);
+      clone.left = ast_clone_expression(cast(*Expression) original.left);
+      clone.right = ast_clone_expression(cast(*Expression) original.right);
+      return cast(*Expression) clone;
+    }
+    case .Ternary: {
+      original := cast(*Expression_Ternary) original;
+      clone := ast_make_clone!(Expression_Ternary)(original);
+      clone.condition = ast_clone_expression(cast(*Expression) original.condition);
+      clone.then_expression = ast_clone_expression(cast(*Expression) original.then_expression);
+      clone.else_expression = ast_clone_expression(cast(*Expression) original.else_expression);
+      return cast(*Expression) clone;
+    }
+    case .Modify: {
+      original := cast(*Expression_Modify) original;
+      clone := ast_make_clone!(Expression_Modify)(original);
+      clone.expression = ast_clone_expression(cast(*Expression) original.expression);
+      return cast(*Expression) clone;
+    }
+
+    case .Query: {
+      original := cast(*Expression_Query) original;
+      clone := ast_make_clone!(Expression_Query)(original);
+      switch (original.query_kind) {
+        case .Size_Of_Expression, .Typeid_Of_Expression, .Type_Info_Of_Expression: clone.value = ast_clone_expression(original.value.(*Expression));
+        case .Size_Of_Type, .Typeid_Of_Type, .Type_Info_Of_Type: clone.value = ast_clone_type_specification(original.value.(*Type_Specification));
+      }
+      return cast(*Expression) clone;
+    }
+    case .Directive: {
+      original := cast(*Expression_Directive) original;
+      clone := ast_make_clone!(Expression_Directive)(original);
+      return cast(*Expression) clone;
+    }
+
+    case .None: fallthrough;
+    case: assert(false);
+  }
+
+  assert(false);
+  return null;
+}
+
+/**
+* Clones an AST element.
+* 
+* @param T        The type of the AST element.
+* @param original The original AST element to clone.
+* @return The cloned AST element
+*/
+private proc ast_make_clone!(T)(original: *T) -> *T {
+  clone := memory.new!(T)();
+  *clone = *original;
+  return clone;
+}

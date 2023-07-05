@@ -1,0 +1,17 @@
+/**
+* Test the functionality of function pointers.
+*/
+internal proc test_function_pointers() {
+  assert(global_function_pointer() == 5);
+  local_function_pointer: proc() -> i32 = function_pointer_function;
+  assert(local_function_pointer() == 5);
+
+  local_function_pointer = global_function_pointer;
+  assert(local_function_pointer() == 5);
+}
+
+private global global_function_pointer := function_pointer_function;
+
+private proc function_pointer_function() -> i32 {
+  return 5;
+}

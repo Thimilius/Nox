@@ -1,0 +1,366 @@
+import "std:math"
+import "std:memory"
+
+/**
+* This implements a generic hash-map based on simple open-addressing with linear probing.
+* This could (and probably should) be improved by using Robin Hood Hashing.
+*/
+
+/**
+* Represents a single map entry.
+* 
+* @param !K The key type of the map entry.
+* @param !V The value type of the map entry.
+*/
+private struct Map_Entry!(K, V) {
+  private key: K,            // The key of the entry.
+  private value: V,          // The value of the entry.
+  private is_occupied: bool, // Is the entry currently occupied?
+}
+
+/**
+* The load factor for a map.
+*/
+private const MAP_LOAD_FACTOR := 0.75;
+/**
+* The default capacity for a map.
+*/
+private const MAP_DEFAULT_CAPACITY := 16;
+
+/**
+* Represents an iterator for a map.
+* 
+* @param !K The key type of the map iterator.
+* @param !V The value type of the map iterator.
+*/
+public struct Map_Iterator!(K, V) {
+  m: *map[K]V, // The map that gets iterated over.
+  index: int,  // The current entry index of the iterator.
+}
+
+/**
+* Makes a new map.
+*
+* @param !K                The key type of the map.
+* @param !V                The value type of the map.
+* @param allocator         The allocator to be used.
+* @param hash_procedure    The hash procedure for the key.
+* @param compare_procedure The compare procedure for the key.
+* @return The new map.
+*/
+public proc map_make!(K, V)(
+  allocator: Allocator = context.allocator,
+  hash_procedure: Hash_Function!(K) = hash_function_of_type!(K)(),
+  compare_procedure: Compare_Function!(K) = compare_function_of_type!(K)(),
+) -> map[K]V {
+  raw_map: memory.Raw_Map;
+  raw_map.allocator = allocator;
+  raw_map.hash_procedure = hash_procedure;
+  raw_map.compare_procedure = compare_procedure;
+  return *cast(*map[K]V) &raw_map;
+}
+
+/**
+* Sets the map entry of a given key to a new value.
+* 
+* @param !K    The key type of the map.
+* @param !V    The value type of the map.
+* @param m     The map to set the entry of.
+* @param key   The key of the entry to set.
+* @param value The value to set.
+*/
+public proc map_set!(K, V)(m: *map[K]V, key: K, value: V) {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null) then return;
+  if (raw_map.capacity == 0) then map_reserve(m, MAP_DEFAULT_CAPACITY);
+
+  entry, index := map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  if (entry.is_occupied) {
+    entry.value = value;
+    return;
+  }
+
+  needs_to_grow := raw_map.length + 1 > cast(int) (cast(f64) raw_map.capacity * MAP_LOAD_FACTOR);
+  if (needs_to_grow) {
+    map_reserve(m, raw_map.capacity * 2);
+    entry, index = map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  } 
+
+  entry.key = key;
+  entry.value = value;
+  entry.is_occupied = true;
+  raw_map.length++;
+}
+
+/**
+* Gets the value of a given map entry.
+* 
+* @param !K  The key type of the map.
+* @param !V  The value type of the map.
+* @param m   The map to get the value of.
+* @param key The key of the entry.
+* @return 1. The value of the key; 2. True if the map contains a entry for the key otherwise false.
+*/
+public func map_get!(K, V)(m: *map[K]V, key: K) -> (V, bool) {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null || raw_map.capacity == 0) then return {{}, false};
+
+  entry, _ := map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  return entry.is_occupied ? {entry.value, true} : {{}, false};
+}
+
+/**
+* Gets the address of a value of a given key.
+* 
+* @param !K  The key type of the map.
+* @param !V  The value type of the map.
+* @param m   The map to get the value address of.
+* @param key The key of the entry.
+* @return The address of the value (or null if the map does not contain an entry for the given key).
+*/
+public func map_get_address!(K, V)(m: *map[K]V, key: K) -> *V {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null || raw_map.capacity == 0) then return null;
+
+  entry, _ := map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  return entry.is_occupied ? &entry.value : null;
+}
+
+/**
+* Checks whether or not a map contains an entry for a given key.
+* 
+* @param !K  The key type of the map.
+* @param !V  The value type of the map.
+* @param m   The map to check the entry of.
+* @param key The key of the entry.
+* @return True if the map contains an entry for the given key otherwise false.
+*/
+public func map_contains!(K, V)(m: *map[K]V, key: K) -> bool {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null || raw_map.capacity == 0) then return false;
+
+  entry, _ := map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  return entry.is_occupied;
+}
+
+/**
+* Removes the map entry of a given key.
+* 
+* @param !K    The key type of the map.
+* @param !V    The value type of the map.
+* @param m     The map to remove the entry of.
+* @param key   The key of the entry to remove.
+* @return True if the map entry could be removed otherwise false.
+*/
+public proc map_remove!(K, V)(m: *map[K]V, key: K) -> bool {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null || raw_map.capacity == 0) then return false;
+
+  entry, i := map_find_entry!(K, V)(raw_map.data, raw_map.capacity, key, raw_map.hash_procedure, raw_map.compare_procedure);
+  if (!entry.is_occupied) then return false;
+
+  entry.is_occupied = false;
+
+  hash_procedure := cast(Hash_Function!(K)) raw_map.hash_procedure;
+  entries := cast(*Map_Entry!(K, V)) raw_map.data;
+
+  j := i;
+  for {
+    j = (j + 1) & (cast(uint) raw_map.capacity - 1);
+    offset: ^uint*Map_Entry!(K, V) = j;
+
+    loop_entry := entries + offset;
+    if (!loop_entry.is_occupied) then break;
+    
+    k := hash_procedure(loop_entry.key) & (cast(uint) raw_map.capacity - 1);
+    if (i <= j) {
+      if (i < k && k <= j) {
+        continue;
+      }
+    } else {
+      if (i < k || k <= j) {
+        continue;
+      }
+    }
+
+    offset = i;
+    entry = entries + offset;
+
+    *entry = *loop_entry;
+    loop_entry.is_occupied = false;
+
+    i = j;
+  }
+
+  raw_map.length--;
+
+  return true;
+}
+
+/**
+* Reserve more capacity for a map.
+* 
+* @param !K      The key type of the map.
+* @param !V      The value type of the map.
+* @param m       The map to reserve more capacity for.
+* @param caacity The new capacity to reserve.
+*/
+public proc map_reserve!(K, V)(m: *map[K]V, capacity: int) {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map.hash_procedure == null) then raw_map.hash_procedure = hash_function_of_type!(K)();
+  if (raw_map.compare_procedure == null) then raw_map.compare_procedure = compare_function_of_type!(K)();
+  if (raw_map.allocator.procedure == null) then raw_map.allocator = context.allocator;
+
+  capacity := math.round_up_to_next_power_of_2(capacity);
+  new_capacity := max(MAP_DEFAULT_CAPACITY, capacity); // Grows exponentially and always is a multiple of 2.
+  if (new_capacity < raw_map.capacity) then return;
+
+  entries := cast(*Map_Entry!(K, V)) raw_map.data;
+  new_entries := cast(*Map_Entry!(K, V)) memory.allocate(cast(uint) new_capacity * size_of(:Map_Entry!(K, V)), raw_map.allocator);
+
+  new_length := 0;
+  for (i := 0; i < raw_map.capacity; i++) {
+    offset: ^*Map_Entry!(K, V) = i;
+    entry := entries[offset];
+
+    if (!entry.is_occupied) then continue;
+
+    new_entry, _ := map_find_entry!(K, V)(new_entries, new_capacity, entry.key, raw_map.hash_procedure, raw_map.compare_procedure);
+    new_entry.key = entry.key;
+    new_entry.value = entry.value;
+    new_entry.is_occupied = true;
+    new_length++;
+  }
+
+  if (raw_map.data != null) then memory.free(raw_map.data, raw_map.allocator);
+
+  raw_map.data = new_entries;
+  raw_map.length = new_length;
+  raw_map.capacity = new_capacity;
+}
+
+/**
+* Makes a new iterator for a map.
+* 
+* @param !K The key type of the map iterator.
+* @param !V The value type of the map iterator.
+* @param m  The map to iterate over.
+* @return The new map iterator.
+*/
+public proc map_iterator!(K, V)(m: *map[K]V) -> Map_Iterator!(K, V) {
+  assert(m != null);
+  return {m, -1, false};
+}
+
+/**
+* Checks whether or not a map iterator has a next entry to get.
+* 
+* @param !K The key type of the map iterator.
+* @param !V The value type of the map iterator.
+* @param m  The map iterator to check.
+* @return True if the iterator has a next entry to get otherwise false.
+*/
+public proc map_iterator_has_next!(K, V)(iterator: *Map_Iterator!(K, V)) -> bool {
+  if (iterator == null) then return false;
+
+  raw_map := cast(*memory.Raw_Map) iterator.m;
+
+  index := iterator.index + 1;
+  iterator.index = index;
+  if (index >= raw_map.capacity) then return false;
+
+  offset: ^*Map_Entry!(K, V) = index;
+  entries := cast(*Map_Entry!(K, V)) raw_map.data;
+  entry := entries + offset;
+  for (!entry.is_occupied) {
+    index++;
+    iterator.index = index;
+    if (index >= raw_map.capacity) then return false;
+
+    offset = index;
+    entry = entries + offset;
+  }
+
+  return true;
+}
+
+/**
+* Gets the key and value of the current iterator entry.
+* 
+* @param !K The key type of the map iterator.
+* @param !V The value type of the map iterator.
+* @param m  The map iterator.
+* @return 1. The key of the current entry; 2. The value of the current entry.
+*/
+public proc map_iterator_get!(K, V)(iterator: *Map_Iterator!(K, V)) -> (K, V) {
+  if (iterator == null) then return {};
+  if (iterator.index < 0) then return {};
+
+  raw_map := cast(*memory.Raw_Map) iterator.m;
+  offset: ^*Map_Entry!(K, V) = iterator.index;
+  entries := cast(*Map_Entry!(K, V)) raw_map.data;
+  entry := entries + offset;
+  return {entry.key, entry.value};
+}
+
+/**
+* Destroys all resources of a given map.
+* 
+* @param !K The key type of the map.
+* @param !V The value type of the map.
+* @param m  The map to destroy.
+*/
+public proc map_destroy!(K, V)(m: *map[K]V) {
+  raw_map := cast(*memory.Raw_Map) m;
+
+  if (raw_map == null || raw_map.capacity == 0) then return;
+
+  memory.free(raw_map.data, raw_map.allocator);
+
+  raw_map.data = null;
+  raw_map.capacity = 0;
+  raw_map.length = 0;
+}
+
+/**
+* Finds the corresponding entry for a key.
+* 
+* @param !K           The key type of the map.
+* @param !V           The value type of the map.
+* @param data         The data of the map.
+* @param capacity     The capacity of the map.
+* @param key          The key to find the entry for.
+* @param hash_proc    The hash procedure of the key.
+* @param compare_proc The comapare procedure of the key.
+* @return 1. A pointer to the found entry; 2. The index of the found entry.
+*/
+private func map_find_entry!(K, V)(
+  data: rawptr,
+  capacity: int,
+  key: K,
+  hash_proc: rawptr,
+  compare_proc: rawptr,
+) -> (*Map_Entry!(K, V), uint) {
+  entries := cast(*Map_Entry!(K, V)) data;
+
+  hash_procedure := cast(Hash_Function!(K)) hash_proc;
+  compare_procedure := cast(Compare_Function!(K)) compare_proc;
+
+  hash := hash_procedure(key);
+  index := hash & (cast(uint) capacity - 1); // Optimization for the '%' operator. Works because capacity is always a multiple of 2.
+  offset: ^uint*Map_Entry!(K, V) = index;
+
+  for (entries[offset].is_occupied && !compare_procedure(entries[offset].key, key)) {
+    index = (index + 1) & (cast(uint) capacity - 1);
+    offset = index;
+  }
+
+  return {entries + offset, index};
+}
+

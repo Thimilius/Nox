@@ -1,0 +1,22 @@
+/**
+* Test the functionality of tuples.
+*/
+internal proc test_tuples() {
+  tuple: (int, bool) = {3, true};
+  t1, t2 := tuple;
+  assert(t1 == 3);
+  assert(t2 == true);
+
+  t := test_pass_and_return_tuple({5, false});
+  t3, t4 := t;
+  assert(t3 == 5);
+  assert(t4 == false);
+
+  t3, t4 = tuple;
+  assert(t3 == 3);
+  assert(t4 == true);
+}
+
+private proc test_pass_and_return_tuple(t: (int, bool)) -> (int, bool) {
+  return t;  
+}

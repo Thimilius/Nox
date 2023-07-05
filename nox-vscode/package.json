@@ -1,0 +1,27 @@
+{
+  "name": "nox",
+  "displayName": "Nox",
+  "description": "Nox language support",
+  "icon": "nox_icon.png",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.23.0"
+  },
+  "publisher": "Jan Storm",
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [{
+      "id": "nox",
+      "aliases": ["Nox", "nox"],
+      "extensions": [".nox"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "nox",
+      "scopeName": "source.nox",
+      "path": "./syntaxes/nox.tmLanguage.json"
+    }]
+  }
+}

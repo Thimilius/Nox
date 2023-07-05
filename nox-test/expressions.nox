@@ -1,0 +1,123 @@
+/**
+* Test the functionality of differnt kinds of expressions.
+*/
+internal proc test_expressions() {
+  test_ternary();
+  test_modify();
+  test_short_circuit();
+  test_shifts();
+  test_size_of();
+  test_compound();
+}
+
+private const TERNARY := true ? 23 : 19;
+
+private proc test_ternary() {
+  test_ternary_simple(false);
+  test_ternary_side_effects(false);
+}
+
+private proc test_ternary_simple(b: bool) {
+  assert(TERNARY == 23);
+
+  v := 23;
+  p := &v;
+  s := b ? p : null;
+
+  assert(s == null);
+}
+
+private global g_ternary_side_effect := 7;
+
+private proc test_ternary_side_effects(b: bool) {
+  i := b ? first_ternary() : second_ternary();
+  assert(i == 19);
+  assert(g_ternary_side_effect == 7);
+}
+
+private proc first_ternary() -> int {
+  g_ternary_side_effect = 18;
+  return 13;
+}
+
+private proc second_ternary() -> int {
+  return 19;
+}
+
+private proc test_modify() {
+  i := 0;
+  ++i;
+  d := i++;
+  assert(d == 1);
+  assert(i == 2);
+
+  p := &i;
+  (*p)++;
+  assert(i == 3);
+}
+
+private proc test_short_circuit() {
+  b := first_short_circuit() || second_short_circuit() && third_short_circuit() || false && true || false;
+  assert(b == true);
+  assert(g_short_circuit_side_effect == 3);
+
+  v: int;
+  if (true || false && false) {
+    v = 10;
+  } else {
+    v = 6;
+  }
+  assert(v == 10);
+}
+
+private proc first_short_circuit() -> bool {
+  return true;
+}
+
+private global g_short_circuit_side_effect := 3;
+
+private proc second_short_circuit() -> bool {
+  g_short_circuit_side_effect = 23;
+  return true;
+}
+
+private proc third_short_circuit() -> bool {
+  return false;
+}
+
+private proc test_shifts() {
+  left := 2 << 1;
+  assert(left == 4);
+  right := 4 >> 1;
+  assert(right == 2);
+}
+
+private proc test_size_of() {
+  assert(size_of(:u32) == 4);
+  assert(size_of(:string) == 16);
+  assert(size_of(3 + 4 * 9) == 8);
+  assert(size_of(false) == 1);
+  assert(size_of(test_size_of) == 8);
+}
+
+private struct Compound_Bar {
+  i: int,
+}
+
+private struct Compound_Foo {
+  s: cstring,
+  i: int,
+  b: Compound_Bar,
+}
+
+private proc test_compound() {
+  foo := Compound_Foo{"Foo", 78, {23}};
+  assert(foo.i == 78);
+  assert(foo.b.i == 23);
+
+  array := (:[...]int){1, 2, 3, 4};
+  assert(array[0] == 1);
+  assert(array[1] == 2);
+  assert(array[2] == 3);
+  assert(array[3] == 4);
+}

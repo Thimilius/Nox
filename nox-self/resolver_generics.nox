@@ -1,0 +1,906 @@
+import "std:strings"
+
+/**
+* Represents a generic contxt.
+*/
+internal struct Generic_Context {
+  type_names: [dynamic]string,   // The names of the generic type parameters.
+  generic_types: [dynamic]*Type, // The types to instantiate for the generic type parameters.
+}
+
+/**
+* Represents an instantiated generic routine.
+*/
+internal struct Instantiated_Generic_Routine {
+  generic_types: [dynamic]*Type, // The generic types used to instantiate the routine.
+  symbol: *Symbol,               // The symbol of the instantiated routine.
+}
+
+/**
+* Represents a nested index for resolving generic type parameters.
+*/
+private struct Nested_Index {
+  kind: Type_Specification_Kind, // The kind of the type specification that got resolved.
+  index: int,                    // The resolved nested index (semantics depend on the type specification kind).
+}
+
+/**
+* Represents a generic type parameter to infer.
+*/
+private struct Parameter_To_Infer {
+  argument_index: int,                   // The index of the argument that gets used to infer the parameter.
+  generic_type_index: int,               // The index of the generic type that needs to be inferred.
+
+  // This dynamic array tells us how deep we need to look in a type to find the actual generic type parameter.
+  // This is necessary to automatically infer the generic type parameter in complex scenarios.
+  // For example: proc foo!(T1, T2)(f: Foo!(Foo!(T1)), i: []*T2).
+  // Here T1 and T2 are nested inside other type specifications and the indices tell us where to look.
+  // That means the actual semantic of an index depends on the type we currently look in.
+  // To properly check we are looking into the correct type the nested index stores the kind of the type specification it came from with it.
+  nested_indices: [dynamic]Nested_Index, // The indices that are needed to resolve nested types.
+}
+
+implement Resolver {
+
+  /**
+  * Gets the generic type corresponding to a generic type parameter name.
+  * 
+  * @param generic_context The generic context to look in.
+  * @param name            The name of the generic type parameter.
+  * @return The generic type.
+  */
+  internal proc resolve_generic_type_by_name(generic_context: Generic_Context, name: string) -> *Type {
+    foreach (generic_type_name, i in generic_context.type_names) {
+      if (generic_type_name == name) {
+        return generic_context.generic_types[i];
+      }
+    }
+    return null;
+  }
+
+  /**
+  * Resolves a generic type specification name.
+  *
+  * @param symbol             The generic symbol.
+  * @param type_specification The generic type specification to resolve.
+  * @param generic_contex     The generic context to use.
+  * @return The resolved generic type.
+  */
+  internal proc resolve_generic_type_specification_name(symbol: *Symbol, type_specification: *Type_Specification_Name, generic_context: Generic_Context) -> *Type {
+    type_specification := cast(*Type_Specification_Name) type_specification;
+
+    declaration := symbol.declaration;
+    generic_type_names: [dynamic]string;
+    if (declaration.kind == .Struct) {
+      generic_type_names = (cast(*Declaration_Struct) declaration).generic_type_names;
+    } else if (declaration.kind == .Type_Alias) {
+      generic_type_names = (cast(*Declaration_Type_Alias) declaration).generic_type_names;
+    }
+
+    if (length(generic_type_names) != length(type_specification.generic_types)) {
+      report_error_fatal(
+        type_specification.position,
+        "Non-matching number of generic type parameters. Expected % got %",
+        length(generic_type_names),
+        length(type_specification.generic_types),
+      );
+    }
+
+    is_uninstantiated_generic := false;
+    generic_types := array_make!(*Type)(0, length(generic_type_names), context.temporary_allocator);
+    foreach (generic_type_spec in type_specification.generic_types) {
+      generic_type := self.resolve_type_specification(generic_type_spec, generic_context);
+      if (has_flag(generic_type.flags, .Uninstantiated_Generic)) {
+        is_uninstantiated_generic = true;
+      }
+      array_add(&generic_types, generic_type);
+    }
+
+    if (declaration.kind == .Struct) {
+      storage := context.storage;
+      instantiated_type := storage.get_cached_type_instantiated(symbol.type, generic_types);
+      if (instantiated_type != null) {
+        return instantiated_type;
+      }
+
+      // We need to copy the temporarily allocated generic types to a permament array that the instantiated type can hold.
+      instantiated_generic_types := array_make!(*Type)(0, length(generic_types));
+      foreach (generic_type in generic_types) {
+        array_add(&instantiated_generic_types, generic_type);
+      }
+
+      instantiated_type = context.storage.make_type_instantiated(symbol, instantiated_generic_types);
+
+      instantiated_symbol := symbol_make(self, symbol.kind, .Public, symbol.package_file, instantiated_type.name, declaration);
+      instantiated_symbol.state = .Resolved;
+      set_flag(&instantiated_symbol.flags, .Reachable);
+      if (is_uninstantiated_generic) {
+        set_flag(&instantiated_symbol.flags, .Uninstantiated_Generic);
+      }
+      instantiated_type.symbol = instantiated_symbol;
+      instantiated_symbol.type = instantiated_type;
+
+      return instantiated_type;
+    } else if (declaration.kind == .Type_Alias) {
+      aliased_type := cast(*Type_Specification) (cast(*Declaration_Type_Alias) declaration).type;
+
+      // It is very important that we resolve the instantiated type alias with the correct package set.
+      // Meaning the package in which the uninstantiated symbol was declared in.
+      // Otherwise we will fail to resolve the correct types.
+      previous_package := package_enter(symbol.package_file.package);
+      new_generic_context: Generic_Context;
+      new_generic_context.generic_types = generic_types;
+      new_generic_context.type_names = generic_type_names;
+      type := self.resolve_type_specification(aliased_type, new_generic_context);
+      package_leave(previous_package);
+
+      return type;
+    } else {
+      assert(false);
+      return null;
+    }
+  }
+
+  /**
+  * Resolves a generic expression call.
+  *
+  * @param expression             The generic expression call.
+  * @param statement_context      The statement context to use.
+  * @param routine_type           The type of the uninstantiated routine.
+  * @param uninstantiated_routine The symbol of the uninstantiated routine.
+  * @return The resolved generic routine.
+  */
+  internal proc resolve_generic_expression_call(
+    expression: *Expression_Call,
+    statement_context: Statement_Context,
+    routine_type: *Type_Routine,
+    uninstantiated_routine: *Symbol,
+  ) -> *Type_Routine {
+    // For generic routines, We need to:
+    //   1. Try to infer generic types if none are provided.
+    //   2. Resolve the generic types that are used in the function call.
+    //   3. Check if we have already instantiated the generic routine with the same generic type combination and if so use this cached version.
+    //   4. If no cached version is available create a new symbol to hold the instantiated routine.
+    //   5. Clone the routine declaration of the uninstantiated symbol.
+    //   6. Actually instantiate the routine by replacing all generic type names in the cloned declaration with the actual type specification being used.
+    //   7. For all cloned generic type specifications we need to set the overwrite type so that symbols we referred to from different packages are handled correctly.
+    //   8. Validate the generic types againts the provided constraints (can't be done sooner as they need to be instantiated themselves).
+    //   9. Lastly we need to overwrite the resolved symbol for the expression we are trying to call.
+    
+    call_expression := cast(*Expression) expression.expression;
+    if (call_expression.kind != .Name && call_expression.kind != .Member) {
+      report_error_fatal(call_expression.position, "Can only call generic procedures or functions by name");
+    }
+
+    declaration := cast(*Declaration_Routine) uninstantiated_routine.declaration;
+    generic_type_names := declaration.generic_type_names;
+
+    generic_type_specifications: [dynamic]*Type_Specification;
+    if (call_expression.kind == .Name) {
+      generic_type_specifications = (cast(*Expression_Name) call_expression).generic_types;
+    } else {
+      generic_type_specifications = (cast(*Expression_Member) call_expression).generic_types;
+    }
+
+    should_infer_generic_types := length(generic_type_specifications) == 0;
+    generic_types: [dynamic]*Type;
+    if (should_infer_generic_types) {
+      self.infer_generic_types_from_arguments(expression, statement_context, routine_type, declaration, &generic_types);
+    } else {
+      if (length(generic_type_names) != length(generic_type_specifications)) {
+        report_error_fatal(
+          expression.position,
+          "Generic routine call with invalid type arguments. Expected % got %",
+          length(generic_type_names),
+          length(generic_type_specifications),
+        );
+      }
+
+      foreach (generic_type_spec in generic_type_specifications) {
+        // Nested generics should not need to be handled here.
+        // The instantiation of generics already properly resolves all calls to nested generic routines.
+        generic_type := self.resolve_type_specification(generic_type_spec);
+        array_add(&generic_types, generic_type);
+      }
+    }
+
+    // At this point we should have a proper mapping between generic type names and their corresponding resolved types.
+    assert(length(generic_type_names) == length(generic_types));
+
+    instantiated_routine := self.get_instantiated_generic_routine(uninstantiated_routine, generic_types);
+    uninstantiated_package_file := uninstantiated_routine.package_file;
+    needs_to_instantiate_routine := instantiated_routine == null;
+
+    if (needs_to_instantiate_routine) {
+      instantiated_routine = self.make_instantiated_routine_symbol(uninstantiated_routine, generic_types);
+
+      // We allocate the instantiated AST in the package file of the uninstantiated symbol.
+      ast_allocator := uninstantiated_package_file.ast_allocator;
+
+      instantiated_declaration := ast_clone_declaration_routine(cast(*Declaration) declaration, ast_allocator);
+
+      generic_type_specifications_to_instantiate := generic_type_specifications;
+      if (should_infer_generic_types) {
+        // We need to create type specifications for our inferred types.
+        // For that we have to remember to use the AST allocator from the uninstanted symbol.
+        new_context := *context;
+        new_context.allocator = ast_allocator;
+        push_context (new_context) {
+          foreach (generic_type in generic_types) {
+            generic_type_specification := self.make_type_specification_from_type(generic_type, expression.position);
+            array_add(&generic_type_specifications_to_instantiate, generic_type_specification);
+          }
+        }
+      } else {
+        assert(length(generic_types) == length(generic_type_specifications_to_instantiate));
+        // This is necessary so that symbols in different packages do not need to be resolved from inside the package the instantiated routine lives in.
+        foreach (generic_type_specification, i in generic_type_specifications_to_instantiate) {
+          self.set_overwrite_type_for_generic_type_specification(generic_type_specification, generic_types[i]);
+        }
+      }
+
+      instantiation_context := Instantiation_Context{generic_type_names, generic_type_specifications_to_instantiate};
+      ast_instantiate_declaration_routine(instantiated_declaration, instantiation_context, ast_allocator);
+      if (should_infer_generic_types) {
+        // No destroying of 'generic_type_specifications' necessary here because we have a dedicated AST allocator.
+        array_destroy(&generic_type_specifications_to_instantiate);
+      }
+
+      instantiated_routine.declaration = instantiated_declaration; 
+      array_add(&instantiated_routine.package_file.declarations, instantiated_declaration);
+
+      instantiated_generic_routines, _ := map_get(&self.instantiated_generic_routines,uninstantiated_routine);
+      array_add(&instantiated_generic_routines, {generic_types, instantiated_routine});
+      map_set(&self.instantiated_generic_routines, uninstantiated_routine, instantiated_generic_routines);
+
+      self.resolve_symbol(instantiated_routine); 
+    }
+
+    self.check_generic_constraints(expression.position, instantiated_routine.declaration, uninstantiated_package_file, generic_type_names, generic_types);
+
+    if (!needs_to_instantiate_routine) {
+      // We have to check for cyclic dependencies here as this might happen in case we are using the generic routine as a default parameter initializer.
+      if (instantiated_routine.state == .Resolving) {
+        report_error_fatal(instantiated_routine.declaration.position, "Cyclic dependency of symbol: '%v'", instantiated_routine.name);
+      }
+      array_destroy(&generic_types);
+    }
+
+    // We update the expression so that it refers to the instantiated symbol instead of the uninstantiated one.
+    self.set_resolved_symbol(call_expression, instantiated_routine);
+    self.set_resolved_type(call_expression, instantiated_routine.type);
+
+    return cast(*Type_Routine) instantiated_routine.type;
+  }
+
+  /**
+  * Infers generic type parameters for a generic routine from provided arguments.
+  *
+  * @param expression        The generic expression call.
+  * @param statement_context The statement context to use.
+  * @param routine_type      The type of the uninstantiated routine.
+  * @param declaration       The declaration of the uninstantiated routine.
+  * @param generic_types     The generic types that will be inferred and filled in.
+  */
+  private proc infer_generic_types_from_arguments(
+    expression: *Expression_Call,
+    statement_context: Statement_Context,
+    type_routine: *Type_Routine,
+    declaration: *Declaration_Routine,
+    generic_types: *[dynamic]*Type,
+  ) {
+    parameters_to_infer := array_make!(Parameter_To_Infer)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+
+    nested_indices := array_make!(Nested_Index)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+    foreach (parameter, i in declaration.parameters) {
+      // We only have to look at parameters which are not yet instantiated.
+      if (has_flag(type_routine.parameters[i].type.flags, .Uninstantiated_Generic)) {
+        self.try_infer_type_for_parameter(parameter.type, i, declaration.generic_type_names, &parameters_to_infer, &nested_indices, .None, -1);
+      }
+    }
+
+    if (length(parameters_to_infer) == 0 || length(parameters_to_infer) != length(declaration.generic_type_names)) {
+      report_error_fatal(expression.position, "Cannot automatically infer generic type parameters");
+    }
+
+    has_params := has_flag(type_routine.routine_flags, .Has_Params);
+    params_index := length(type_routine.parameters) - 1;
+    params_arguments_count := length(expression.arguments) - params_index;
+
+    // We can't infer the generic type parameter for the params parameter if we don't get an argument for it.
+    if (has_params && length(expression.arguments) <= params_index) {
+      report_error_fatal(expression.position, "Cannot automatically infer generic type parameters");
+    }
+
+    *generic_types = array_make!(*Type)(length(parameters_to_infer), length(parameters_to_infer));
+    foreach (parameter_to_infer in parameters_to_infer) {
+      parameter := declaration.parameters[parameter_to_infer.argument_index];
+      is_default_parameter := parameter.initializer != null;
+
+      generic_type: *Type;
+      if (is_default_parameter) {
+        initializer := self.resolve_expression(parameter.initializer, statement_context);
+        operand_remove_untyped(parameter.position, &initializer);
+        generic_type = initializer.type;
+      } else {
+        if (parameter_to_infer.argument_index >= length(expression.arguments)) {
+          expected_parameter_count := length(declaration.parameters);
+          foreach (parameter in declaration.parameters) {
+            if(parameter.initializer != null) {
+              expected_parameter_count -= 1;
+            }
+          }
+          if (has_params) then expected_parameter_count -= 1;
+          report_error_fatal(expression.position, "Routine call with too few arguments. Expected % got %", expected_parameter_count, length(expression.arguments));
+        }
+
+        argument := expression.arguments[parameter_to_infer.argument_index];
+        argument_operand := self.resolve_expression(argument, statement_context);
+        operand_remove_untyped(argument.position, &argument_operand);
+        argument_type := argument_operand.type;
+
+        // We have to explicitly handle 'null' as that is the only untyped type which we can never infer.
+        if (argument_type.is_untyped_null()) {
+          report_error_fatal(argument.position, "Cannot automatically infer generic type parameter from 'null'");
+        }
+
+        nested_indices := parameter_to_infer.nested_indices;
+
+        // We have to check the params type explicitly.
+        if (has_params && parameter_to_infer.argument_index == params_index) {
+          assert(length(nested_indices) >= 1);
+          if (params_arguments_count == 1) {
+            if (argument_type.is_slice()) {
+              generic_type = argument_type.base;
+            } else {
+              generic_type = argument_type;
+            }
+          } else {
+            generic_type = argument_type;
+          }
+        } else {
+          generic_type = self.try_get_nested_generic_type(argument_type, &nested_indices, length(nested_indices));
+          if (generic_type == null) {
+            parameter_type := type_routine.parameters[parameter_to_infer.argument_index].type;
+            report_error_fatal(
+              argument.position,
+              "Invalid type in %. routine call argument. Expected '%' got '%'",
+              parameter_to_infer.argument_index + 1,
+              parameter_type.name,
+              argument_type.name,
+            ); 
+          }
+        }
+      }
+
+      generic_types[parameter_to_infer.generic_type_index] = generic_type;
+
+      array_destroy(&parameter_to_infer.nested_indices);
+    }
+  }
+
+  /**
+  * Recursively tries to infer the (possibly nested) generic type parameter.
+  *
+  * @param type_spec           The type specification of the parameter to infer.
+  * @param parameter_index     The index of the parameter.
+  * @param generic_type_names  The names of the generic type parameters.
+  * @param parameters_to_infer The parameters to infer that will get filled in.
+  * @param nested_indices      The nested indices that will be filled while trying to infer.
+  * @param nested_kind         The kind of the current nested type.
+  * @param nested_index        The index of the current nested type (semantics depend on the kind).
+  */
+  private proc try_infer_type_for_parameter(
+    type_specification: *Type_Specification,
+    parameter_index: int,
+    generic_type_names: [dynamic]string,
+    parameters_to_infer: *[dynamic]Parameter_To_Infer,
+    nested_indices: *[dynamic]Nested_Index,
+    nested_kind: Type_Specification_Kind,
+    nested_index: int,
+  ) {
+    array_add(nested_indices, {nested_kind, nested_index});
+    defer array_pop(nested_indices);
+
+    kind := type_specification.kind;
+    switch (kind) {
+      case .Name: {
+        type_specification := cast(*Type_Specification_Name) type_specification;
+        foreach (generic_type_name, generic_type_name_index in generic_type_names) {
+          if (generic_type_name == type_specification.name) {
+            // We do not want to infer types multiple times.
+            foreach (parameter_to_infer in parameters_to_infer) {
+              if (parameter_to_infer.generic_type_index == generic_type_name_index) {
+                return;
+              }
+            }
+
+            // We skip the first index when copying as it contains the '-1' index from the first recursive call which we do not want.
+            nested_indices_copy := array_make!(Nested_Index)(0, length(nested_indices) - 1);
+            for (i := 1; i < length(nested_indices); i++) {
+              array_add(&nested_indices_copy, nested_indices[i]);
+            }
+            array_add(parameters_to_infer, {parameter_index, generic_type_name_index, nested_indices_copy});
+            return;
+          }
+
+          // The generic type may be nested inside.
+          foreach (generic_type, generic_index in type_specification.generic_types) {
+            self.try_infer_type_for_parameter(generic_type, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, generic_index);
+          }
+        }
+      }
+      case .Pointer: {
+        type_specification := cast(*Type_Specification_Pointer) type_specification;
+        base := cast(*Type_Specification) type_specification.base;
+        self.try_infer_type_for_parameter(base, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 0);
+
+        relative_base := cast(*Type_Specification) type_specification.relative_base;
+        if (relative_base != null) {
+          self.try_infer_type_for_parameter(relative_base, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 1);
+        }
+      }
+      case .Array: {
+        type_specification := cast(*Type_Specification_Array) type_specification;
+        base := cast(*Type_Specification) type_specification.base;
+        self.try_infer_type_for_parameter(base, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 0);
+      }
+      case .Slice: {
+        type_specification := cast(*Type_Specification_Slice) type_specification;
+        base := cast(*Type_Specification) type_specification.base;
+        self.try_infer_type_for_parameter(base, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 0);
+      }
+      case .Map: {
+        type_specification := cast(*Type_Specification_Map) type_specification;
+        key := cast(*Type_Specification) type_specification.key;
+        self.try_infer_type_for_parameter(key, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 0);
+        value := cast(*Type_Specification) type_specification.value;
+        self.try_infer_type_for_parameter(value, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, 1);
+      }
+      case .Tuple: {
+        type_specification := cast(*Type_Specification_Tuple) type_specification;
+        foreach (element, element_index in type_specification.elements) {
+          self.try_infer_type_for_parameter(element, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, element_index);
+        }
+      }
+
+      case .Procedure, .Function: {
+        type_specification := cast(*Type_Specification_Routine) type_specification;
+        parameter_count := length(type_specification.parameters);
+        foreach (parameter, p_index in type_specification.parameters) {
+          self.try_infer_type_for_parameter(parameter, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, p_index);
+        }
+
+        return_type := cast(*Type_Specification) type_specification.return_type;
+        if (return_type != null) {
+          self.try_infer_type_for_parameter(return_type, parameter_index, generic_type_names, parameters_to_infer, nested_indices, kind, parameter_count);
+        }
+      }
+
+      case .None: fallthrough;
+      case: assert(false);
+    }
+  }
+
+  /**
+  * Recursively tries to get the nested generic type from a provided argument.
+  *
+  * @param type           The type of the provided argument.
+  * @param nested_indices The nested indices to use.
+  * @param nested_depth   The current nested depth.
+  * @return The nested generic type (or null if none can be found).
+  */
+  private proc try_get_nested_generic_type(type: *Type, nested_indices: *[dynamic]Nested_Index, nested_depth: int) -> *Type {
+    if (nested_depth == 0) then return type;
+
+    // The nested indices have been added as a stack, so we know we can always look at the front when removing it at the same time.
+    nested_index := nested_indices[length(nested_indices) - nested_depth];
+
+    nested_type: *Type;
+    switch (type.kind) {
+      case .Pointer: {
+        if (nested_index.kind != .Pointer) then return null;
+        nested_type = type.base;
+      }
+      case .Array, .Dynamic_Array, .Slice: {
+        if (type.kind == .Slice) {
+          if (nested_index.kind != .Slice) then return null;
+        } else {
+          if (nested_index.kind != .Array) then return null;
+        }
+
+        if (type.is_soa_or_aosoa()) {
+          nested_type = type.base.base;
+        } else {
+          nested_type = type.base;
+        }
+      }
+      case .Self_Relative_Pointer, .Offset_Relative_Pointer: {
+        if (nested_index.kind != .Pointer) then return null;
+        type := cast(*Type_Relative_Pointer) type;
+        nested_type = nested_index.index == 0 ? type.base : type.relative_base;
+      }
+      case .Map: {
+        if (nested_index.kind != .Map) then return null;
+        type := cast(*Type_Map) type;
+        nested_type = nested_index.index == 0 ? type.key : type.value;
+      }
+      case .Tuple: {
+        if (nested_index.kind != .Tuple) then return null;
+        type := cast(*Type_Tuple) type;
+        nested_type = type.elements[nested_index.index].type;
+      }
+      case .Struct: {
+        if (nested_index.kind != .Name) then return null;
+        type := cast(*Type_Struct) type;
+        if (nested_index.index >= length(type.generic_types)) then return null;
+        nested_type = type.generic_types[nested_index.index];
+      }
+
+      case .Procedure, .Function: {
+        if (type.kind == .Procedure) {
+          if (nested_index.kind != .Procedure) then return null;
+        } else {
+          if (nested_index.kind != .Function) then return null;
+        }
+        type := cast(*Type_Routine) type;
+        parameter_count := length(type.parameters);
+        if (nested_index.index == parameter_count) {
+          nested_type = type.return_type;
+        } else {
+          nested_type = type.parameters[nested_index.index].type;
+        }
+      }
+    }
+
+    if (nested_type == null) {
+      // If we get here we know that the type passed can't possibly be the required parameter type.
+      // That is, we have run out of nested types to look in.
+      return null;
+    } else {
+      return self.try_get_nested_generic_type(nested_type, nested_indices, nested_depth - 1);
+    }
+  }
+
+  /**
+  * Tries to get the instantiated routine for an uninstantiated routine based on given generic type parameters.
+  *
+  * @param uninstantiated_symbol The uninstantiated symbol
+  * @param generic_types         The generic types of the instantiated version.
+  */
+  private proc get_instantiated_generic_routine(uninstantiated_symbol: *Symbol, generic_types: [dynamic]*Type) -> *Symbol {
+    instantiated_generic_routines, found := map_get(&self.instantiated_generic_routines, uninstantiated_symbol);
+    if (found) {
+      foreach (instantiated_generic_routine in instantiated_generic_routines) {
+        assert(length(instantiated_generic_routine.generic_types) == length(generic_types));
+        found_instantiated := true;
+        foreach (generic_type, i in instantiated_generic_routine.generic_types) {
+          if (generic_type != generic_types[i]) {
+            found_instantiated = false;
+            break;
+          }
+        }
+        if (found_instantiated) then return instantiated_generic_routine.symbol;
+      }
+    }
+    return null;
+  }
+
+  /**
+  * Makes a symbol for an instantiated routine.
+  *
+  * @param uninstantiated_symbol The uninstantiated symbol
+  * @param generic_types         The generic types of the instantiated version.
+  * @return The instantiated routine symbol.
+  */
+  private proc make_instantiated_routine_symbol(uninstantiated_routine: *Symbol, generic_types: [dynamic]*Type) -> *Symbol {
+    builder := strings.builder_make(self.name_allocator);
+    builder.write_string(uninstantiated_routine.name);
+    builder.write_string("!(");
+    foreach (generic_type, i in generic_types) {
+      builder.write_string(generic_type.name);
+      if (i < length(generic_types) - 1) {
+        builder.write_string(", ");
+      }
+    }
+    builder.write_string(")");
+    instantiated_symbol_name := builder.to_string();
+
+    instantiated_symbol := symbol_make(
+      self,
+      uninstantiated_routine.kind,
+      .Public,
+      uninstantiated_routine.package_file,
+      instantiated_symbol_name,
+      uninstantiated_routine.declaration,
+    );
+
+    // We need to copy over all relevant flags and the value as that is needed when the generic is a method.
+    instantiated_symbol.flags = uninstantiated_routine.flags;
+    remove_flag(&instantiated_symbol.flags, .Uninstantiated_Generic);
+    remove_flag(&instantiated_symbol.flags, .Reachable);
+    set_flag(&instantiated_symbol.flags, .Routine_Instantiated);
+    instantiated_symbol.value = uninstantiated_routine.value;
+
+    return instantiated_symbol;
+  }
+
+
+  /**
+  * Makes a type specification from a type.
+  *
+  * @param type     The type to get the specification of.
+  * @param position The generic types of the instantiated version.
+  * @return The specification corresponding to the type.
+  */
+  private proc make_type_specification_from_type(type: *Type, position: Source_Position) -> *Type_Specification {
+    switch (type.kind) {
+      case .B8, .B16, .B32, .B64, .Bool: fallthrough;
+      case .I8, .I16, .I32, .I64, .Int, .U8, .U16, .U32, .U64, .UInt: fallthrough;
+      case .Char, .F32, .F64, .Enumeration: fallthrough;
+      case .String, .CString, .Rawptr, .Constant, .Struct, .Union, .Any, .Typeid, .Interface: {
+        type_name := type.name;
+        // The type named might contain nested generic type parameters which we do not care about.
+        // We only want the name without all generics.
+        name_index_generic_parameters := strings.first_index_of(type_name, "!");
+        if (name_index_generic_parameters != -1) {
+          type_name = type_name[:name_index_generic_parameters];
+        }
+
+        type_specification := cast(*Type_Specification_Name) ast_type_specification_make_name(position, "", type_name, {});
+
+        // This is necessary so that symbols in different packages do not need to be resolved from inside the package the instantiated routine lives in.
+        type_specification.overwrite_type = type;
+
+        generic_types: [dynamic]*Type_Specification;
+        if (type.is_struct()) {
+          type_struct := cast(*Type_Struct) type;
+          foreach (generic_type in type_struct.generic_types) {
+            array_add(&generic_types, self.make_type_specification_from_type(generic_type, position));
+          }
+        }
+        type_specification.generic_types = generic_types;
+
+        return cast(*Type_Specification) type_specification;
+      }
+
+      case .Pointer, .Self_Relative_Pointer, .Offset_Relative_Pointer, .SoA_Layout_Pointer, .AoSoA_Layout_Pointer, .Dynamic_Pointer: {
+        base := self.make_type_specification_from_type(type.base, position);
+
+        pointer_kind: Type_Specification_Pointer_Kind;
+        switch (type.kind) {
+          case .Pointer:                 pointer_kind = .Absolute;
+          case .Self_Relative_Pointer:   pointer_kind = .Self_Relative;
+          case .Offset_Relative_Pointer: pointer_kind = .Offset_Relative;
+          case .SoA_Layout_Pointer:      pointer_kind = .SoA_Layout;
+          case .AoSoA_Layout_Pointer:    pointer_kind = .AoSoA_Layout;
+          case .Dynamic_Pointer:         pointer_kind = .Dynamic;
+        }
+
+        relative_base: *Type_Specification;
+        if (type.kind == .Self_Relative_Pointer || type.kind == .Offset_Relative_Pointer) {
+          relative_base = self.make_type_specification_from_type((cast(*Type_Relative_Pointer) type).relative_base, position);
+        }
+        return ast_type_specification_make_pointer(position, pointer_kind, base, relative_base);
+      }
+
+      case .Array: {
+        type := cast(*Type_Array) type;
+        base_type := type.layout_info.modifier == .None ? type.base : type.base.base;
+        base := self.make_type_specification_from_type(base_type, position);
+        size_expression: *Expression;
+        if (!type.has_incomplete_elements) {
+          size_expression = ast_expression_make_integer(position, cast(u64) type.number_of_elements);
+        }
+        return ast_type_specification_make_array(position, .Fixed, type.layout_info.modifier, base, size_expression);
+      }
+      case .Dynamic_Array: {
+        type := cast(*Type_Dynamic_Array) type;
+        base_type := type.layout_info.modifier == .None ? type.base : type.base.base;
+        base := self.make_type_specification_from_type(base_type, position);
+        return ast_type_specification_make_array(position, .Dynamic, type.layout_info.modifier, base, null);
+      }
+      case .Slice: {
+        type := cast(*Type_Slice) type;
+        base_type := type.layout_info.modifier == .None ? type.base : type.base.base;
+        base := self.make_type_specification_from_type(base_type, position);
+        return ast_type_specification_make_slice(position, type.layout_info.modifier, base);
+      }
+      case .Map: {
+        type := cast(*Type_Map) type;
+        key := self.make_type_specification_from_type(type.key, position);
+        value := self.make_type_specification_from_type(type.value, position);
+        return ast_type_specification_make_map(position, key, value);
+      }
+      case .Tuple: {
+        type := cast(*Type_Tuple) type;
+        elements: [dynamic]*Type_Specification;
+        foreach (element in type.elements){
+          array_add(&elements, self.make_type_specification_from_type(element.type, position));
+        }
+        return ast_type_specification_make_tuple(position, elements);
+      }
+
+      case .Procedure, .Function: {
+        type := cast(*Type_Routine) type;
+        parameters: [dynamic]*Type_Specification;
+        foreach (parameter in type.parameters) {
+          array_add(&parameters, self.make_type_specification_from_type(parameter.type, position));
+        }
+        return_type: *Type_Specification;
+        if (!type.return_type.is_void()) {
+          return_type = self.make_type_specification_from_type(type.return_type, position);
+        }
+        kind: Type_Specification_Kind = type.kind == .Procedure ? .Procedure : .Function;
+        return ast_type_specification_make_routine(
+          kind,
+          position,
+          type.calling_convention,
+          parameters,
+          has_flag(type.routine_flags, .Has_Params),
+          has_flag(type.routine_flags, .Has_C_Varargs),
+          return_type,
+          has_flag(type.routine_flags, .Is_Pure_Function),
+        );
+      }
+
+      case .None, .Void, .Generic: fallthrough;
+      case .Untyped_Boolean, .Untyped_Integer, .Untyped_Float, .Untyped_Char, .Untyped_String, .Untyped_Null: fallthrough;
+      case: assert(false);
+    }
+
+    assert(false);
+    return null;
+  }
+
+  /** 
+  * Sets the overwritten type for a generic type specification.
+  *
+  * @param type_specification The type specification to set the overwritten type of.
+  * @param type               The overwritten type for the type specification.
+  */
+  private proc set_overwrite_type_for_generic_type_specification(type_specification: *Type_Specification, type: *Type) {
+    switch (type_specification.kind) {
+      case .Name: {
+        type_specification := cast(*Type_Specification_Name) type_specification;
+
+        if (type_specification.overwrite_type == null) {
+          type_specification.overwrite_type = type;
+        }
+      }
+      case .Pointer: {
+        type_specification := cast(*Type_Specification_Pointer) type_specification;
+        self.set_overwrite_type_for_generic_type_specification(cast(*Type_Specification) type_specification.base, type.base);
+        if ((type_specification.pointer_kind == .Self_Relative || type_specification.pointer_kind == .Offset_Relative) && type_specification.relative_base != null) {
+          type := cast(*Type_Relative_Pointer) type;
+          self.set_overwrite_type_for_generic_type_specification(cast(*Type_Specification) type_specification.relative_base, type.relative_base);
+        }
+      }
+      case .Array: {
+        type_specification := cast(*Type_Specification_Array) type_specification;
+        self.set_overwrite_type_for_generic_type_specification(cast(*Type_Specification) type_specification.base, type.base);
+      }
+      case .Slice: {
+        type_specification := cast(*Type_Specification_Slice) type_specification;
+        self.set_overwrite_type_for_generic_type_specification(cast(*Type_Specification) type_specification.base, type.base);
+      }
+      case .Map: {
+        type_specification := cast(*Type_Specification_Tuple) type_specification;
+        foreach (element, i in type_specification.elements) {
+          self.set_overwrite_type_for_generic_type_specification(element, (cast(*Type_Tuple)type).elements[i].type);
+        }
+      }
+      case .Procedure, .Function: {
+        type_specification := cast(*Type_Specification_Routine) type_specification;
+        type_routine := cast(*Type_Routine) type;
+        foreach (parameter, i in type_specification.parameters) {
+          self.set_overwrite_type_for_generic_type_specification(parameter, type_routine.parameters[i].type);
+        }
+        self.set_overwrite_type_for_generic_type_specification(cast(*Type_Specification) type_specification.return_type, type_routine.return_type);
+      }
+
+      case .None: fallthrough;
+      case: assert(false);
+    }
+  }
+
+  /**
+  * Resolves the constraints for a generic routine.
+  *
+  * @param position                    The position of the generic constraints.
+  * @param instantiated_declaration    The declaration of the instantiated routine.
+  * @param uninstantiated_package_file The package file of the uninstantiated routine.
+  * @param generic_type_names          The generic type names of the generic routine.
+  * @param generic_types               The instantiated generic types of the generic routine.
+  */
+  private proc check_generic_constraints(
+    position: Source_Position,
+    instantiated_declaration: *Declaration,
+    uninstantiated_package_file: *Package_File,
+    generic_type_names: [dynamic]string,
+    generic_types: [dynamic]*Type,
+  ) {
+    instantiated_declaration := cast(*Declaration_Routine) instantiated_declaration;
+
+    foreach (generic_constraint, i in instantiated_declaration.generic_constraints) {
+      fulfills_constraint := false;
+
+      switch (generic_constraint.kind) {
+        case .Expression: {
+          constraint_expression := generic_constraint.value.(Declaration_Routine_Generic_Constraint_Expression);
+
+          // We have to remeber that we are currently inside the block of some routine.
+          // That means we first have to enter the correct package in which the uninstantiated routine resides.
+          // Additionally the constraint should not have access to the current local scope.
+          previous_local_scope := self.local_scope;
+          self.local_scope = null;
+          previous_package := package_enter(uninstantiated_package_file.package);
+          operand := self.resolve_expression_constant(constraint_expression.expression, statement_context_default());
+          package_leave(previous_package);
+          self.local_scope = previous_local_scope;
+
+          if (!self.operand_convert(constraint_expression.expression.position, &operand, context.storage.type_bool)) {
+            report_error_fatal(constraint_expression.expression.position, "Generic expression constraint must be a boolean type");
+          }
+          fulfills_constraint = operand.value.(bool);
+        }
+        case .Interface: {
+          constraint_interface := generic_constraint.value.(Declaration_Routine_Generic_Constraint_Interface);
+
+          generic_type_index := -1;
+          foreach (generic_type_name, i in generic_type_names) {
+            if (generic_type_name == constraint_interface.generic_type_name) {
+              generic_type_index = i;
+            }
+          }
+
+          if (generic_type_index == -1) {
+            report_error_fatal(
+              generic_constraint.position,
+              "Interface constraint references undeclared generic type name '%'",
+              constraint_interface.generic_type_name,
+            );
+          }
+
+          generic_type := generic_types[generic_type_index];
+
+          interface_type := self.resolve_type_specification(constraint_interface.type);
+          // For now we just allow interfaces as type constraints.
+          // Anything else does not really makes sense right now.
+          if (!interface_type.is_interface()) {
+            report_error_fatal(constraint_interface.type.position, "Type constraint must be an interface. Got '%'", interface_type.name);
+          }
+
+          foreach (inter in generic_type.interfaces) {
+            if (interface_type == inter) {
+              fulfills_constraint = true;
+              break;
+            }
+          }
+        }
+        case: assert(false);
+      }
+
+      if (!fulfills_constraint) {
+        report_error_fatal(position, "The %. generic constraint of routine '%' ist not fullfilled", i + 1, instantiated_declaration.name);
+      }
+    }
+  }
+
+  /**
+  * Checks for duplicate generic type names.
+  *
+  * @param position   The position of the generic type names.
+  * @parma type_names The generic type names to check.
+  */
+  internal proc check_for_duplicate_generic_type_names(position: Source_Position, type_names: [dynamic]string) {
+    for (i := 0; i < length(type_names) - 1; i += 1) {
+      type_name_a := type_names[i];
+      type_name_b := type_names[i + 1];
+      if (type_name_a == type_name_b) {
+        report_error_fatal(position, "Duplicate generic type parameter '%'", type_name_a);
+      }
+    }
+  }
+
+}

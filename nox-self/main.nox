@@ -1,0 +1,26 @@
+import "std:memory"
+
+/**
+* Main entry point.
+*/
+internal proc main() {
+  new_context := *context;
+  #if (NOX_DEBUG) {
+    allocator: memory.Tracking_Allocator;
+    memory.tracking_allocator_init(&allocator);
+    new_context.allocator = memory.tracking_allocator(&allocator);
+  }
+  
+  push_context (new_context) {
+    nox_main();
+  }
+
+  #if (NOX_DEBUG) {
+    foreach (_, allocation in allocator.allocations) {
+      report_colored(.Red, "Compiler leaked: %", allocation);
+    }
+    foreach (bad_free in allocator.bad_frees) {
+      report_colored(.Red, "Compiler badly freed: %", bad_free);
+    }
+  }
+}

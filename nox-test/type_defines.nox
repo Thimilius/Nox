@@ -1,0 +1,30 @@
+/**
+* Test the functionality of type defines.
+*/
+internal proc test_type_defines() {
+  b: Typed_Struct = {23};
+  assert(b.i == 23);
+
+  a: Array = {1, 3, 4};
+  assert(a[0] == 1);
+  assert(a[1] == 3);
+  assert(a[2] == 4);
+  
+  m: My_Type = 123;
+  assert(m == 123);
+
+  mm: My_Type_Type = 13;
+  assert(mm == 13);
+
+  v := cast(My_Type) mm;
+  assert(v == 13);
+}
+
+private struct Normal_Struct {
+  i: int,
+}
+
+private type_define Typed_Struct := Normal_Struct;
+private type_define My_Type := int;
+private type_define My_Type_Type := My_Type;
+private type_define Array := [3]int;

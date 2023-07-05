@@ -1,0 +1,46 @@
+/**
+* Test the functionality of interfaces.
+*/
+public proc test_interfaces() {
+  test_interfaces_simple();
+  test_interfaces_dynamic_pointers();
+}
+
+private proc test_interfaces_simple() {
+  foo: Foo_Implementing_IFoo = {13};
+  assert(foo.sum(7) == 20);
+
+  assert(generic_taking_interface(foo) == 20);
+}
+
+private interface IFoo {
+  private proc sum(i: int) -> int
+}
+
+private struct Foo_Implementing_IFoo {
+  data: int,
+}
+
+implement IFoo for Foo_Implementing_IFoo {
+
+  private proc sum(i: int) -> int {
+    return self.data + i;
+  }
+
+}
+
+private proc generic_taking_interface!(T)(foo: T) -> int where T : IFoo {
+  return foo.sum(7);
+}
+
+private proc test_interfaces_dynamic_pointers() {
+  foo: Foo_Implementing_IFoo = {13};
+  p: dynamic*IFoo = &foo;
+  assert(p.sum(7) == 20);
+
+  taking_dynamic_pointer(&foo);
+}
+
+private proc taking_dynamic_pointer(p: dynamic*IFoo) {
+  assert(p.sum(3) == 16);
+}

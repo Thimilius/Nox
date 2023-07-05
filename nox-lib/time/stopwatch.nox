@@ -1,0 +1,125 @@
+/**
+* Represents a stopwatch for timings.
+*/
+public struct Stopwatch {
+  private running: bool,         // Is the stopwatch running?
+  private start_time: i64,       // The time at which the stopwatch was started.
+  public accumulation_time: i64, // The accumulated time of the stopwatch.
+}
+
+/**
+* Constant for one nanosecond.
+*/
+public const Nanosecond: i64 = 1;
+/**
+* Constant for one microsecond.
+*/
+public const Microsecond: i64 = 1000 * Nanosecond;
+/**
+* Constant for one millisecond.
+*/
+public const Millisecond: i64 = 1000 * Microsecond;
+/**
+* Constant for one second.
+*/
+public const Second: i64 = 1000 * Millisecond;
+/**
+* Constant for one minute.
+*/
+public const Minute: i64 = 60 * Second;
+/**
+* Constant for one hour.
+*/
+public const Hour: i64 = 60 * Minute;
+
+implement Stopwatch {
+
+  /**
+  * Starts the stopwatch.
+  */
+  public proc start() {
+    if (!self.running) {
+      self.running = true;
+      self.start_time = get_now();
+    }
+  }
+
+  /**
+  * Stops the stopwatch.
+  */
+  public proc stop() {
+    if (self.running) {
+      self.running = false;
+      self.accumulation_time += get_now() - self.start_time;
+    }
+  }
+
+  /**
+  * Resets the stopwatch.
+  */
+  public proc reset() {
+    self.running = false;
+    self.accumulation_time = 0;
+  }
+
+  /**
+  * Gets the accumulated time of the stopwatch in milliseconds.
+  * 
+  * * @return The accumulated time in milliseconds.
+  */
+  public func get_milliseconds() -> f64 {
+    return self.get_seconds() * 1000;
+  }
+
+  /**
+  * Gets the accumulated time of the stopwatch in seconds.
+  * 
+  * @return The accumulated time in seconds.
+  */
+  public func get_seconds() -> f64 {
+    seconds := self.accumulation_time / Second;
+    nanoseconds := self.accumulation_time % Second;
+    return cast(f64) seconds + cast(f64) nanoseconds / 1000000000;
+  }
+
+}
+
+#if (NOX_OS == .Windows) {
+
+  import "std:system/windows"
+
+  /**
+  * Gets the current time in nanoseconds.
+  * 
+  * @return The current time in nanoseconds.
+  */
+  private proc get_now() -> i64 {
+    frequency: windows.LARGE_INTEGER;
+    windows.QueryPerformanceFrequency(&frequency);
+    now: windows.LARGE_INTEGER;
+    windows.QueryPerformanceCounter(&now);
+
+    // Convert into nanoseconds.
+    quotient := cast(i64) now / cast(i64) frequency;
+    remainder := cast(i64) now % cast(i64) frequency;
+    nanoseconds := quotient * 1_000_000_000 + remainder * 1_000_000_000 / cast(i64) frequency;
+    return nanoseconds;
+  }
+
+} else {
+
+  import "std:system/unix"
+
+  /**
+  * Gets the current time in nanoseconds.
+  * 
+  * @return The current time in nanoseconds.
+  */
+  private proc get_now() -> i64 {
+    timespec: unix.Timespec;
+    unix.clock_gettime(unix.CLOCK_REALTIME, &timespec);
+    nanoseconds := timespec.tv_sec * 1_000_000_000 + timespec.tv_nsec;
+    return nanoseconds;
+  }
+  
+}

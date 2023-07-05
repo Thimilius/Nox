@@ -1,0 +1,552 @@
+import "std:io"
+import "std:memory"
+import "std:strings"
+import "std:system"
+
+/**
+* Represents the mode for loading a value.
+*/
+internal enum Loading_Mode {
+  Load_Value,   // The default for loading values with an address.
+  Load_Address, // For getting the address of a value without loading from it.
+}
+
+/**
+* Represents a local symbol for LLVM.
+*/
+internal struct LLVM_Local_Symbol {
+  llvm_value: LLVMValueRef, // The LLVM value of the local symbol.
+  llvm_type: LLVMTypeRef,   // The LLVM type of the local symbol.
+
+  type: *Type,              // The type of the local symbol.
+  is_parameter: bool,       // Is the local symbol a parameter?
+}
+
+/**
+* Represents an LLVM routine symbol and its LLVM type.
+*/
+internal struct LLVM_Routine_Tuple {
+  llvm_symbol: LLVMValueRef, // The LLVM symbol of the routine.
+  llvm_type: LLVMTypeRef,    // The LLVM type of the routine.
+}
+
+/**
+* Represents a built-in routine for LLVM.
+*/
+internal struct LLVM_Builtin_Routine {
+  symbol: *Symbol,                // The built-in symbol.
+  llvm_tuple: LLVM_Routine_Tuple, // The LLVM symbol.
+}
+
+/**
+* Represents the key for looking up a vtable. 
+*/
+internal struct VTable_Key {
+  interface_type: *Type,      // The type of the interface that gets implemented.
+  implementation_type: *Type, // The type implementing the interface.
+}
+
+/**
+* Represents the kind for a local routine scope.
+*/
+internal enum Routine_Local_Scope_Kind {
+  Block,         // A regular block.
+  Control_Block, // A block corresponding to a control statement.
+}
+
+/**
+* Represents a local routine scope.
+*/
+internal struct Routine_Local_Scope {
+  kind: Routine_Local_Scope_Kind,           // The kind of the local scope.
+  parent: *Routine_Local_Scope,             // The parent scope.
+
+  symbols: map[string]LLVM_Local_Symbol,    // The local symbols defined in this scope.
+  deferred_statements: [dynamic]*Statement, // The statements that got deferred in this scope at need to be executed at the end.
+
+  debug: Routine_Debug_Local_Scope,         // The debug information associated with this scope.
+}
+
+/**
+* Represents the context when generating a routine.
+*/
+internal struct Routine_Context {
+  symbol: *Symbol,                           // The symbol of the routine.
+  llvm_symbol: LLVMValueRef,                 // The LLVM symbol of the routine.
+  return_type: *Type,                        // The return type of the routine.
+
+  local_scope: *Routine_Local_Scope,         // Holds the deepest local scope in the stack of the routine.
+  
+  current_loading_mode: Loading_Mode,        // The currently requested loading mode.
+
+  declaration_block: LLVMBasicBlockRef,      // The block where all 'alloca' instructions should be located.
+  current_block: LLVMBasicBlockRef,          // The currently active block.
+  needs_after_block: bool,                   // Used to check if control flow statements should append a block after themselves.
+  last_next_block: LLVMBasicBlockRef,        // Used to transfer out of a scope to the next (this is the most convoluted one as it can mean different things).
+  last_break_block: LLVMBasicBlockRef,       // Used to transfer out of a scope throguh 'break'.
+  last_continue_block: LLVMBasicBlockRef,    // Used to transfer out of a scope through 'continue'.
+  next_fallthrough_block: LLVMBasicBlockRef, // Used to tranfer into next scope through 'fallthrough'.
+  
+  // NOTE: All these counters are not really necessary for the generation but are quite useful when trying to read the LLVM IR names.
+  block_counter: uint,                       // For blocks.
+  value_counter: uint,                       // For temporary LLVM values.
+  variable_counter: uint,                    // For variables allocated through 'alloca'.
+  temp_counter: uint,                        // For general temporaries allocated through 'alloca'.
+  byval_counter: uint,                       // For parameters that are passed as pointers.
+  sret_counter: uint,                        // For return values that are passed as pointers.
+  array_counter: uint,                       // For arrays that are needed (usually as the backing data of slices).
+  slice_counter: uint,                       // For slices that are needed.
+  compound_counter: uint,                    // For the values of compound expressions.
+
+  // This is a little bit of a hack but works for now.
+  is_global_initializer: bool,               // Are we currently generating an initializer for a global?
+  is_storing_byval_or_sret: bool,            // Are we currently storing a parameter marked with 'byval' or 'sret'?
+  last_resolved_symbol_name: string,         // Holds the last resolved symbol name.
+  last_resolved_symbol_was_parameter: bool,  // Was the last resolved symbol a parameter?
+
+  debug: Routine_Context_Debug,              // The debug information associated with the routine.
+}
+
+/**
+* Represents data needed for generating the LLVM IR.
+*/
+internal struct Generator {
+  storage: *Type_Storage,                                                                // Holds a reference to the type storage.
+  resolver_output: Resolver_Output,                                                      // Holds the output of the resolver.
+  user_entry_point: *Symbol,                                                             // Holds the user defined entry point.
+
+  module: LLVMModuleRef,                                                                 // Holds the LLVM module used as singular translation unit.
+  builder: LLVMBuilderRef,                                                               // Holds the LLVM builder used for generating.
+  temporary_builder: LLVMBuilderRef,                                                     // Holds a temporary LLVM builder.
+
+  llvm_types: map[*Type]LLVMTypeRef,                                                     // Holds all types for LLVM.
+  llvm_symbols: map[*Symbol]LLVMValueRef,                                                // Holds all symbols for LLVM.
+  llvm_builtin_routines: [type_enum_item_count!(Builtin_Routine)()]LLVM_Builtin_Routine, // Holds all built-in routines for LLVM.
+  llvm_intrinsics: map[Intrinsic_Routine]LLVM_Routine_Tuple,                             // Holds all intrinsic routines for LLVM.
+  llvm_strings: map[string]LLVMValueRef,                                                 // Holds all strings for LLVM.
+  llvm_vtables: map[VTable_Key]LLVMValueRef,                                             // Holds all vtables for LLVM.
+  llvm_hasher_functions: map[*Type]LLVM_Routine_Tuple,                                   // Holds all hasher functions for LLVM.
+  llvm_comparer_functions: map[*Type]LLVM_Routine_Tuple,                                 // Holds all comparer functions for LLVM.
+
+  type_info_table_indices: map[Type_Id]u64,                                              // Holds all type info table indices.
+  llvm_type_info_table_indices_map: LLVMValueRef,                                        // Holds the LLVM type info indices table.
+  llvm_type_info_table_indices_map_type: LLVMTypeRef,                                    // Holds the LLVM type of the type info indices table.
+  llvm_type_info_table: LLVMValueRef,                                                    // Holds the LLVM type info table.
+  llvm_type_info_table_type: LLVMTypeRef,                                                // Holds the LLVM type of the type info table.
+
+  initializer_routine_context: Routine_Context,                                          // Holds the routine context for the global initializer.
+  initializer_context: LLVMValueRef,                                                     // Holds the implicit context for the global initializer.
+  initializer_declaration_block: LLVMBasicBlockRef,                                      // Holds the declaration block for insering 'alloca' instructions.
+  initializer_block: LLVMBasicBlockRef,                                                  // Holds the actual block for regular global intiailizer expressions.
+
+  llvm_target_machine: LLVMTargetMachineRef,                                             // Holds the LLVM target machine.
+  llvm_target_data_layout: LLVMTargetDataRef,                                            // Holds the LLVM data layout of the target machine.
+  llvm_module_pass_manager: LLVMPassManagerRef,                                          // Holds the LLVM module pass manager used in optimization.
+  llvm_function_pass_manager: LLVMPassManagerRef,                                        // Holds the LLVM function pass manager used in optimization.
+
+  debug: Generator_Debug,                                                                // Holds the associated debug information.
+}
+
+/**
+* Holds all arguments required for generation.
+*/
+internal struct Generation_Arguments {
+  resolver_output: Resolver_Output,             // The output of the resolver.
+  main_symbol: *Symbol,                         // The symbol of the main entry point.
+  compilation_arguments: Compilation_Arguments, // The compilation arguments that are being used.
+  libraries_to_link: []string,                  // The external libraries to link to.
+}
+
+/**
+* Makes a new generator.
+*
+* @return The new generator.
+*/
+internal proc generator_make() -> *Generator {
+  generator := memory.new!(Generator)();
+  return generator;
+}
+
+/**
+* Destroys the resouces assocociated with a generator.
+* 
+* @param generator The generator to destroy.
+*/
+internal proc generator_destroy(generator: *Generator) {
+  generator_debug_destroy(generator);
+
+  map_destroy(&generator.llvm_types);
+  map_destroy(&generator.llvm_symbols);
+  map_destroy(&generator.llvm_intrinsics);
+  map_destroy(&generator.llvm_strings);
+  map_destroy(&generator.llvm_vtables);
+  map_destroy(&generator.llvm_hasher_functions);
+  map_destroy(&generator.llvm_comparer_functions);
+  map_destroy(&generator.type_info_table_indices);
+
+  // We could dispose of LLVM resources here but that is pretty much just time being wasted.
+
+  memory.free(generator);
+}
+
+implement Generator {
+  
+  /**
+  * Starts the generation phase.
+  *
+  * @param arguments The generation arguments.
+  */
+  internal proc generate(arguments: Generation_Arguments) {
+    compiler := context.compiler;
+
+    self.resolver_output = arguments.resolver_output;
+    self.module = LLVMModuleCreateWithName(to_cstring(arguments.compilation_arguments.output_name));
+    self.builder = LLVMCreateBuilder();
+    self.temporary_builder = LLVMCreateBuilder();
+
+    self.debug_init(arguments);
+
+    self.init_types();
+    self.init_symbols();
+    self.init_routine_intrinsics();
+    self.init_initializer_function();
+    self.init_target_machine();
+    self.init_module_pass_manager(arguments.compilation_arguments.optimization_level);
+    self.init_function_pass_manager(arguments.compilation_arguments. optimization_level);
+
+    self.user_entry_point = arguments.main_symbol;
+
+    self.emit_type_info_table(arguments.compilation_arguments.rttr_disabled);
+    self.emit_symbols();
+    
+    self.finalize_initializer_function();
+    self.debug_finalize();
+
+    compiler.profiler.individual_stopwatch.stop();
+    compiler.profiler.generator_time = compiler.profiler.individual_stopwatch.get_seconds();
+    compiler.profiler.individual_stopwatch.reset();
+    compiler.profiler.individual_stopwatch.start();
+
+    compiler.profiler.frontend_stopwatch.stop();
+    compiler.profiler.frontend_time = compiler.profiler.frontend_stopwatch.get_seconds();
+    compiler.profiler.frontend_stopwatch.reset();
+    compiler.profiler.frontend_stopwatch.start();
+
+    self.optimize();
+
+    if (arguments.compilation_arguments.generate_llvm_ir) {
+      self.generate_intermediate(arguments.compilation_arguments.output_name);
+    }
+    self.generate_executable(arguments.compilation_arguments.output_name);
+
+    compiler.profiler.individual_stopwatch.stop();
+    compiler.profiler.llvm_time = compiler.profiler.individual_stopwatch.get_seconds();
+    compiler.profiler.individual_stopwatch.reset();
+    compiler.profiler.individual_stopwatch.start();
+
+    self.link_executable(arguments.compilation_arguments, arguments.libraries_to_link);
+
+    compiler.profiler.individual_stopwatch.stop();
+    compiler.profiler.link_time = compiler.profiler.individual_stopwatch.get_seconds();
+    compiler.profiler.individual_stopwatch.reset();
+    compiler.profiler.individual_stopwatch.start();
+  }
+
+  /**
+  * Initializes all LLVM intrinsics.
+  */
+  private proc init_routine_intrinsics() {
+    intrinsic_name_trap := "llvm.trap";
+    llvm_intrinsic_trap_id := LLVMLookupIntrinsicID(to_cstring(intrinsic_name_trap), cast(u64) length(intrinsic_name_trap));
+    llvm_intrinsic_trap_symbol := LLVMGetIntrinsicDeclaration(self.module, llvm_intrinsic_trap_id, null, 0);
+    llvm_intrinsic_trap_type := LLVMIntrinsicGetType(LLVMGetGlobalContext(), llvm_intrinsic_trap_id, null, 0);
+    map_set(&self.llvm_intrinsics, .Trap, {llvm_intrinsic_trap_symbol, llvm_intrinsic_trap_type});
+  }
+
+  /**
+  * Initializes the global initializer function.
+  */
+  private proc init_initializer_function() {
+    // Inspired from: https://gist.github.com/ishikawa/765033/cebaaf73d5ea1e250be6204e5d1ccc0b61be646e
+
+    function_type := LLVMFunctionType(LLVMVoidType(), null, 0, false);
+    pointer_type := LLVMPointerType(LLVMInt8Type(), 0);
+
+    initializer_function := LLVMAddFunction(self.module, "$ctor", function_type);
+    self.initializer_routine_context.is_global_initializer = true;
+    self.initializer_routine_context.llvm_symbol = initializer_function;
+    self.initializer_routine_context.debug.scope = self.debug_get_initializer_function_scope();
+    self.initializer_declaration_block = LLVMAppendBasicBlock(initializer_function, "block_0");
+    self.initializer_block = LLVMAppendBasicBlock(initializer_function, "block_1");
+    self.initializer_routine_context.current_block = self.initializer_block;
+    self.initializer_routine_context.declaration_block = self.initializer_declaration_block;
+    LLVMPositionBuilderAtEnd(self.builder, self.initializer_declaration_block);
+    self.initializer_context = LLVMBuildAlloca(
+      self.builder,
+      self.type_to_llvm(context.storage.cached_runtime_types.context_struct),
+      to_cstring(SPECIAL_NAME_CONTEXT),
+    );
+    LLVMPositionBuilderAtEnd(self.builder, self.initializer_block);
+    self.emit_default_context_initialization(self.initializer_context);
+    
+    struct_element_types: []LLVMTypeRef = { LLVMInt32Type(), LLVMPointerType(function_type, 0), pointer_type };
+    llvm_global_ctors_element_type := LLVMStructType(data(struct_element_types), cast(u32) length(struct_element_types), false);
+
+    llvm_global_ctors := LLVMAddGlobal(self.module, LLVMArrayType(llvm_global_ctors_element_type, 1), "llvm.global_ctors");
+    LLVMSetLinkage(llvm_global_ctors, .Appending);
+    LLVMSetSection(llvm_global_ctors, ".ctor");
+
+    struct_element_values: []LLVMValueRef = { LLVMConstInt(LLVMInt32Type(), 65535, false), initializer_function, LLVMConstNull(pointer_type) };
+    array_element_values: []LLVMValueRef = { LLVMConstStruct(data(struct_element_values), cast(u32) length(struct_element_values), false) };
+    LLVMSetInitializer(llvm_global_ctors, LLVMConstArray(llvm_global_ctors_element_type, data(array_element_values), cast(u32) length(array_element_values)));
+  }
+  
+  /**
+  * Initializes the target machine.
+  */
+  private proc init_target_machine() {
+    // Initialize all targets for now (may or may not be necessary).
+    LLVMInitializeAllTargetInfos();
+    LLVMInitializeAllTargets();
+    LLVMInitializeAllTargetMCs();
+    LLVMInitializeAllAsmPrinters();
+    LLVMInitializeAllAsmParsers();
+    LLVMInitializeAllDisassemblers();
+
+    target_triple := LLVMGetDefaultTargetTriple();
+    target: LLVMTargetRef;
+    target_error: cstring;
+    LLVMGetTargetFromTriple(target_triple, &target, &target_error);
+
+    llvm_cpu: cstring = "generic";
+    // On Linux we need a different relocation mode.
+    #if (NOX_OS == .Linux) {
+      relocation_mode := LLVMRelocMode.PIC;
+    } else {
+      relocation_mode := LLVMRelocMode.Default;
+    }
+    
+    llvm_features := LLVMGetHostCPUFeatures();
+    self.llvm_target_machine = LLVMCreateTargetMachine(
+      target,
+      target_triple,
+      llvm_cpu,
+      llvm_features,
+      .Default,
+      relocation_mode,
+      .Default,
+    );
+    self.llvm_target_data_layout = LLVMCreateTargetDataLayout(self.llvm_target_machine);
+    LLVMSetModuleDataLayout(self.module, self.llvm_target_data_layout);
+    LLVMSetTarget(self.module, target_triple);
+  }
+
+  /**
+  * Finalizes the generation of the global initializer function.
+  */
+  private proc finalize_initializer_function() {
+    LLVMPositionBuilderAtEnd(self.builder, self.initializer_declaration_block);
+    LLVMBuildBr(self.builder, self.initializer_block);
+
+    LLVMPositionBuilderAtEnd(self.builder, self.initializer_block);
+    LLVMBuildRetVoid(self.builder);
+  }
+
+  /**
+  * Generates the intermediate LLVM IR in text form.
+  *
+  * @param output_name The name of the output file.
+  */
+  private proc generate_intermediate(output_name: string) {
+    builder: strings.Builder;
+    defer builder.destroy();
+    builder.write_string(output_name);
+    builder.write_string(".ll");
+    filename := strings.clone_to_cstring(builder.to_string());
+    defer cstring_destroy(filename);
+
+    module_print_error: cstring;
+    LLVMPrintModuleToFile(self.module, filename, &module_print_error);
+    LLVMDisposeMessage(module_print_error);
+  }
+
+  /**
+  * Generates the native machine code.
+  *
+  * @param output_name The name of the output file.
+  */
+  private proc generate_executable(output_name: string) {
+    // First we verify the module.
+    verify_error: cstring;
+    LLVMVerifyModule(self.module, LLVMVerifierFailureAction.AbortProcess, &verify_error);
+    LLVMDisposeMessage(verify_error);
+
+    // Here we finally produce the object file.
+    builder: strings.Builder;
+    defer builder.destroy();
+    builder.write_string(output_name);
+    #if (NOX_OS == .Windows) {
+      builder.write_string(".obj");
+    } else #if (NOX_OS == .Linux) {
+      builder.write_string(".o");
+    }
+    filename := strings.clone_to_cstring(builder.to_string());
+    defer cstring_destroy(filename);
+
+    emit_error: cstring;
+    LLVMTargetMachineEmitToFile(self.llvm_target_machine, self.module, filename, LLVMCodeGenFileType.ObjectFile, &emit_error);
+  }
+
+}
+
+#if (NOX_OS == .Windows) {
+
+  import "std:libc"
+  import extern "../vendor/sdk-finder/lib/windows/sdk-finder.lib"
+
+  private struct FindResult {
+    windows_sdk_version: i32,
+
+    windows_sdk_root: *libc.wchar_t,
+    windows_sdk_um_library_path: *libc.wchar_t,
+    windows_sdk_ucrt_library_path: *libc.wchar_t,
+
+    is_vs_2017: b32,
+    vs_exe_path: *libc.wchar_t,
+    vs_library_path: *libc.wchar_t,
+  }
+
+  private extern proc find_visual_studio_and_windows_sdk() -> FindResult
+  private extern proc free_resources(result: *FindResult)
+  
+  implement Generator {
+
+    /**
+    * Links the generated native machine code with the os.
+    *
+    * @param arguments         The compilation arguments that are being used.
+    * @param libraries_to_link The external libraries to link to.
+    */
+    private proc link_executable(compilation_arguments: Compilation_Arguments, libraries_to_link: []string) {
+      result := find_visual_studio_and_windows_sdk();
+      defer free_resources(&result);
+      if (result.windows_sdk_version == 0) {
+        report_error_fatal_simple("Failed to find windows and visual studio SDK");
+      }
+
+      temporary_allocator := context.temporary_allocator;
+
+      windows_library_path := system.utf16_to_utf8(result.windows_sdk_um_library_path, temporary_allocator);
+      universal_c_runtime_library_path := system.utf16_to_utf8(result.windows_sdk_ucrt_library_path, temporary_allocator);
+      visual_studio_exe_path := system.utf16_to_utf8(result.vs_exe_path, temporary_allocator);
+      visual_studio_library_path := system.utf16_to_utf8(result.vs_library_path, temporary_allocator);
+
+      // We assume the corresponding .obj already exists.
+
+      // NOTE: We need "legacy_stdio_definitions.lib" for functions like "printf".
+      // We need "msvcrt.lib" for the C runtime library (linking it as /MD) as we are relying on it.
+      // This means we have "mainCRTStartup" as the entry point to the runtime (Otherwise without the runtime we would need "/ENTRY:main").
+      // More info here: https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features?view=msvc-170
+
+      // NOTE: Because of Windows we need to wrap the whole command in quotes as the command processor otherwise does not understand anything.
+      // See here for details: https://stackoverflow.com/questions/9964865/c-system-not-working-when-there-are-spaces-in-two-different-parameters
+      builder := strings.builder_make(temporary_allocator);
+
+      builder.write_string("\"");
+      
+      builder.write_string("\"");
+      builder.write_string(visual_studio_exe_path);
+      builder.write_string("\\link.exe\" ");
+
+      builder.write_string("/NOLOGO ");
+      builder.write_string("/SUBSYSTEM:console ");
+      builder.write_string("/LIBPATH:\"");
+      builder.write_string(windows_library_path);
+      builder.write_string("\" /LIBPATH:\"");
+      builder.write_string(universal_c_runtime_library_path);
+      builder.write_string("\" /LIBPATH:\"");
+      builder.write_string(visual_studio_library_path);
+      builder.write_string("\" ");
+      builder.write_string("/INCREMENTAL:NO "); 
+      if (compilation_arguments.build_debug) {
+        builder.write_string("/PDB:");
+        builder.write_string(compilation_arguments.output_name);
+        builder.write_string(".pdb ");
+        builder.write_string("/DEBUG ");
+      }
+      builder.write_string(compilation_arguments.output_name);
+      builder.write_string(".obj libcmt.lib legacy_stdio_definitions.lib ");
+
+      foreach (library in libraries_to_link) {
+        builder.write_string("\"");
+        builder.write_string(library);
+        builder.write_string("\"");
+        builder.write_string(" ");
+      }
+
+      builder.write_string(compilation_arguments.extra_linker_flags);
+
+      builder.write_string("\"");
+      linker_command := builder.to_string();
+      nox_log_verbose("Executing linker: %\n", linker_command);
+
+      system.run(linker_command);
+
+      if (!compilation_arguments.keep_intermediate) {
+        builder := strings.builder_make(temporary_allocator);
+        builder.write_string(compilation_arguments.output_name);
+        builder.write_string(".obj");
+        object_file_name := builder.to_string();
+        io.remove_file(object_file_name);
+      }
+    }
+
+  }
+
+} else {
+  
+  implement Generator {
+
+    /**
+    * Links the generated native machine code with the os.
+    *
+    * @param arguments         The compilation arguments that are being used.
+    * @param libraries_to_link The external libraries to link to.
+    */
+    private proc link_executable(compilation_arguments: Compilation_Arguments, libraries_to_link: []string) {
+      temporary_allocator := context.temporary_allocator;
+
+      // We assume 'clang' is on the PATH.
+      builder := strings.builder_make(temporary_allocator);
+
+      builder.write_string("clang ");
+      builder.write_string("-o ");
+      builder.write_string(compilation_arguments.output_name);
+      builder.write_string(" ");
+      builder.write_string(compilation_arguments.output_name);
+      builder.write_string(".o ");
+      
+      foreach (library in libraries_to_link) {
+        builder.write_string(library);
+        builder.write_string(" ");
+      }
+      
+      builder.write_string(compilation_arguments.extra_linker_flags);
+
+      linker_command := builder.to_string();
+      nox_log_verbose("Executing linker: %\n", linker_command);
+
+      system.run(linker_command);
+
+      if (!compilation_arguments.keep_intermediate) {
+        builder := strings.builder_make(temporary_allocator);
+        builder.write_string(compilation_arguments.output_name);
+        builder.write_string(".o");
+        object_file_name := builder.to_string();
+        io.remove_file(object_file_name);
+      }
+    }
+
+  }
+
+}

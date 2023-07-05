@@ -1,0 +1,2207 @@
+implement Resolver {
+
+  /**
+  * Resolves an expression.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    return self.resolve_expression_expected(expression, statement_context, null);
+  }
+
+  /**
+  * Resolves an expression as an rvalue.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_rvalue(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    return operand_decay(self.resolve_expression(expression, statement_context));
+  }
+
+  /**
+  * Resolves an expression as an rvalue with an expected type.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_expected_rvalue(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    return operand_decay(self.resolve_expression_expected(expression, statement_context, expected_type));
+  }
+
+  /**
+  * Resolves an expression as a condition.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_condition(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    condition := self.resolve_expression_rvalue(expression, statement_context);
+    if (!condition.type.is_boolean()) {
+      report_error_fatal(expression.position, "Conditional expression must have a boolean type. Got '%'", condition.type.name);
+    }
+    return condition;
+  }
+
+  /**
+  * Resolves an expression as a constant.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_constant(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    return self.resolve_expression_constant_expected(expression, statement_context, null);
+  }
+
+  /**
+  * Resolves an expression as a constant with an expected type.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_constant_expected(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    result := self.resolve_expression_expected(expression, statement_context, expected_type);
+    if (!has_flag(result.flags, .Is_Constant)) {
+      report_error_fatal(expression.position, "Expected constant expression");
+    }
+    return result;
+  }
+
+  /**
+  * Resolves an expression with an expected type.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  internal proc resolve_expression_expected(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    result: Operand;
+
+    switch (expression.kind) {
+      case .Parenthesized: {
+        expression := cast(*Expression_Parenthesized) expression;
+        result = self.resolve_expression_expected(cast(*Expression) expression.expression, statement_context, expected_type);
+      }
+
+      case .Boolean: result = operand_constant(context.storage.type_untyped_boolean, (cast(*Expression_Literal) expression).value.(bool));
+      case .Integer: result = operand_constant(context.storage.type_untyped_integer, (cast(*Expression_Literal) expression).value.(u64));
+      case .Float: result = operand_constant(context.storage.type_untyped_float, (cast(*Expression_Literal) expression).value.(f64));
+      case .Character: result = operand_constant(context.storage.type_untyped_char, (cast(*Expression_Literal) expression).value.(char));
+      case .String: result = operand_constant(context.storage.type_untyped_string, (cast(*Expression_Literal) expression).value.(string));
+      case .Name: result = self.resolve_expression_name(expression, statement_context);
+
+      case .Cast: result = self.resolve_expression_cast(expression, statement_context);
+      case .Call: result = self.resolve_expression_call(expression, statement_context, expected_type);
+      case .Index: result = self.resolve_expression_index(expression, statement_context);
+      case .Slice: result = self.resolve_expression_slice(expression, statement_context);
+      case .Member: result = self.resolve_expression_member(expression, statement_context);
+      case .Compound: result = self.resolve_expression_compound(expression, statement_context, expected_type);
+      case .Selector: result = self.resolve_expression_selector(expression, statement_context);
+      case .Implicit_Selector: result = self.resolve_expression_implicit_selector(expression, expected_type);
+
+      case .Unary: result = self.resolve_expression_unary(expression, statement_context, expected_type);
+      case .Binary: result = self.resolve_expression_binary(expression, statement_context);
+      case .Ternary: result = self.resolve_expression_ternary(expression, statement_context, expected_type);
+      case .Modify: result = self.resolve_expression_modify(expression, statement_context);
+
+      case .Query: result = self.resolve_expression_query(expression, statement_context);
+      case .Directive: result = self.resolve_expression_directive(expression);
+
+      case .None: fallthrough;
+      case: assert(false);
+    }
+
+    self.set_resolved_type(expression, result.type);
+
+    if (statement_context.statement_restriction != .Allow_All) {
+      if (!has_flag(result.flags, .Is_Pure)) {
+        report_error_fatal(expression.position, "Expression in function is not pure");
+      }
+    }
+
+    return result;
+  }
+
+  /**
+  * Resolves a name expression.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_name(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Name) expression;
+    name := expression.name;
+
+    symbol := self.resolve_name(expression.position, context.compiler.current_package, name);
+    operand := self.resolve_expression_name_operand(expression.position, statement_context, symbol, name, expression.generic_types);
+    self.set_resolved_symbol(cast(*Expression) expression, symbol);
+
+    return operand;
+  }
+
+  /**
+  * Resolves a name expression.
+  *
+  * @param position          The position of the name expression.
+  * @param statement_context The statement context to use.
+  * @param symbol            The symbol the name corresponds to.
+  * @param name              The name of the expression.
+  * @param generic_types     The generic types of the expression.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_name_operand(
+    position: Source_Position,
+    statement_context: Statement_Context,
+    symbol: *Symbol,
+    name: string,
+    generic_types: [dynamic]*Type_Specification,
+  ) -> Operand {
+    is_immutable := has_flag(symbol.flags, .Local_Immutable);
+
+    operand: Operand;
+    if (symbol.kind == .Constant || (symbol.type != null && symbol.type.is_constant())) {
+      // The additional type check here stems from the fact that we want to allow constant values which might be defined locally.
+      // This is the case for enum items for example.
+      operand = operand_constant(symbol.type, symbol.value);
+    } else if (symbol.kind == .Global || symbol.kind == .Local) {
+      operand = operand_lvalue(symbol.type, symbol.kind == .Local, is_immutable);
+    } else if (symbol.kind == .Parameter) {
+      operand = operand_parameter(symbol.type, is_immutable);
+    } else if (symbol.kind == .Routine) {
+      operand = operand_rvalue(symbol.type, has_flag(symbol.flags, .Routine_Function), is_immutable);
+    } else if (has_flag(statement_context.legal_statements, .Can_Refer_To_Enum_Item) && symbol.kind == .Type && symbol.type.is_enumeration()) {
+      // Enums can be referred to by name and as such we are returning them as a constant.
+      // This is a little hacky because that is only ever allowed it we are part of a member expression.
+      operand = operand_constant(symbol.type, {});
+    } else {
+      report_error_fatal(position, "'%' must be a constant, global, local or routine", name);
+    }
+
+    if (symbol.kind != .Routine && length  (generic_types) > 0) {
+      report_error_fatal(position, "'%' does not have generic type arguments", name);
+    }
+
+    return operand;
+  }
+
+  /** 
+  * Resolves a cast expression.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_cast(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Cast) expression;
+
+    type := self.resolve_type_specification(cast(*Type_Specification) expression.type);
+    operand := self.resolve_expression_expected_rvalue(cast(*Expression) expression.expression, statement_context, type);
+
+    if (!self.operand_cast(expression.position, &operand, type)) {
+      report_error_fatal(expression.position, "Invalid type cast '%' to '%'", operand.type.name, type.name);
+    }
+
+    return operand;
+  }
+
+  /**
+  * Resolves a call expression.
+  *
+  * @param expression        The expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_call(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    expression := cast(*Expression_Call) expression;
+    call_expression := cast(*Expression) expression.expression;
+
+    routine := self.resolve_expression_rvalue(call_expression, statement_context);
+    if (routine.type.kind != .Procedure && routine.type.kind != .Function) {
+      report_error_fatal(call_expression.position, "Can only call procedures or functions");
+    }
+    type_routine := cast(*Type_Routine) routine.type;
+
+    if (has_flag(type_routine.routine_flags, .Is_Intrinsic)) {
+      return self.resolve_expression_call_intrinsic(expression, statement_context);
+    }
+
+    symbol := type_routine.symbol;
+    if (symbol != null) {
+      if (has_flag(symbol.flags, .Uninstantiated_Generic)) {
+        type_routine = self.resolve_generic_expression_call(expression, statement_context, type_routine, symbol);
+      }
+    } else {
+      if (call_expression.kind == .Name || call_expression.kind == .Member) {
+        has_generic_parameters := false;
+        if (call_expression.kind == .Name) {
+          has_generic_parameters = length((cast(*Expression_Name) call_expression).generic_types) > 0;
+        } else {
+          has_generic_parameters = length((cast(*Expression_Member) call_expression).generic_types) > 0;
+        }
+    
+        if (has_generic_parameters) {
+          report_error_fatal(call_expression.position, "Routine has no generic type parameters");
+        }
+      }
+    }
+
+    if (type_routine.has_context() && !has_flag(statement_context.legal_statements, .Can_Call_Routine_With_Nox_Calling_Convention)) {
+      report_error_fatal(expression.position, "Can't call routine with 'Nox' calling convention from routine which doesn't push a context explicitly");
+    }
+
+    parameter_count := length(type_routine.parameters);
+    parameter_count_without_defaults := parameter_count;
+    foreach (parameter in type_routine.parameters) {
+      if (parameter.is_default) {
+        parameter_count_without_defaults -= 1;
+      }
+    }
+    minimum_argument_count := parameter_count_without_defaults;
+    has_params := has_flag(type_routine.routine_flags, .Has_Params);
+    if (has_params) {
+      minimum_argument_count -= 1;
+    }
+
+    expression_argument_count := length(expression.arguments);
+    if (expression_argument_count < minimum_argument_count) {
+      report_error_fatal(expression.position, "Routine call with too few arguments. Expected % got %", minimum_argument_count, expression_argument_count);
+    } else if (expression_argument_count > parameter_count && !has_params && !has_flag(type_routine.routine_flags, .Has_C_Varargs)) {
+      report_error_fatal(expression.position, "Routine call with too many arguments. Expected % got %", parameter_count, expression_argument_count);
+    }
+
+    return self.resolve_expression_call_regular(expression, statement_context, type_routine, expected_type);
+  }
+
+  /**
+  * Resolves an intrinsic call expression.
+  *
+  * @param expression        The call expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param routine_type      The type of the routine.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_call_intrinsic(expression: *Expression_Call, statement_context: Statement_Context) -> Operand {
+    symbol, found_symbol := map_get(&self.output.resolved_symbols, cast(*Expression) expression.expression);
+    assert(found_symbol);
+
+    intrinsic_routine, found_intrinsic_routine := map_get(&INTRINSIC_ROUTINES, symbol.name);
+    assert(found_intrinsic_routine);
+    switch (intrinsic_routine) {
+      case .Entry_Point: {
+        if (length(expression.arguments) != 0) {
+          report_error_fatal(
+            expression.position,
+            "Invalid number of arguments to internal routine call 'entry_pointer'. Expected 0 got %",
+            length(expression.arguments),
+          );
+        }
+
+        return operand_rvalue(context.storage.type_void, false, false);
+      }
+      case .Data: {
+        if (length(expression.arguments) != 1) {
+          report_error_fatal(expression.position, "Invalid number of arguments to internal routine call 'data'. Expected 1 got %", length(expression.arguments));
+        }
+
+        argument_expression := expression.arguments[0];
+        argument := self.resolve_expression_rvalue(argument_expression, statement_context);
+
+        argument_type := argument.type;
+        if (argument_type.is_absolute_pointer() || argument_type.is_self_relative_pointer()) {
+          argument_type = argument_type.base;
+        }
+
+        if (!argument_type.is_string() && !argument_type.is_array() && !argument_type.is_dynamic_array() && !argument_type.is_slice() && !argument_type.is_any()) {
+          report_error_fatal(
+            argument_expression.position,
+            "Invalid argument type in internal routine call to 'data'. Expected string, array, dynamic array, slice or any type. Got '%'",
+            argument.type.name,
+          );
+        }
+
+        if (argument_type.is_soa_or_aosoa()) {
+          report_error_fatal(argument_expression.position, "SoA/AoSoA type '%' does not have a distinct data pointer", argument_type.name);
+        }
+
+        data_pointer_type := context.storage.type_rawptr;
+        if (!argument_type.is_string() && !argument_type.is_any()) {
+          data_pointer_type = context.storage.get_or_make_type_pointer(argument_type.base);
+        }
+        return operand_rvalue(data_pointer_type, true, false);
+      }
+      case .Length: {
+        if (length(expression.arguments) != 1) {
+          report_error_fatal(expression.position, "Invalid number of arguments to internal routine call 'length'. Expected 1 got %", length(expression.arguments));
+        }
+
+        argument_expression := expression.arguments[0];
+        argument := self.resolve_expression_rvalue(argument_expression, statement_context);
+
+        argument_type := argument.type;
+        if (argument_type.is_absolute_pointer() || argument_type.is_self_relative_pointer()) {
+          argument_type = argument_type.base;
+        }
+
+        if (argument_type.is_string()) {
+          // For strings we do an explicit check for constants which we can simply resolve to later.
+          if (has_flag(argument.flags, .Is_Constant)) {
+            constant_length := operand_constant(context.storage.type_int, length(argument.value.(string)));
+            self.set_resolved_constant(cast(*Expression) expression, constant_length);
+            return constant_length;
+          }
+        } else if (argument_type.is_array()) {
+          // We will always know the length of arrays at compile time.
+          type_array := cast(*Type_Array) argument_type;
+          assert(!type_array.has_incomplete_elements);
+
+          constant_length := operand_constant(context.storage.type_int, type_array.number_of_elements);
+          self.set_resolved_constant(cast(*Expression) expression, constant_length);
+          return constant_length;
+        } else if (!argument_type.is_slice() && !argument_type.is_dynamic_array() && !argument_type.is_map()) {
+          report_error_fatal(
+            argument_expression.position,
+            "Invalid argument type in internal routine call to 'length'. Expected string, array, dynamic array, slice or map type. Got '%'",
+            argument.type.name,
+          );
+        }
+
+        return operand_rvalue(context.storage.type_int, true, false);
+      }
+      case .Capacity: {
+        if (length(expression.arguments) != 1) {
+          report_error_fatal(expression.position, "Invalid number of arguments to internal routine call 'capacity'. Expected 1 got %", length(expression.arguments));
+        }
+
+        argument_expression := expression.arguments[0];
+        argument := self.resolve_expression_rvalue(argument_expression, statement_context);
+
+        argument_type := argument.type;
+        if (argument_type.is_absolute_pointer() || argument_type.is_self_relative_pointer()) {
+          argument_type = argument_type.base;
+        }
+
+        if (!argument_type.is_dynamic_array() && !argument_type.is_map()) {
+          report_error_fatal(
+            argument_expression.position,
+            "Invalid argument type in internal routine call to 'capacity'. Expected dynamic array or map type. Got '%'",
+            argument.type.name,
+          );
+        }
+
+        return operand_rvalue(context.storage.type_int, true, false);
+      }
+      case .Hash_Function_Of_Type: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        if (!has_flag(type.flags, .Has_Hash_Function)) {
+          report_error_fatal(expression.position, "The type '%' does not have a trivial hash function", type.name);
+        }
+
+        parameters: aosoa[dynamic]Type_Routine_Parameter;
+        array_aosoa_add(&parameters, {type, false});
+        hasher_routine_type := context.storage.get_or_make_type_routine(
+          .Function,
+          .No_Context,
+          parameters,
+          context.storage.type_uint,
+          make_routine_flags(false, false, false, false, true),
+        );
+
+        return operand_rvalue(hasher_routine_type, true, false);
+      }
+      case .Compare_Function_Of_Type: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        if (!has_flag(type.flags, .Has_Compare_Function)) {
+          report_error_fatal(expression.position, "The type '%' does not have a trivial compare function", type.name);
+        }
+
+        parameters: aosoa[dynamic]Type_Routine_Parameter;
+        array_aosoa_add(&parameters, {type, false});
+        array_aosoa_add(&parameters, {type, false});
+        comparer_routine_type := context.storage.get_or_make_type_routine(
+          .Function,
+          .No_Context,
+          parameters,
+          context.storage.type_bool,
+          make_routine_flags(false, false, false, false, true),
+        );
+
+        return operand_rvalue(comparer_routine_type, true, false);
+      }
+      case .Trap: {
+        return operand_rvalue(context.storage.type_void, false, false);
+      }
+      case .Type_Is_Scalar: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        is_scalar := type.is_scalar();
+        constant := operand_constant(context.storage.type_bool, is_scalar);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Is_Enum: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        is_enum := type.is_enumeration();
+        constant := operand_constant(context.storage.type_bool, is_enum);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Is_Struct: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        is_struct := type.is_struct();
+        constant := operand_constant(context.storage.type_bool, is_struct);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Is_AoSoA: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        is_aosoa := type.is_aosoa();
+        constant := operand_constant(context.storage.type_bool, is_aosoa);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Is_Trivial_Copyable: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+
+        is_trivial_copyable := !type.contains_self_relative_pointer_in_value();
+        constant := operand_constant(context.storage.type_bool, is_trivial_copyable);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Enum_Item_Count: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+        if (!type.is_enumeration()) {
+          report_error_fatal(expression.position, "The type '%' is not an enum", type.name);
+        }
+
+        item_count := length((cast(*Type_Enumeration) type).items);
+        constant := operand_constant(context.storage.type_int, item_count);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_Struct_Field_Count: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+        if (!type.is_struct()) {
+          report_error_fatal(expression.position, "The type '%' is not a struct", type.name);
+        }
+
+        field_count := length((cast(*Type_Struct) type).fields);
+        constant := operand_constant(context.storage.type_int, field_count);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_AoSoA_Chunk_Size: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+        if (!type.is_aosoa()) {
+          report_error_fatal(expression.position, "The type '%' is not an AoSoA type", type.name);
+        }
+
+        chunk_size := (cast(*Type_Struct) type.base).fields[0].type.base.get_size();
+        constant := operand_constant(context.storage.type_uint, chunk_size);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+      case .Type_AoSoA_Items_In_Chunk: {
+        type := self.resolve_expression_call_intrinsic_get_first_generic_argument(expression, symbol);
+        if (!type.is_aosoa()) {
+          report_error_fatal(expression.position, "The type '%' is not an AoSoA type", type.name);
+        }
+
+        items_in_aosoa_chunk := (cast(*Type_Struct) type.base).layout_info.items_in_aosoa_chunk;
+        constant := operand_constant(context.storage.type_int, items_in_aosoa_chunk);
+        self.set_resolved_constant(cast(*Expression) expression, constant);
+
+        return constant;
+      }
+    }
+
+    report_error_fatal(expression.position, "Invalid call to internal routine with name '%'", symbol.name);
+    return {};
+  }
+
+  /**
+  * Resolves the first generic type argument of an intrinsic call.
+  *
+  * @param expression The call expression.
+  * @param symbol     The symbol of the intrinsic routine.
+  * @return The type of the generic argument.
+  */
+  private proc resolve_expression_call_intrinsic_get_first_generic_argument(expression: *Expression_Call, symbol: *Symbol) -> *Type {
+    assert(expression.expression.kind == .Name);
+    generic_types := (cast(*Expression_Name) expression.expression).generic_types;
+    if (length(generic_types) != 1) {
+      report_error_fatal(
+        expression.position,
+        "Invalid number of generic type arguments to internal routine call '%'. Expected 1 got %",
+        symbol.name,
+        length(generic_types),
+      );
+    }
+
+    generic_type := generic_types[0];
+    type := self.resolve_type_specification(generic_type);
+    self.complete_type(generic_type.position, type);
+
+    return type;
+    }
+
+  /**
+  * Resolves a regular call expression.
+  *
+  * @param expression        The call expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param routine_type      The type of the routine.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_call_regular(
+    expression: *Expression_Call,
+    statement_context: Statement_Context,
+    type_routine: *Type_Routine,
+    expected_type: *Type,
+  ) -> Operand {
+    parameter_count := length(type_routine.parameters);
+    has_params := has_flag(type_routine.routine_flags, .Has_Params);
+    has_c_varargs := has_flag(type_routine.routine_flags, .Has_C_Varargs);
+
+    argument_count := length(expression.arguments);
+
+    params_type: *Type;
+    params_argument_count := argument_count - parameter_count + 1;
+    if (has_params) {
+      params_type = type_routine.parameters[parameter_count - 1].type;
+    }
+
+    for (i := 0; i < argument_count; i++) {
+      is_params_argument := has_params && i >= parameter_count - 1;
+      is_c_varargs_argument := has_c_varargs && i >= parameter_count;
+
+      argument_expression := expression.arguments[i];
+
+      if (is_params_argument) {
+        // We can only have an expected type when we have more than one params argument.
+        // For just one argument we could have either the params slice type or its base.
+        expected_type := params_argument_count > 1 ? params_type.base : null;
+        argument := self.resolve_expression_expected_rvalue(argument_expression, statement_context, expected_type);
+        if (params_argument_count == 1) {
+          if (argument.type != params_type) {
+            if (!self.operand_convert(argument_expression.position, &argument, params_type.base)) {
+              report_error_fatal(
+                argument_expression.position,
+                "Invalid type in %. routine params argument. Expected '%' or '%' got '%'",
+                i + 1,
+                params_type.name,
+                params_type.base.name,
+                argument.type.name,
+              );
+            }
+          }
+        } else {
+          if (!self.operand_convert(argument_expression.position, &argument, params_type.base)) {
+            report_error_fatal(
+              argument_expression.position,
+              "Invalid type in %. routine params argument. Expected '%' got '%'",
+              i + 1,
+              params_type.base.name,
+              argument.type.name,
+            );
+          }
+        }
+        self.set_resolved_overwrite_type(argument_expression, argument.type);
+      } else if (is_c_varargs_argument) {
+        self.resolve_expression_rvalue(argument_expression, statement_context);
+      } else {
+        parameter_type := type_routine.parameters[i].type;
+        argument := self.resolve_expression_expected_rvalue(argument_expression, statement_context, parameter_type);
+        if (!self.operand_convert(argument_expression.position, &argument, parameter_type)) {
+          report_error_fatal(argument_expression.position, "Invalid type in %. routine argument. Expected '%' got '%'", i + 1, parameter_type.name, argument.type.name);
+        }
+        self.set_resolved_overwrite_type(argument_expression, argument.type);
+      }
+    } 
+
+    if (expected_type != null && type_routine.return_type.is_void()) {
+      report_error_fatal(expression.position, "Routine call does not return a value and cannot be used as a value");
+    }
+
+    return operand_rvalue(type_routine.return_type, (cast(*Type) type_routine).is_function(), false);
+  }
+
+  /**
+  * Resolves an index expression.
+  *
+  * @param expression        The index expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_index(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Index) expression;
+
+    index := self.resolve_expression_rvalue(cast(*Expression) expression.index, statement_context); 
+    if (!index.type.is_scalar() && !index.type.is_offset_relative_pointer()) {
+      report_error_fatal(expression.index.position, "Index must be a scalar or an offset-relative pointer type. Got '%'", index.type.name);
+    }
+
+    operand := self.resolve_expression_rvalue(cast(*Expression) expression.expression, statement_context);
+    type := operand.type;
+    
+    // We allow automatic dereferencing of pointers but only if the index that is used is not an offset-relative pointer.
+    is_using_offset_relative_pointer := index.type.is_offset_relative_pointer();
+    if (is_using_offset_relative_pointer) {
+      if (type.is_absolute_pointer() || type.is_self_relative_pointer()) {
+        if (type.base != index.type.base) {
+          report_error_fatal(
+            expression.expression.position,
+            "Base type offset-relative pointer does not match with pointer base. Expected '%' got '%'",
+            type.base.name,
+            index.type.base.name,
+          );
+        }
+      } else {
+        report_error_fatal(expression.expression.position, "Indexing with offset-relative pointer requires a pointer type. Got '%'", type.name);
+      }
+    } else if (type.is_absolute_pointer() || type.is_self_relative_pointer()) {
+      type = type.base;
+    }
+
+    if (!type.is_array() && !type.is_dynamic_array() && !type.is_slice() && !type.is_absolute_pointer() && !type.is_self_relative_pointer()) {
+      if (!is_using_offset_relative_pointer && (operand.type.is_absolute_pointer() || operand.type.is_self_relative_pointer())) {
+        report_error_fatal(expression.expression.position, "Indexing of pointers must be done with an offset-relative pointer type. Got '%'", index.type.name);
+      } else {
+        report_error_fatal(
+          expression.expression.position,
+          "Can only index array, dynamic array, slice, absolute pointer or self-relative pointer types. Got '%'",
+          operand.type.name,
+        );
+      }
+    }
+
+    // Do a constant out of bounds check for arrays.
+    if (type.is_array() && has_flag(index.flags, .Is_Constant)) {
+      constant_index := index;
+      operand_cast_unchecked(expression.expression.position, &constant_index, context.storage.type_int);
+      index_value := constant_index.value.(int);
+      if (index_value < 0 || index_value >= (cast(*Type_Array) type).number_of_elements) {
+        report_error_fatal(expression.expression.position, "Index '%' is out of bounds for array type '%'", index_value, operand.type.name);
+      }
+    }
+
+    result_type := type.base;
+    if (type.is_soa_or_aosoa()) {
+      result_type = type.base.base;
+    }
+
+    return operand_lvalue(result_type, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+  }
+
+  /**
+  * Resolves a slice expression.
+  *
+  * @param expression        The slice expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_slice(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Slice) expression;
+
+    operand := self.resolve_expression_rvalue(cast(*Expression) expression.expression, statement_context);
+    type := operand.type;
+
+    if (type.is_absolute_pointer() || type.is_self_relative_pointer()) {
+      type = type.base;
+    }
+
+    if (!type.is_string() && !type.is_array() && !type.is_dynamic_array() && !type.is_slice()) {
+      report_error_fatal(expression.expression.position, "Can only slice strings, array, dynamic array or slice types. Got '%'", operand.type.name);
+    }
+
+    has_constant_lower_bound := false;
+    lower_bound_value := 0;
+    if (expression.lower != null) {
+      lower_bound := self.resolve_expression(cast(*Expression) expression.lower, statement_context);
+      if (!lower_bound.type.is_integer()) {
+        report_error_fatal(expression.lower.position, "Expected integer as lower bounds in slice expression. Got '%'", lower_bound.type.name);
+      }
+      if (has_flag(lower_bound.flags, .Is_Constant)) {
+        has_constant_lower_bound = true;
+        operand_cast_unchecked(expression.lower.position, &lower_bound, context.storage.type_int);
+        lower_bound_value = lower_bound.value.(int);
+        if (lower_bound_value < 0) {
+          report_error_fatal(expression.lower.position, "Slice lower bound '%' can not be negative", lower_bound_value);
+        }
+      }
+    }
+
+    has_constant_higher_bound := false;
+    higher_bound_value := 0;
+    if (expression.higher != null) {
+      higher_bound := self.resolve_expression(cast(*Expression) expression.higher, statement_context);
+      if (!higher_bound.type.is_integer()) {
+        report_error_fatal(expression.higher.position, "Expected integer as higher bounds in slice expression. Got '%'", higher_bound.type.name);
+      }
+      if (has_flag(higher_bound.flags, .Is_Constant)) {
+        has_constant_higher_bound = true;
+        operand_cast_unchecked(expression.higher.position, &higher_bound, context.storage.type_int);
+        higher_bound_value = higher_bound.value.(int);
+        if (higher_bound_value < 0) {
+          report_error_fatal(expression.higher.position, "Slice higher bound '%' can not be negative", higher_bound_value);
+        }
+      }
+    }
+
+    if (has_constant_lower_bound && has_constant_higher_bound && lower_bound_value > higher_bound_value) {
+      report_error_fatal(expression.higher.position, "Slice lower bound '%' is greater than higher bound '%'", lower_bound_value, higher_bound_value);
+    } 
+
+    result_type: *Type;
+    if (type.is_string()) {
+      result_type = context.storage.type_string;
+    } else if (type.is_soa_or_aosoa()) {
+      layout_modifier := Layout_Modifier.None;
+      if (type.is_array()) {
+        layout_modifier = (cast(*Type_Array) type).layout_info.modifier;
+      } else if (type.is_dynamic_array()) {
+        layout_modifier = (cast(*Type_Dynamic_Array) type).layout_info.modifier;
+      } else if (type.is_slice()) {
+        layout_modifier = (cast(*Type_Slice) type).layout_info.modifier;
+      } else {
+        assert(false);
+      }
+
+      if (layout_modifier == .AoSoA) {
+        report_error_fatal(expression.position, "Slicing an AoSoA collection is currently not allowed");
+      }
+
+      actual_base := type.base.base;
+      slice_base := self.resolve_type_specification_layout_struct(expression.position, .Slice, actual_base, layout_modifier, 0);
+      layout_info := (cast(*Type_Struct) slice_base).layout_info;
+      result_type = context.storage.get_or_make_type_slice(layout_info, slice_base);
+    } else {
+      result_type = context.storage.get_or_make_type_slice(SOA_INFO_NONE, type.base);
+    }
+
+    return operand_lvalue(result_type, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+  }
+
+  /**
+  * Resolves a member expression.
+  *
+  * @param expression        The member expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_member(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Member) expression;
+
+    position := expression.position;
+    name := expression.name;
+
+    // First check if we reference a package.
+    package_to_look_in := self.resolve_expression_member_try_package(cast(*Expression) expression.expression);
+    if (package_to_look_in != null) {
+      symbol := package_get_symbol(package_to_look_in, position, name, .Public_Only);
+      self.resolve_symbol(symbol);
+      operand := self.resolve_expression_name_operand(position, statement_context, symbol, name, {});
+      self.set_resolved_symbol(cast(*Expression) expression, symbol);
+      return operand;
+    }
+
+    new_statement_context := statement_context;
+    set_flag(&new_statement_context.legal_statements, .Can_Refer_To_Enum_Item);
+    operand := self.resolve_expression(cast(*Expression) expression.expression, new_statement_context);
+    operand_remove_untyped(expression.expression.position, &operand);
+    type := operand.type;
+    self.complete_type(position, type);
+
+    // We do automatic dereferencing of pointers, so make sure the type is actually complete.
+    dereferencing_dynamic_pointer := false;
+    if (type.is_absolute_pointer() || type.is_self_relative_pointer() || type.is_layout_pointer() || type.is_dynamic_pointer()) {
+      dereferencing_dynamic_pointer = type.is_dynamic_pointer();
+      base := type.is_layout_pointer() ? type.base.base.base : type.base;
+      operand = operand_lvalue(base, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+      type = operand.type;
+      self.complete_type(position, type);
+    }
+
+    referring_to_enum_item := type.is_enumeration() && has_flag(operand.flags, .Is_Constant); // Feels kinda hacky that we are relying on the operand being constant.
+    referring_to_struct := type.is_struct();
+
+    found_method := false;
+    defer if (!found_method && length(expression.generic_types) > 0) then report_error_fatal(position, "'%' does not have generic type arguments", name);
+
+    if (referring_to_enum_item) {
+      enum_item_result, found_enum_item := self.resolve_expression_find_enum_item(cast(*Expression) expression, type, name);
+      if (found_enum_item) {
+        return enum_item_result;
+      }
+    } else if (referring_to_struct) {
+      field_result, found_field := self.resolve_expression_member_find_struct_field(cast(*Expression) expression, type, name, operand, null);
+      if (found_field) {
+        return field_result;
+      }
+    } else if (dereferencing_dynamic_pointer) {
+      dynamic_method_result, found_dynamic_method := self.resolve_expression_member_find_interface_method(cast(*Expression) expression, type, name, operand);
+      if (found_dynamic_method) {
+        return dynamic_method_result;
+      }
+    }
+
+    method_result: Operand;
+    method_result, found_method = self.resolve_expression_member_find_method(cast(*Expression) expression, type, name, operand);
+    if (found_method) {
+      return method_result;
+    }
+
+    self.resolve_expression_member_report_no_such_member(position, cast(*Expression) expression.expression, type, name);
+    return {};
+  }
+
+  /**
+  * Tries to get a package from a member expression.
+  *
+  * @param expression The member expression to try.
+  * @return The package that got resolved.
+  */
+  private proc resolve_expression_member_try_package(expression: *Expression) -> *Package {
+    if (expression.kind == .Name) {
+      expression := cast(*Expression_Name) expression;
+      name := expression.name;
+      if (length(expression.generic_types) == 0) {
+        symbol := self.resolve_name(expression.position, context.compiler.current_package, name);
+        if (symbol != null && symbol.kind == .Package) {
+          return symbol.value.(*Package);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+  * Tries to get a package from a member expression.
+  *
+  * @param expression  The member expression to check.
+  * @param struct_type The type of the struct.
+  * @param name        The name of the field to find.
+  * @param operand     The operand of the member expression.
+  * @param indices     The indices to fill while resolving.
+  * @return 1. The operand of the field; 2. True if the field could be found otherwise false.
+  */
+  private proc resolve_expression_member_find_struct_field(
+    expression: *Expression,
+    struct_type: *Type,
+    name: string,
+    operand: Operand,
+    indices: *[dynamic]int,
+  ) -> (Operand, bool) {
+    type_struct := cast(*Type_Struct) struct_type;
+    foreach (field, i in type_struct.fields) {
+      access_modifier := field.access_modifier;
+      field_name := field.name;
+      field_type := field.type;
+
+      if (field_name == name) {
+        symbol := struct_type.symbol;
+        position := symbol.declaration == null ? SOURCE_POSITION_BUILTIN : symbol.declaration.position;
+        self.resolve_expression_member_access_check(expression.position, access_modifier, symbol.package_file.package, position.file, field_name, symbol.name);
+
+        // We avoid allocating for simple direct access with just a single index.
+        if (indices == null) {
+          self.set_resolved_member(expression, {cast(int) i, {}, field_type});
+        } else {
+          // It might be that we have already resolved the member when we are an argument expression inside a generic routine call.
+          // When trying to infer generic type parameters we already got here.
+          // This is actually true for every argument expression and currently we are sort of doing the work twice.
+          // However this is the only instance where we allocate additional memory and because of that we only want to do it once. 
+          _, found := map_get(&self.output.resolved_members, expression);
+          if (!found) {
+            array_add(indices, i);
+            indices_copy := array_make!(int)(0, length(indices));
+            foreach (index in indices) {
+              array_add(&indices_copy, index);
+            }
+            self.set_resolved_member(expression, {-1, indices_copy, field_type});
+          }
+        }
+
+        is_pure := has_flag(operand.flags, .Is_Pure);
+        is_immutable := has_flag(operand.flags, .Is_Immutable);
+        if (has_flag(operand.flags, .Is_LValue)) {
+          return {operand_lvalue(field_type, is_pure, is_immutable), true};
+        } else {
+          return {operand_rvalue(field_type, is_pure, is_immutable), true};
+        }
+      } else if (type_struct.fields[i].is_composite) {
+        // We don't look into embedded fields we can't access normally based on the access modifier.
+        if (self.current_routine == null || has_flag(self.current_routine.flags, .Routine_Instantiated)) {
+          if (access_modifier == .Internal && struct_type.symbol.package_file.package != context.compiler.current_package) {
+            continue;
+          }
+          if (access_modifier == .Private && struct_type.symbol.declaration.position.file != expression.position.file) {
+            continue;
+          }
+        }
+
+        indices := indices;
+        local_indices := array_make!(int)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+        if (indices == null) {
+          indices = &local_indices;
+        }
+        array_add(indices, i);
+        
+        field_operand, found := self.resolve_expression_member_find_struct_field(expression, field_type, name, operand, indices);
+        if (found) {
+          return {field_operand, true};
+        }
+
+        array_pop(indices);
+      }
+    }
+
+    return {{}, false};
+  }
+  
+  /**
+  * Tries to find the method of an interface.
+  *
+  * @param expression     The member expression to check.
+  * @param interface_type The type of the interface.
+  * @param name           The name of the method to find.
+  * @param operand        The operand of the member expression.
+  * @return 1. The operand of the method; 2. True if the method could be found otherwise false.
+  */
+  private proc resolve_expression_member_find_interface_method(expression: *Expression, interface_type: *Type, name: string, operand: Operand) -> (Operand, bool) {
+    assert(interface_type.is_interface());
+
+    foreach (method, i in interface_type.methods) {
+      if (method.name == name) {
+        self.set_resolved_member(expression, {cast(int) i, {}, method.type});
+        is_pure := has_flag(operand.flags, .Is_Pure) || method.type.kind == .Function;
+        is_immutable := has_flag(operand.flags, .Is_Immutable);
+        return {operand_rvalue(method.type, is_pure, is_immutable), true};
+      }
+    }
+
+    return {{}, false};
+  }
+
+  /**
+  * Tries to find the method of a type.
+  *
+  * @param expression The member expression to check.
+  * @param type       The type to check.
+  * @param name       The name of the method to find.
+  * @param operand    The operand of the member expression.
+  * @return 1. The operand of the method; 2. True if the method could be found otherwise false.
+  */
+  private proc resolve_expression_member_find_method(expression: *Expression, type: *Type, name: string, operand: Operand) -> (Operand, bool) {
+    // First we try to find a regular method.
+    method, found := self.resolve_expression_member_find_method_in_methods(expression, {null, type}, type.methods, name, operand);
+    if (found) {
+      return {method, true};
+    }
+
+    // Now look at all the interfaces.
+    foreach (interface_type in type.interfaces) {
+      method, found := self.resolve_expression_member_find_method_in_methods(expression, {interface_type, type}, interface_type.methods, name, operand);
+      if (found) {
+        return {method, true};
+      } 
+    }
+
+    return {{}, false};
+  }
+
+  /**
+  * Tries to find a method in a collection.
+  *
+  * @param expression The member expression to check.
+  * @param key        The key of the type that implements the methods.
+  * @param name       The name of the method to find.
+  * @param operand    The operand of the member expression.
+  * @return 1. The operand of the method; 2. True if the method could be found otherwise false.
+  */
+  private proc resolve_expression_member_find_method_in_methods(
+    expression: *Expression,
+    key: Resolved_Implementation_Key,
+    methods: aosoa[dynamic]Type_Method,
+    name: string,
+    operand: Operand,
+  ) -> (Operand, bool) {
+    foreach (method in methods) {
+      if (method.name == name) {
+        symbol_name := key.implementation_type.symbol == null ? key.implementation_type.name : key.implementation_type.symbol.name;
+        self.resolve_expression_member_access_check(
+          expression.position,
+          method.access_modifier,
+          method.package,
+          method.file,
+          method.name,
+          symbol_name,
+        );
+
+        // We need to find the appropriate symbol in the corresponding implementation.
+        implementations, _ := map_get(&self.output.resolved_implementations, key);
+        foreach (implementation in implementations) {
+          symbol, found := map_get(&implementation.symbols, name);
+          if (found) {
+            self.resolve_symbol(symbol);
+            self.set_resolved_symbol(expression, symbol);
+            
+            is_pure := has_flag(operand.flags, .Is_Pure) || method.type.kind == .Function;
+            is_immutable := has_flag(operand.flags, .Is_Immutable);
+            return {operand_rvalue(method.type, is_pure, is_immutable), true};
+          }
+        }
+      }
+    }
+
+    return {{}, false};
+  }
+
+  /**
+  * Does an access check for a member.
+  *
+  * @param position        The position of the member expression.
+  * @param access_modifier The access modifier of the member.
+  * @param pack            The package the member belongs to.
+  * @param file            The file the member belongs to.
+  * @param member_name     The name of the member.
+  * @param symbol_name     The name of the symbol.
+  */
+  private proc resolve_expression_member_access_check(
+    position: Source_Position,
+    access_modifier: Access_Modifier,
+    package: *Package,
+    file: string,
+    member_name: string,
+    symbol_name: string,
+  ) {
+    // Check if we are allowed to access. However we exclude instantiated generic routines.
+    if (self.current_routine == null || !has_flag(self.current_routine.flags, .Routine_Instantiated)) {
+      if (access_modifier == .Internal) {
+        if (package != context.compiler.current_package) {
+          report_error_fatal(position, "Trying to access internal member '%' of type '%'", member_name, symbol_name);
+        }
+      } else if (access_modifier == .Private) {
+        if (file != position.file) {
+          report_error_fatal(position, "Trying to access private member '%' of type '%'", member_name, symbol_name);
+        }
+      }
+    }
+  }
+
+  /**
+  * Reports that no member could be found for a member expression.
+  *
+  * @param position          The position of the member expression.
+  * @param member_expression The expression of the member expression.
+  * @param type              The type of the member expression.
+  * @parma name              The name of the member that could not be found.
+  */
+  private proc resolve_expression_member_report_no_such_member(position: Source_Position, member_expression: *Expression, type: *Type, name: string) {
+    if (member_expression.kind == .Name) {
+      type_name := (cast(*Expression_Name) member_expression).name;
+      report_error_fatal(position, "'%' of type '%' has no member '%'", type_name, type.name, name);
+    } else if (member_expression.kind == .Member) {
+      type_name := (cast(*Expression_Member) member_expression).name;
+      report_error_fatal(position, "'%' of type '%' has no member '%'", type_name, type.name, name);
+    } else {
+      report_error_fatal(position, "The type '%' has no member '%'", type.name, name);
+    }
+  }
+
+  /**
+  * Resolves a compound expression.
+  *
+  * @param expression        The compound expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_compound(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    expression := cast(*Expression_Compound) expression;
+
+    if ((expected_type == null || expected_type.is_any()) && expression.type == null) {
+      report_error_fatal(expression.position, "Cannot infer type of compound literal. Missing explicit type");
+    }
+
+    type: *Type;
+    if (expression.type != null) {
+      type = self.resolve_type_specification(cast(*Type_Specification) expression.type);
+    } else {
+      type = expected_type;
+    }
+    type = type.unqualify();
+    result_type := type;
+
+    self.complete_type(expression.position, type);
+
+    // We allow an empty compound literal ('{}') to be a constant for every type.
+    if (length(expression.fields) == 0) {
+      assert(!result_type.is_untyped());
+      return operand_constant(result_type, value_default(result_type));
+    }
+
+    // For now we simply disallow initializing SoA/AoSoA types through compound expressions.
+    // It could however in theory be supported as there is no technical reason which would make it impossible.
+    if (type.is_soa_or_aosoa()) {
+      report_error_fatal(expression.position, "Compound expression for SoA/AoSoA type '%' is not supported", type.name);
+    }
+
+    if (type.is_array()) {
+      array_type := self.resolve_expression_compound_array(expression, statement_context, type);
+      // We overwrite the result only for incomplete arrays.
+      if ((cast(*Type_Array) type).has_incomplete_elements) {
+        result_type = array_type;
+      }
+    } else if (type.is_slice()) {
+      self.resolve_expression_compound_slice(expression, statement_context, type);
+    } else if (type.is_tuple()) {
+      self.resolve_expression_compound_tuple(expression, statement_context, type);
+    } else if (type.is_struct()) {
+      self.resolve_expression_compound_struct(expression, statement_context, type);
+    } else {
+      report_error_fatal(expression.position, "Illegal compound literal for type '%'", type.name);
+    }
+
+    return operand_lvalue(result_type, true, false);
+  }
+
+  /**
+  * Resolves an array compound expression.
+  *
+  * @param resolver          The reference to the resolver.
+  * @param expression        The compound expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param type              The type of the compound expression.
+  * @return The type of the array.
+  */
+  private proc resolve_expression_compound_array(expression: *Expression_Compound, statement_context: Statement_Context, type: *Type) -> *Type {
+    type_array := cast(*Type_Array) type;
+    has_incomplete_elements := type_array.has_incomplete_elements;
+    number_of_elements := type_array.number_of_elements;
+
+    index := 0;
+    max_index := 0;
+    foreach (field in expression.fields) {
+      compound_field := *field;
+
+      if (compound_field.kind == .Name) {
+        report_error_fatal(compound_field.position, "Illegal name field initializer in compound literal");
+      } else if (compound_field.kind == .Index) {
+        operand := self.resolve_expression_constant(compound_field.value.(*Expression), statement_context);
+        if (operand.type.is_enumeration() || operand.type.is_char()) {
+          self.operand_cast(compound_field.position, &operand, context.storage.type_int);
+        } else {
+          if (!self.operand_convert(compound_field.position, &operand, context.storage.type_int)) {
+            report_error_fatal(compound_field.position, "Index compound field initializer must have an integer type. Got '%'", operand.type.name);
+          }
+        }
+        index = operand.value.(int);
+        if (index < 0) {
+          report_error_fatal(compound_field.position, "Index compound field initializer cannot be negative");
+        }
+        if (!has_incomplete_elements && index >= number_of_elements) {
+          report_error_fatal(compound_field.position, "Compound index '%' is out of bounds for array type '%'", number_of_elements, type.name);
+        }
+      }
+
+      if (!has_incomplete_elements && index >= number_of_elements) {
+        report_error_fatal(compound_field.position, "Array compound literal out of range. Expected '%' got '%'", number_of_elements, length(expression.fields));
+      }
+
+      self.resolve_compound_expression_initializer(compound_field, statement_context, type.base, index);
+
+      max_index = max(max_index, index);
+      index += 1;
+    }
+
+    if (has_incomplete_elements) {
+      // We should never get here with an SoA/AoSoA array.
+      return context.storage.get_or_make_type_array(SOA_INFO_NONE, type.base, max_index + 1, false);
+    } else {
+      return type;
+    }
+  }
+
+  /**
+  * Resolves a slice compound expression.
+  *
+  * @param expression        The compound expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param type              The type of the compound expression.
+  */
+  private proc resolve_expression_compound_slice(expression: *Expression_Compound, statement_context: Statement_Context, type: *Type) {
+    index := 0;
+    foreach (field in expression.fields) {
+      if (field.kind == .Index) {
+        report_error_fatal(field.position, "Illegal index field initializer in compound literal");
+      } else if (field.kind == .Name) {
+        report_error_fatal(field.position, "Illegal name field initializer in compound literal");
+      }
+
+      self.resolve_compound_expression_initializer(*field, statement_context, type.base, index);
+
+      index += 1;
+    }
+  }
+
+  /**
+  * Resolves a tuple compound expression.
+  *
+  * @param expression        The compound expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param type              The type of the compound expression.
+  */
+  private proc resolve_expression_compound_tuple(expression: *Expression_Compound, statement_context: Statement_Context, type: *Type) {
+    type_tuple := cast(*Type_Tuple) type;
+
+    if (length(expression.fields) > 0) {
+      if (length(expression.fields) != length(type_tuple.elements)) {
+        report_error_fatal(
+          expression.position,
+          "Mismatched initializer expression count in compound literal. Expected '%' got '%'",
+          length(type_tuple.elements),
+          length(expression.fields),
+        );
+      }
+    }
+
+    index := 0;
+    foreach (field in expression.fields) {
+      if (field.kind == .Index) {
+        report_error_fatal(field.position, "Illegal index field initializer in compound literal");
+      } else if (field.kind == .Name) {
+        report_error_fatal(field.position, "Illegal name field initializer in compound literal");
+      }
+
+      element_type := type_tuple.elements[index].type;
+      self.resolve_compound_expression_initializer(*field, statement_context, element_type, index);
+
+      index += 1;
+    }
+  }
+
+  /**
+  * Resolves a struct compound expression.
+  *
+  * @param expression        The compound expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param type              The type of the compound expression.
+  */
+  private proc resolve_expression_compound_struct(expression: *Expression_Compound, statement_context: Statement_Context, type: *Type) {
+    type_struct := cast(*Type_Struct) type;
+
+    if (length(expression.fields) > 0) {
+      if (length(expression.fields) != length(type_struct.fields)) {
+        report_error_fatal(
+          expression.position,
+          "Mismatched initializer expression count in compound literal. Expected '%' got '%'",
+          length(type_struct.fields),
+          length(expression.fields),
+        );
+      }
+    }
+
+    index := 0;
+    foreach (field in expression.fields) {
+      if (field.kind == .Index) {
+        report_error_fatal(field.position, "Illegal index field initializer in compound literal");
+      } else if (field.kind == .Name) {
+        struct_field_name := field.value.(string);
+        index = type.get_struct_field_index(struct_field_name); 
+        if (index < 0) {
+          report_error_fatal(
+            field.position,
+            "Referenced field '%' in compound literal does not exist on struct of type '%'",
+            struct_field_name,
+            type.name,
+          );
+        }
+      }
+
+      field_type := type_struct.fields[index].type;
+      self.resolve_compound_expression_initializer(*field, statement_context, field_type, index);
+
+      index += 1;
+    }
+  }
+
+  /**
+  * Resolves a compound field initializer.
+  *
+  * @param compound_field    The compound field whose initializer to resolve.
+  * @param statement_context The statement context to use.
+  * @param field_type        The type of the compound field.
+  * @param index             The index of the compound field.
+  */
+  private proc resolve_compound_expression_initializer(
+    compound_field: Expression_Compound_Field,
+    statement_context: Statement_Context,
+    field_type: *Type,
+    index: int,
+  ) {
+    compound_field_type, success := self.resolve_initializer_typed(statement_context, field_type, compound_field.initializer);
+    if (!success) {
+      report_error_fatal(compound_field.position, "Invalid type in compound literal. Expected '%' got '%'", field_type.name, compound_field_type.name);
+    }
+    self.set_resolved_compound_field(compound_field.initializer, {index, field_type});
+  }
+
+  /**
+  * Resolves a selector expression.
+  *
+  * @param expression        The selector expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_selector(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Selector) expression;
+
+    operand := self.resolve_expression(cast(*Expression) expression.expression, statement_context);
+    union_type := operand.type;
+    if (union_type.is_absolute_pointer() || union_type.is_self_relative_pointer()) {
+      union_type = union_type.base;
+    }
+    if (!union_type.is_union()) {
+      report_error_fatal(expression.expression.position, "Selector expressions are only valid on union types. Got '%'", operand.type.name);
+    }
+    self.complete_type(expression.expression.position, union_type);
+
+    selected_type := self.resolve_type_specification(cast(*Type_Specification) expression.type);
+    self.complete_type(expression.type.position, selected_type);
+
+    is_type_in_union := false;
+    type_union := cast(*Type_Union) union_type;
+    foreach (variant in type_union.variants) {
+      if (variant == selected_type) {
+        is_type_in_union = true;
+        break;
+      }
+    }
+
+    if (!is_type_in_union) {
+      report_error_fatal(expression.position, "The type '%' is not a variant of the union '%'", selected_type.name, operand.type.name);
+    }
+
+    return operand_rvalue(selected_type, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+  }
+
+  /**
+  * Resolves an implicit selector expression.
+  *
+  * @param expression        The implicit selector expression to resolve.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_implicit_selector(expression: *Expression, expected_type: *Type) -> Operand {
+    expression := cast(*Expression_Implicit_Selector) expression;
+
+    if (expected_type == null) {
+      report_error_fatal(expression.position, "Implicit selector cannot infer type. Use explicit enum access");
+    }
+
+    if (!expected_type.is_enumeration()) {
+      report_error_fatal(expression.position, "Implicit selector only works for enumerations. Got '%'", expected_type.name);
+    }
+
+    enum_item, found_enum_item := self.resolve_expression_find_enum_item(cast(*Expression) expression, expected_type, expression.name);
+    if (found_enum_item) {
+      return enum_item;
+    } else {
+      report_error_fatal(expression.position, "Enumeration type '%' does not have an item named '%'", expected_type.name, expression.name);
+      return {};
+    }
+  }
+
+  /**
+  * Resolves an unary expression.
+  *
+  * @param expression        The unary expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_unary(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    expression := cast(*Expression_Unary) expression;
+
+    if (expression.operator == .And) {
+      return self.resolve_expression_unary_address(expression, statement_context, expected_type);    
+    } else {
+      return self.resolve_expression_unary_basic(expression, statement_context);
+    }
+  }
+
+  /**
+  * Resolves an address unary expression.
+  *
+  * @param expression        The unary expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_unary_address(expression: *Expression_Unary, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    operand: Operand;
+    if (expected_type != null && (expected_type.is_absolute_pointer() || expected_type.is_self_relative_pointer())) {
+      operand = self.resolve_expression_expected(cast(*Expression) expression.expression, statement_context, expected_type.base);
+    } else {
+      operand = self.resolve_expression(cast(*Expression) expression.expression, statement_context);
+    }
+    if (!has_flag(operand.flags, .Is_LValue)) {
+      report_error_fatal(expression.position, "Cannot take address of non-lvalue");
+    }
+    if (has_flag(operand.flags, .Is_Immutable)) {
+      // For now we don't want to disallow taking the address of members of immutables.
+      // Something like this: 'foreach (foo in foos) { p := &foo.bar; }' should work even though 'foo' itself is immutable.
+      if (expression.expression.kind == .Name) {
+        report_error_fatal(expression.position, "Cannot take address of immutable");
+      }
+    }
+    if (has_flag(operand.flags, .Is_Parameter)) {
+      report_error_fatal(expression.position, "Cannot take address of parameter");
+    }
+
+    result_type: *Type;
+    if (expression.expression.kind == .Index) {
+      expression := cast(*Expression_Index) expression.expression;
+      index_expression_type, found := map_get(&self.output.resolved_types, cast(*Expression) expression.expression);
+      assert(found);
+      if (index_expression_type.is_absolute_pointer() || index_expression_type.is_self_relative_pointer()) {
+        index_expression_type = index_expression_type.base;
+      }
+
+      // We have to remember that the base of an SoA/AoSoA pointer is the actual layout collection.
+      if (index_expression_type.is_soa()) {
+        result_type = context.storage.get_or_make_type_soa_pointer(index_expression_type);
+      } else if (index_expression_type.is_aosoa()) {
+        result_type = context.storage.get_or_make_type_aosoa_pointer(index_expression_type);
+      }
+    }
+
+    if (result_type == null) {
+      if (expected_type != null && expected_type.is_self_relative_pointer()) {
+        relative_base := (cast(*Type_Relative_Pointer) expected_type).relative_base;
+        result_type = context.storage.get_or_make_type_self_relative_pointer(operand.type, relative_base);
+      } else {
+        result_type = context.storage.get_or_make_type_pointer(operand.type);
+      }
+    }
+
+    return operand_rvalue(result_type, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+  }
+
+  /**
+  * Resolves a basic unary expression.
+  *
+  * @param expression        The unary expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_unary_basic(expression: *Expression_Unary, statement_context: Statement_Context) -> Operand {
+    operator := expression.operator;
+
+    operand := self.resolve_expression(cast(*Expression) expression.expression, statement_context);
+    type := operand.type;
+
+    switch (operator) {
+      case .Multiply: {
+        if (!type.is_absolute_pointer() && !type.is_self_relative_pointer() && !type.is_layout_pointer()) {
+          if (type.is_offset_relative_pointer()) {
+            report_error_fatal(expression.position, "Cannot directly dereference offset-relative pointer type. Use offset dereference expression instead");
+          } else {
+            report_error_fatal(expression.position, "Cannot dereference non-pointer type '%'", type.name);
+          }
+        }
+        if (type.is_raw_pointer()) {
+          report_error_fatal(expression.position, "Cannot dereference rawptr");
+        }
+
+        base := type.base;
+        if (type.is_layout_pointer()) {
+          base = type.base.base.base;
+        }
+
+        return operand_lvalue(base, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+      }
+      case .Add, .Subtract: {
+        if (!type.is_arithmetic()) {
+          report_error_fatal(expression.position, "Can only use unary '%' with arithmetic types", lexer_get_token_kind_name(operator));
+        }
+        return self.resolve_operation_unary_basic(operator, operand);
+      }
+      case .Negate: {
+        if (!type.is_integer() && !type.is_enumeration()) {
+          report_error_fatal(expression.position, "Can only use '~' with integer or enum types");
+        }
+        return self.resolve_operation_unary_basic(operator, operand);
+      }
+      case .Not: {
+        if (!type.is_boolean()) {
+          report_error_fatal(expression.position, "Can only use '!' with bool type");
+        }
+        return self.resolve_operation_unary_basic(operator, operand);
+      }
+    }
+
+    assert(false);
+    return {};
+  }
+
+  /**
+  * Resolves a basic unary operation.
+  *
+  * @param operator The operator of the oepration.
+  * @param operand  The operand of the unary expression.
+  * @return The operand of the operation.
+  */
+  private proc resolve_operation_unary_basic(operator: Token_Kind, operand: Operand) -> Operand {
+    if (has_flag(operand.flags, .Is_Constant)) {
+      return operand_constant(operand.type, self.evaluate_operation_unary(operator, operand.type, operand.value));
+    } else {
+      return operand;
+    }
+  }
+
+  /**
+  * Resolves a binary expression.
+  *
+  * @param expression        The binary expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_binary(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Binary) expression;
+
+    left_expression := cast(*Expression) expression.left;
+    right_expression := cast(*Expression) expression.right;
+
+    // We explicitly check for implicit selector expressions here to allow for something like: foo == .Foo.
+    // And to resolve that properly we need to figure out the expected type first.
+    left_is_implicit_selector := left_expression.kind == .Implicit_Selector;
+    right_is_implicit_selector := right_expression.kind == .Implicit_Selector;
+
+    left: Operand;
+    right: Operand;
+    if (left_is_implicit_selector || right_is_implicit_selector) {
+      if (left_is_implicit_selector) {
+        right = self.resolve_expression_rvalue(right_expression, statement_context);
+        left = self.resolve_expression_expected_rvalue(left_expression, statement_context, right.type);
+      } else {
+        left = self.resolve_expression_rvalue(left_expression, statement_context);
+        right = self.resolve_expression_expected_rvalue(right_expression, statement_context, left.type);
+      }
+    } else {
+      left = self.resolve_expression_rvalue(left_expression, statement_context);
+      right = self.resolve_expression_rvalue(right_expression, statement_context);
+    }
+
+    return self.resolve_expression_binary_operation(expression.position, expression.operator, left, right, left_expression, right_expression);
+  }
+
+  /**
+  * Resolves a binary expression operation.
+  *
+  * @param position         The position of the operation.
+  * @param operator         The operator of the operation.
+  * @param left             The left operand.
+  * @param right            The right operand.
+  * @param left_expression  The left expression.
+  * @param right_expression The right expression.
+  * @return The operand of the operation.
+  */
+  internal proc resolve_expression_binary_operation(
+    position: Source_Position,
+    operator: Token_Kind,
+    left: Operand,
+    right: Operand,
+    left_expression: *Expression,
+    right_expression: *Expression,
+  ) -> Operand {
+    left_type := left.type;
+    right_type := right.type;
+
+    switch (operator) {
+      case .Multiply, .Divide: {
+        if (!left_type.is_arithmetic()) {
+          report_error_fatal(position, "Left operand of '%' must have an arithmetic type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+        }
+        if (!right_type.is_arithmetic()) {
+          report_error_fatal(position, "Right operand of '%' must have an arithmetic type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+        }
+        return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+      }
+      case .Modulo: {
+        if (!left_type.is_integer()) {
+          report_error_fatal(position, "Left operand of '%' must have an integer type. Got '%'", left_type.name);
+        }
+        if (!right_type.is_integer()) {
+          report_error_fatal(position, "Right operand of '%' must have an integer type. Got '%'", right_type.name);
+        }
+        return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+      }
+      case .Add: {
+        is_doing_pointer_arithmetic := left_type.is_absolute_pointer() || right_type.is_absolute_pointer();
+        if (is_doing_pointer_arithmetic) {
+          return self.resolve_operation_binary_pointer_arithmetic(position, operator, left, right);
+        } else {
+          if (!left_type.is_arithmetic()) {
+            report_error_fatal(position, "Left operand of '+' must have an arithmetic type. Got '%'", left_type.name);
+          }
+          if (!right_type.is_arithmetic()) {
+            report_error_fatal(position, "Right operand of '+' must have an arithmetic type. Got '%'", right_type.name);
+          }
+          return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+        }
+      }
+      case .Subtract: {
+        is_doing_pointer_arithmetic := left_type.is_absolute_pointer() || right_type.is_absolute_pointer();
+        if (is_doing_pointer_arithmetic) {
+          return self.resolve_operation_binary_pointer_arithmetic(position, operator, left, right);
+        } else {
+          if (!left_type.is_arithmetic()) {
+            report_error_fatal(position, "Left operand of '%' must have an arithmetic type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+          }
+          if (!right_type.is_arithmetic()) {
+            report_error_fatal(position, "Right operand of '%' must have an arithmetic type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+          }
+          return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+        }
+      }
+
+      case .Left_Shift, .Right_Shift: {
+        if (!left_type.is_integer()) {
+          report_error_fatal(position, "Left operand of '%' must have an integer type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+        }
+        if (!right_type.is_unsigned() && right_type.kind != .Untyped_Integer) {
+          report_error_fatal(position, "Right operand of '%' must have an unsigned integer type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+        }
+
+        if (has_flag(left.flags, .Is_Constant) && has_flag(right.flags, .Is_Constant)) {
+          return operand_constant(left_type, self.evaluate_operation_binary_shift(operator, left, right));
+        } else {
+          is_pure := has_flag(left.flags, .Is_Pure) && has_flag(right.flags, .Is_Pure);
+          is_immutable := has_flag(left.flags, .Is_Immutable) && has_flag(right.flags, .Is_Immutable);
+          return operand_rvalue(left_type, is_pure, is_immutable);
+        }
+      }
+
+      case .And, .Or, .Xor: {
+        if (!left_type.is_integer() && !left_type.is_enumeration()) {
+          report_error_fatal(position, "Left operand of '%' must have an integer or enum type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+        }
+        if (!right_type.is_integer() && !right_type.is_enumeration()) {
+          report_error_fatal(position, "Right operand of '%' must have an integer or enum type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+        }
+        return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+      }
+
+      case .Equal, .Not_Equal: {
+        if (!left_type.is_scalar() &&
+          !left_type.is_string_like() &&
+          !left_type.is_absolute_or_relative_pointer_like() &&
+          !left_type.is_dynamic_pointer() &&
+          !left_type.is_union() &&
+          !left_type.is_typeid()) {
+          report_error_fatal(
+            position,
+            "Left operand of '%' must have a scalar, string, pointer, union or typeid type. Got '%'",
+            lexer_get_token_kind_name(operator),
+            left_type.name,
+          );
+        }
+        if (!right_type.is_scalar() &&
+          !right_type.is_string_like() &&
+          !right_type.is_absolute_or_relative_pointer_like() &&
+          !right_type.is_dynamic_pointer() &&
+          !right_type.is_union() &&
+          !right_type.is_typeid()) {
+          report_error_fatal(
+            position,
+            "Right operand of '%' must have a scalar, string, pointer, union or typeid type. Got '%'",
+            lexer_get_token_kind_name(operator),
+            right_type.name,
+          );
+        }
+
+        result := self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+        operand_cast_unchecked(position, &result, context.storage.type_bool);
+        return result;
+      }
+
+      case .Less_Than, .Less_Than_Equal, .Greater_Than, .Greater_Than_Equal: {
+        if (!left_type.is_scalar() && !left_type.is_absolute_or_relative_pointer_like()) {
+          report_error_fatal(position, "Left operand of '%' must have a scalar or pointer type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+        }
+        if (!right_type.is_scalar() && !right_type.is_absolute_or_relative_pointer_like()) {
+          report_error_fatal(position, "Right operand of '%' must have a scalar or pointer type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+        }
+
+        result := self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+        operand_cast_unchecked(position, &result, context.storage.type_bool);
+        return result;
+      }
+
+      case .And_And, .Or_Or: {
+        if (!left_type.is_boolean()) {
+          report_error_fatal(position, "Left operand of '%' must have a boolean type. Got '%'", lexer_get_token_kind_name(operator), left_type.name);
+        }
+        if (!right_type.is_boolean()) {
+          report_error_fatal(position, "Right operand of '%' must have a boolean type. Got '%'", lexer_get_token_kind_name(operator), right_type.name);
+        }
+        return self.resolve_operation_binary(position, operator, left, right, left_expression, right_expression);
+      }
+    }
+
+    return {};
+  }
+
+  /**
+  * Resolves a binary operation.
+  *
+  * @param position         The position of the operation.
+  * @param operator         The operator of the operation.
+  * @param left             The left operand.
+  * @param right            The right operand.
+  * @param left_expression  The left expression.
+  * @param right_expression The right expression.
+  * @return The operand of the operation.
+  */
+  private proc resolve_operation_binary(
+    position: Source_Position,
+    operator: Token_Kind,
+    left: Operand,
+    right: Operand,
+    left_expression: *Expression,
+    right_expression: *Expression,
+  ) -> Operand {
+    left := left;
+    right := right;
+
+    left_type := left.type;
+    right_type := right.type;
+
+    // First coerce types to be properly compatible.
+    type: *Type = left.type;
+    if (left_type.is_untyped() && !right_type.is_untyped()) {
+      // We try to coerce the untyped left into the typed right.
+      if (!self.operand_convert(position, &left, right.type)) {
+        report_error_fatal(
+          position,
+          "Operands of '%' must have the same type. Got '%' and '%'",
+          lexer_get_token_kind_name(operator),
+          left.type.name,
+          right.type.name,
+        );
+      }
+      type = right.type;
+    } else if (!left_type.is_untyped() && right_type.is_untyped()) {
+      // We try to coerce the untyped right into the typed left.
+      if (!self.operand_convert(position, &right, left.type)) {
+        report_error_fatal(
+          position, 
+          "Operands of '%' must have the same type. Got '%' and '%'",
+          lexer_get_token_kind_name(operator),
+          left.type.name,
+          right.type.name,
+        );
+      }
+    } else if (!left_type.is_untyped() && !right_type.is_untyped()) {
+      if (left_type.is_union()) {
+        report_error_fatal(position, "Can only compare unions with 'null'");
+      }
+      // If both are not untyped, we try to coerce the right into the left type.
+      if (!self.operand_convert(position, &right, left.type)) {
+        report_error_fatal(
+          position,
+          "Operands of '%' must have the same type. Got '%' and '%'",
+          lexer_get_token_kind_name(operator),
+          left.type.name,
+          right.type.name,
+        );
+      }
+    } else if (left_type.is_untyped_null() && right_type.is_untyped_null()) {
+      report_error_fatal(position, "Operands of '%' cannot both be 'null'", lexer_get_token_kind_name(operator));
+    }
+
+    self.set_resolved_type(left_expression, left.type);
+    self.set_resolved_type(right_expression, right.type);
+
+    result_type := type;
+    if (operator >= .First_Comparison && operator <= .Last_Comparison) {
+      // The result of a comparison is always a boolean.
+      result_type = context.storage.type_bool;
+    }
+
+    if (has_flag(right.flags, .Is_Constant) && (operator == .Divide || operator == .Modulo)) {
+      self.resolve_expression_binary_check_for_zero(position, right);
+    }
+
+    if (has_flag(left.flags, .Is_Constant) && has_flag(right.flags, .Is_Constant)) {
+      return operand_constant(result_type, self.evaluate_operation_binary(operator, type, left.value, right.value));
+    } else {
+      is_pure := has_flag(left.flags, .Is_Pure) && has_flag(right.flags, .Is_Pure);
+      is_immutable := has_flag(left.flags, .Is_Immutable) && has_flag(right.flags, .Is_Immutable);
+      return operand_rvalue(result_type, is_pure, is_immutable);
+    }
+  }
+
+  /**
+  * Resolves an arithmetic binary operation.
+  *
+  * @param position The position of the operation.
+  * @param operator The operator of the operation.
+  * @param left     The left operand.
+  * @param right    The right operand.
+  * @return The operand of the operation.
+  */
+  private proc resolve_operation_binary_pointer_arithmetic(position: Source_Position, operator: Token_Kind, left: Operand, right: Operand) -> Operand {
+    left_type := left.type;
+    right_type := right.type;
+
+    is_pure := has_flag(left.flags, .Is_Pure) && has_flag(right.flags, .Is_Pure);
+    is_immutable := has_flag(left.flags, .Is_Immutable) && has_flag(right.flags, .Is_Immutable);
+
+    switch (operator) {
+      case .Add: {
+        if (left_type.is_absolute_pointer()) {
+          if (!right_type.is_offset_relative_pointer()) {
+            report_error_fatal(position, "Right operand of '+' must be an offset-relative pointer. Got '%'", right_type.name);
+          } else if (right_type.base != left_type.base) {
+            report_error_fatal(
+              position,
+              "Right operand of '+' must be an offset-relative pointer with the same base. Expected '%' as base got '%'",
+              left_type.base.name,
+              right_type.base.name,
+            );
+          } else {
+            return operand_rvalue(left_type, is_pure, is_immutable);
+          }
+        } else {
+          if (!left_type.is_offset_relative_pointer()) {
+            report_error_fatal(position, "Left operand of '+' must be an offset-relative pointer. Got '%'", left_type.name);
+          } else if (left_type.base != right_type.base) {
+            report_error_fatal(
+              position,
+              "Left operand of '+' must be an offset-relative pointer with the same base. Expected '%' as base got '%'",
+              right_type.base.name,
+              left_type.base.name,
+            );
+          } else {
+            return operand_rvalue(right_type, is_pure, is_immutable);
+          }
+        }
+      }
+      case .Subtract: {
+        if (!left_type.is_absolute_pointer()) {
+          report_error_fatal(position, "Left operand of '-' must be an absolute pointer. Got '%'", left_type.name);
+        } else if (!right_type.is_absolute_pointer()) {
+          report_error_fatal(position, "Right operand of '-' must be an absolute pointer. Got '%'", left_type.name);
+        }
+        offset_relative_pointer_type := context.storage.get_or_make_type_offset_relative_pointer(left_type.base, context.storage.type_int);
+        return operand_rvalue(offset_relative_pointer_type, is_pure, is_immutable);
+      }
+    }
+
+    assert(false);
+    return {};
+  }
+
+  /**
+  * Checks for zero in an operand.
+  *
+  * @param position The position of the operand expression.
+  * @param operand  The operand to check.
+  */
+  private proc resolve_expression_binary_check_for_zero(position: Source_Position, operand: Operand) {
+    if (!has_flag(operand.flags, .Is_Constant)) then return;
+
+    if (operand.type.is_integer()) {
+      value: u64;
+      switch (operand.type.kind) {
+        case .I8:              value = cast(u64) operand.value.(i8);
+        case .I16:             value = cast(u64) operand.value.(i16);
+        case .I32:             value = cast(u64) operand.value.(i32);
+        case .I64:             value = cast(u64) operand.value.(i64);
+        case .Int:             value = cast(u64) operand.value.(int);
+        case .U8:              value = cast(u64) operand.value.(u8);
+        case .U16:             value = cast(u64) operand.value.(u16);
+        case .U32:             value = cast(u64) operand.value.(u32);
+        case .U64:             value = cast(u64) operand.value.(u64);
+        case .UInt:            value = cast(u64) operand.value.(uint);
+        case .Untyped_Integer: value = cast(u64) operand.value.(int);
+        case: assert(false);
+      }
+
+      if (value == 0) {
+        report_error_fatal(position, "Division by zero is not allowed");
+      }
+    } else if (operand.type.is_float()) {
+      value: f64;
+      switch (operand.type.kind) {
+        case .F32:           value = cast(f64) operand.value.(f32);
+        case .F64:           value = cast(f64) operand.value.(f64);
+        case .Untyped_Float: value = cast(f64) operand.value.(f64);
+        case: assert(false);
+      }
+
+      if (value == 0.0) {
+        report_error_fatal(position, "Division by zero is not allowed");
+      }
+    } else {
+      assert(false);
+    }
+  }
+
+  /**
+  * Resolves a ternary expression.
+  *
+  * @param expression        The ternary expression to resolve.
+  * @param statement_context The statement context to use.
+  * @param expected_type     The type to expect.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_ternary(expression: *Expression, statement_context: Statement_Context, expected_type: *Type) -> Operand {
+    expression := cast(*Expression_Ternary) expression;
+
+    condition := self.resolve_expression_rvalue(cast(*Expression) expression.condition, statement_context);
+    if (!condition.type.is_boolean()) {
+      report_error_fatal(expression.condition.position, "Ternary condition must be a boolean. Got '%'", condition.type.name);
+    }
+
+    then_operand := self.resolve_expression_expected_rvalue(cast(*Expression) expression.then_expression, statement_context, expected_type);
+    else_operand := self.resolve_expression_expected_rvalue(cast(*Expression) expression.else_expression, statement_context, expected_type);
+
+    then_untyped := then_operand.type.is_untyped();
+    else_untyped := else_operand.type.is_untyped();
+    both_untyped := then_untyped && else_untyped;
+
+    if (!both_untyped) {
+      if (then_untyped) {
+        if (!self.operand_convert(expression.position, &then_operand, else_operand.type)) {
+          report_error_fatal(expression.position, "Incompatible types in ternary expression. '%v' and '%v'", else_operand.type.name, then_operand.type.name);
+        }
+      } else {
+        if (!self.operand_convert(expression.position, &else_operand, then_operand.type)) {
+          report_error_fatal(expression.position, "Incompatible types in ternary expression. '%v' and '%v'", then_operand.type.name, else_operand.type.name);
+        }
+      }
+    } else {
+      operand_remove_untyped(expression.then_expression.position, &then_operand);
+      operand_remove_untyped(expression.else_expression.position, &else_operand);
+    }
+
+    if (then_operand.type == else_operand.type) {
+      if (expected_type == null && then_operand.type.is_untyped_null()) {
+        report_error_fatal(expression.position, "Cannot determine type from 'untyped null' in ternary expression");  
+      }
+
+      result_type := both_untyped && expected_type != null ? expected_type : then_operand.type;
+      if (has_flag(condition.flags, .Is_Constant) && has_flag(else_operand.flags, .Is_Constant) && has_flag(then_operand.flags, .Is_Constant)) {
+        return operand_constant(result_type, condition.value.(bool) ? then_operand.value : else_operand.value);
+      } else {
+        is_pure := has_flag(condition.flags, .Is_Pure) && has_flag(else_operand.flags, .Is_Pure) && has_flag(then_operand.flags, .Is_Pure);
+        is_immutable := has_flag(condition.flags, .Is_Immutable) && has_flag(else_operand.flags, .Is_Immutable) && has_flag(then_operand.flags, .Is_Immutable);
+        return operand_rvalue(result_type, is_pure, is_immutable);
+      }
+    } else if (then_operand.type.is_absolute_pointer_like() && else_operand.type.is_untyped_null()) { 
+      return operand_rvalue(then_operand.type, has_flag(then_operand.flags, .Is_Constant), has_flag(then_operand.flags, .Is_Immutable));
+    } else if (then_operand.type.is_untyped_null() && else_operand.type.is_absolute_pointer_like()) { 
+      return operand_rvalue(else_operand.type, has_flag(else_operand.flags, .Is_Constant), has_flag(else_operand.flags, .Is_Constant));
+    } else {
+      report_error_fatal(expression.position, "Incompatible types in ternary expression. '%' and '%'", then_operand.type.name, else_operand.type.name);
+      return {};
+    }
+  }
+
+  /**
+  * Resolves a modify expression.
+  *
+  * @param expression        The modify expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  proc resolve_expression_modify(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Modify) expression;
+
+    operand := self.resolve_expression(cast(*Expression) expression.expression, statement_context);
+    type := operand.type;
+    self.complete_type(expression.position, type);
+
+    if (!has_flag(operand.flags, .Is_LValue)) {
+      report_error_fatal(expression.position, "Cannot modify non-lvalue");
+    }
+    if (has_flag(operand.flags, .Is_Parameter)) {
+      report_error_fatal(expression.position, "Cannot modify parameter");
+    }
+    if (has_flag(type.flags, .Non_Modifiable)) {
+      report_error_fatal(expression.position, "Cannot modify non-modifiable type");
+    }
+    if (!type.is_integer()) {
+      report_error_fatal(expression.position, "'%' is only valid for integer types", lexer_get_token_kind_name(expression.operator));
+    }
+
+    return operand_rvalue(type, has_flag(operand.flags, .Is_Pure), has_flag(operand.flags, .Is_Immutable));
+  }
+
+  /**
+  * Resolves a query expression.
+  *
+  * @param expression        The query expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_query(expression: *Expression, statement_context: Statement_Context) -> Operand {
+    expression := cast(*Expression_Query) expression;
+    storage := context.storage;
+
+    result: Operand;
+    constant: Operand;
+    switch (expression.query_kind) {
+      case .Size_Of_Expression: {
+        resolved_expression := self.resolve_expression_query_resolve_expression(expression, statement_context);
+        result = self.resolve_expression_query_size_of_type(expression.position, resolved_expression.type);
+        constant = result;
+      }
+      case .Size_Of_Type: {
+        type := self.resolve_type_specification(expression.value.(*Type_Specification));
+        result = self.resolve_expression_query_size_of_type(expression.position, type);
+        constant = result;
+      }
+      case .Typeid_Of_Expression: {
+        resolved_expression := self.resolve_expression_query_resolve_expression(expression, statement_context);
+        // The 'typeid_of' expression is special for 'any' and union has it does not produce the typeid of 'any'/union but actually the 'typeid' they contain.
+        if (resolved_expression.type.is_any() || resolved_expression.type.is_union()) {
+          result = operand_rvalue(storage.type_typeid, has_flag(resolved_expression.flags, .Is_Pure), has_flag(resolved_expression.flags, .Is_Immutable));
+        } else {
+          self.mark_type_for_rttr_generation(expression.value.(*Expression).position, resolved_expression.type);
+          result = operand_constant(storage.type_typeid, resolved_expression.type.id);
+          constant = result;
+        }
+      }
+      case .Typeid_Of_Type: {
+        type_specification := expression.value.(*Type_Specification);
+        type := self.resolve_type_specification(type_specification);
+        self.mark_type_for_rttr_generation(type_specification.position, type);
+        result = operand_constant(storage.type_typeid, type.id);
+        constant = result;
+      }
+      case .Type_Info_Of_Expression: {
+        resolved_expression := self.resolve_expression_query_resolve_expression(expression, statement_context);
+        position := expression.value.(*Expression).position;
+        if (!self.operand_convert(position, &resolved_expression, storage.type_typeid)) {
+          report_error_fatal(position, "Expected 'typeid' in 'type_info_of' expression. Got '%'", resolved_expression.type.name);
+        }
+        result = operand_rvalue(storage.get_or_make_type_pointer(storage.cached_runtime_types.type_info), true, false);
+      }
+      case .Type_Info_Of_Type: {
+        type_specification := expression.value.(*Type_Specification);
+        type := self.resolve_type_specification(type_specification);
+        self.mark_type_for_rttr_generation(type_specification.position, type);
+        result = operand_rvalue(storage.get_or_make_type_pointer(storage.cached_runtime_types.type_info), true, false);
+        constant = operand_constant(storage.type_typeid, type.id);
+      }
+      case: assert(false);
+    }
+
+    self.set_resolved_constant(cast(*Expression) expression, constant);
+    return result;
+  }
+  
+  /**
+  * Resolves an expression of a query expression.
+  *
+  * @param expression        The query expression whose expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_query_resolve_expression(expression: *Expression_Query, statement_context: Statement_Context) -> Operand {
+    expression := expression.value.(*Expression);
+    resolved_expression := self.resolve_expression(expression, statement_context);
+    operand_remove_untyped(expression.position, &resolved_expression);
+    return resolved_expression;
+  }
+
+  /**
+  * Resolves the size of a query expression.
+  *
+  * @param position The position of the query expression.
+  * @param type     The type whose size to get.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_query_size_of_type(position: Source_Position, type: *Type) -> Operand {
+    self.complete_type(position, type);
+    
+    // The 'size_of' expression always returns a 'uint'.
+    return operand_constant(context.storage.type_uint, cast(uint) type.get_size());
+  }
+
+  /**
+  * Resolves a directive expression.
+  *
+  * @param expression        The directive expression to resolve.
+  * @param statement_context The statement context to use.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_directive(expression: *Expression) -> Operand {
+    expression := cast(*Expression_Directive) expression;
+    
+    // The actual constant values of these expressions are created by the generator.
+    switch (expression.directive_kind) {
+      case .Line: return operand_constant(context.storage.type_int, cast(int) expression.position.line);
+      case .Routine: return operand_constant(context.storage.type_string, self.current_routine.name);
+      case .File: return operand_constant(context.storage.type_string, expression.position.file);
+      case .Location: return operand_constant(context.storage.cached_runtime_types.source_location, null);
+      case: assert(false);
+    }
+
+    assert(false);
+    return {};
+  }
+
+  /**
+  * Finds an item in an enum.
+  *
+  * @param expression The name expression.
+  * @param enum_type  The type of the enum.
+  * @param name       The name of the enum item.
+  * @return The operand of the expression.
+  */
+  private proc resolve_expression_find_enum_item(expression: *Expression, enum_type: *Type, name: string) -> (Operand, bool) {
+    type := cast(*Type_Enumeration) enum_type;
+    foreach (item in type.items) {
+      if (item.name == name) {
+        operand := operand_constant(enum_type, item.value);
+        self.set_resolved_constant(expression, operand);
+        return {operand, true};
+      }
+    }
+
+    return {{}, false};
+  }
+
+}

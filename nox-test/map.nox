@@ -1,0 +1,54 @@
+/**
+* Test the functionality of maps.
+*/
+internal proc test_maps() {
+  m: map[string]int;
+  map_set(&m, "0", 0);
+  map_set(&m, "1", 1);
+  map_set(&m, "2", 2);
+  map_set(&m, "3", 3);
+  map_set(&m, "4", 4);
+  map_set(&m, "5", 5);
+
+  assert(length(m) == 6);
+
+  value, found := map_get(&m, "0");
+  assert(found);
+  assert(value == 0);
+
+  value, found = map_get(&m, "1");
+  assert(found);
+  assert(value == 1);
+
+  value, found = map_get(&m, "2");
+  assert(found);
+  assert(value == 2);
+
+  value, found = map_get(&m, "3");
+  assert(found);
+  assert(value == 3);
+
+  value, found = map_get(&m, "4");
+  assert(found);
+  assert(value == 4);
+
+  value, found = map_get(&m, "5");
+  assert(found);
+  assert(value == 5);
+
+  value, found = map_get(&m, "6");
+  assert(!found);
+
+  values: []int = {0, 1, 2, 3, 4, 5};
+  foreach (_, value in m) {
+    found := false;
+    foreach (v in values) {
+      if (v == value) {
+        found = true;
+        break;
+      }
+    }
+
+    assert(found);
+  }
+}

@@ -1,0 +1,1021 @@
+#if (NOX_OS == .Windows) {
+  import extern "/../vendor/llvm/lib/windows/LLVM-C.lib"
+}
+
+internal type_define LLVMContextRef := rawptr;
+internal type_define LLVMAttributeRef := rawptr;
+internal type_define LLVMTargetRef := rawptr;
+internal type_define LLVMTargetMachineRef := rawptr;
+internal type_define LLVMTargetDataRef := rawptr;
+internal type_define LLVMModuleRef := rawptr;
+internal type_define LLVMPassManagerRef := rawptr;
+internal type_define LLVMBuilderRef := rawptr;
+internal type_define LLVMBasicBlockRef := rawptr;
+internal type_define LLVMValueRef := rawptr;
+internal type_define LLVMTypeRef := rawptr;
+internal type_define LLVMDIBuilderRef := rawptr;
+internal type_define LLVMMetadataRef := rawptr;
+internal type_define LLVMBool := b32;
+
+internal const LLVMAttributeFunctionIndex: i32 = -1;
+
+internal enum LLVMModuleFlagBehavior {
+  Error,
+  Warning,
+  Require,
+  Override,
+  Append,
+  AppendUnique,
+}
+
+internal enum LLVMTypeKind {
+  Void,
+  Half,
+  Float,
+  Double,
+  X86_FP80,
+  FP128,
+  PPC_FP128,
+  Label,
+  Integer,
+  Function,
+  Struct,
+  Array,
+  Pointer,
+  Vector,
+  Metadata,
+  X86_MMX,
+  Token,
+  ScalableVector,
+  BFloat,
+  X86_AMX,
+}
+
+internal enum LLVMIntPredicate {
+  EQ = 32,
+  NE,     
+  UGT,    
+  UGE,    
+  ULT,    
+  ULE,    
+  SGT,    
+  SGE,    
+  SLT,    
+  SLE,
+}
+
+internal enum LLVMRealPredicate {
+  PredicateFalse,
+  OEQ,           
+  OGT,           
+  OGE,           
+  OLT,           
+  OLE,           
+  ONE,           
+  ORD,           
+  UNO,           
+  UEQ,           
+  UGT,           
+  UGE,           
+  ULT,           
+  ULE,           
+  UNE,           
+  PredicateTrue,
+}
+
+internal enum LLVMLinkage {
+  External,
+  AvailableExternally,
+  LinkOnceAny,
+  LinkOnceODR,
+  LinkOnceODRAutoHide,
+  WeakAny,
+  WeakODR,
+  Appending,
+  Internal,
+  Private,
+  DLLImport,
+  DLLExport,
+  ExternalWeak,
+  Ghost,
+  Common,
+  LinkerPrivate,
+  LinkerPrivateWeak,
+}
+
+internal enum LLVMCallConv {
+  C             = 0,
+  Fast          = 8,
+  Cold          = 9,
+  GHC           = 10,
+  HiPE          = 11,
+  WebKitJS      = 12,
+  AnyReg        = 13,
+  PreserveMost  = 14,
+  PreserveAll   = 15,
+  Swift         = 16,
+  CXXFASTTLS    = 17,
+  X86Stdcall    = 64,
+  X86Fastcall   = 65,
+  ARMAPCS       = 66,
+  ARMAAPCS      = 67,
+  ARMAAPCSVFP   = 68,
+  MSP430INTR    = 69,
+  X86ThisCall   = 70,
+  PTXKernel     = 71,
+  PTXDevice     = 72,
+  SPIRFUNC      = 75,
+  SPIRKERNEL    = 76,
+  IntelOCLBI    = 77,
+  X8664SysV     = 78,
+  Win64         = 79,
+  X86VectorCall = 80,
+  HHVM          = 81,
+  HHVMC         = 82,
+  X86INTR       = 83,
+  AVRINTR       = 84,
+  AVRSIGNAL     = 85,
+  AVRBUILTIN    = 86,
+  AMDGPUVS      = 87,
+  AMDGPUGS      = 88,
+  AMDGPUPS      = 89,
+  AMDGPUCS      = 90,
+  AMDGPUKERNEL  = 91,
+  X86RegCall    = 92,
+  AMDGPUHS      = 93,
+  MSP430BUILTIN = 94,
+  AMDGPULS      = 95,
+  AMDGPUES      = 96,
+}
+
+internal enum LLVMVerifierFailureAction {
+  AbortProcess,
+  PrintMessage,
+  ReturnStatus,
+}
+
+internal enum LLVMCodeGenOptLevel {
+  None,
+  Less,
+  Default,
+  Aggressive,
+}
+
+internal enum LLVMRelocMode {
+  Default,
+  Static,
+  PIC,
+  DynamicNoPic,
+  ROPI,
+  RWPI,
+  ROPI_RWPI,
+}
+
+internal enum LLVMCodeModel {
+  Default,
+  JITDefault,
+  Tiny,
+  Small,
+  Kernel,
+  Medium,
+  Large,
+}
+
+internal enum LLVMCodeGenFileType {
+  AssemblyFile,
+  ObjectFile,
+}
+
+internal enum LLVMDIFlags {
+  Zero = 0,
+  Private = 1,
+  Protected = 2,
+  Public = 3,
+  FwdDecl = 1 << 2,
+  AppleBlock = 1 << 3,
+  ReservedBit4 = 1 << 4,
+  Virtual = 1 << 5,
+  Artificial = 1 << 6,
+  Explicit = 1 << 7,
+  Prototyped = 1 << 8,
+  ObjcClassComplete = 1 << 9,
+  ObjectPointer = 1 << 10,
+  Vector = 1 << 11,
+  StaticMember = 1 << 12,
+  LValueReference = 1 << 13,
+  RValueReference = 1 << 14,
+  Reserved = 1 << 15,
+  SingleInheritance = 1 << 16,
+  MultipleInheritance = 2 << 16,
+  VirtualInheritance = 3 << 16,
+  IntroducedVirtual = 1 << 18,
+  BitField = 1 << 19,
+  NoReturn = 1 << 20,
+  TypePassByValue = 1 << 22,
+  TypePassByReference = 1 << 23,
+  EnumClass = 1 << 24,
+  FixedEnum = EnumClass,
+  Thunk = 1 << 25,
+  NonTrivial = 1 << 26,
+  BigEndian = 1 << 27,
+  LittleEndian = 1 << 28,
+  IndirectVirtualBase = (1 << 2) | (1 << 5),
+  Accessibility = Private | Protected | Public,
+  PtrToMemberRep = SingleInheritance | MultipleInheritance | VirtualInheritance,
+}
+
+internal enum LLVMDWARFSourceLanguage {
+  C89,
+  C,
+  Ada83,
+  C_plus_plus,
+  Cobol74,
+  Cobol85,
+  Fortran77,
+  Fortran90,
+  Pascal83,
+  Modula2,
+  Java,
+  C99,
+  Ada95,
+  Fortran95,
+  PLI,
+  ObjC,
+  ObjC_plus_plus,
+  UPC,
+  D,
+  Python,
+  OpenCL,
+  Go,
+  Modula3,
+  Haskell,
+  C_plus_plus_03,
+  C_plus_plus_11,
+  OCaml,
+  Rust,
+  C11,
+  Swift,
+  Julia,
+  Dylan,
+  C_plus_plus_14,
+  Fortran03,
+  Fortran08,
+  RenderScript,
+  BLISS,
+  Mips_Assembler,
+  GOOGLE_RenderScript,
+  BORLAND_Delphi,
+}
+
+internal enum LLVMDWARFEmissionKind {
+  None = 0,
+  Full,
+  LineTablesOnly,
+}
+
+internal enum LLVMDWARFTypeEncoding {
+	Address = 1,
+	Boolean = 2,
+	ComplexFloat = 3,
+	Float = 4,
+	Signed = 5,
+	SignedChar = 6,
+	Unsigned = 7,
+	UnsignedChar = 8,
+	ImaginaryFloat = 9,
+	PackedDecimal = 10,
+	NumericString = 11,
+	Edited = 12,
+	SignedFixed = 13,
+	UnsignedFixed = 14,
+	DecimalFloat = 15,
+	Utf = 16,
+	LoUser = 128,
+	HiUser = 255,
+}
+
+internal enum LLVMDWARFTag {
+  Structure = 0x13,
+  Union = 0x17,
+}
+
+internal extern proc LLVMInitializeAArch64TargetInfo()
+internal extern proc LLVMInitializeAMDGPUTargetInfo()
+internal extern proc LLVMInitializeARMTargetInfo()
+internal extern proc LLVMInitializeAVRTargetInfo()
+internal extern proc LLVMInitializeBPFTargetInfo()
+internal extern proc LLVMInitializeHexagonTargetInfo()
+internal extern proc LLVMInitializeLanaiTargetInfo()
+internal extern proc LLVMInitializeMipsTargetInfo()
+internal extern proc LLVMInitializeMSP430TargetInfo()
+internal extern proc LLVMInitializeNVPTXTargetInfo()
+internal extern proc LLVMInitializePowerPCTargetInfo()
+internal extern proc LLVMInitializeRISCVTargetInfo()
+internal extern proc LLVMInitializeSparcTargetInfo()
+internal extern proc LLVMInitializeSystemZTargetInfo()
+internal extern proc LLVMInitializeWebAssemblyTargetInfo()
+internal extern proc LLVMInitializeX86TargetInfo()
+internal extern proc LLVMInitializeXCoreTargetInfo()
+
+internal extern proc LLVMInitializeAArch64Target()
+internal extern proc LLVMInitializeAMDGPUTarget()
+internal extern proc LLVMInitializeARMTarget()
+internal extern proc LLVMInitializeAVRTarget()
+internal extern proc LLVMInitializeBPFTarget()
+internal extern proc LLVMInitializeHexagonTarget()
+internal extern proc LLVMInitializeLanaiTarget()
+internal extern proc LLVMInitializeMipsTarget()
+internal extern proc LLVMInitializeMSP430Target()
+internal extern proc LLVMInitializeNVPTXTarget()
+internal extern proc LLVMInitializePowerPCTarget()
+internal extern proc LLVMInitializeRISCVTarget()
+internal extern proc LLVMInitializeSparcTarget()
+internal extern proc LLVMInitializeSystemZTarget()
+internal extern proc LLVMInitializeWebAssemblyTarget()
+internal extern proc LLVMInitializeX86Target()
+internal extern proc LLVMInitializeXCoreTarget()
+
+internal extern proc LLVMInitializeAArch64TargetMC()
+internal extern proc LLVMInitializeAMDGPUTargetMC()
+internal extern proc LLVMInitializeARMTargetMC()
+internal extern proc LLVMInitializeAVRTargetMC()
+internal extern proc LLVMInitializeBPFTargetMC()
+internal extern proc LLVMInitializeHexagonTargetMC()
+internal extern proc LLVMInitializeLanaiTargetMC()
+internal extern proc LLVMInitializeMipsTargetMC()
+internal extern proc LLVMInitializeMSP430TargetMC()
+internal extern proc LLVMInitializeNVPTXTargetMC()
+internal extern proc LLVMInitializePowerPCTargetMC()
+internal extern proc LLVMInitializeRISCVTargetMC()
+internal extern proc LLVMInitializeSparcTargetMC()
+internal extern proc LLVMInitializeSystemZTargetMC()
+internal extern proc LLVMInitializeWebAssemblyTargetMC()
+internal extern proc LLVMInitializeX86TargetMC()
+internal extern proc LLVMInitializeXCoreTargetMC()
+
+internal extern proc LLVMInitializeAArch64AsmPrinter()
+internal extern proc LLVMInitializeAMDGPUAsmPrinter()
+internal extern proc LLVMInitializeARMAsmPrinter()
+internal extern proc LLVMInitializeAVRAsmPrinter()
+internal extern proc LLVMInitializeBPFAsmPrinter()
+internal extern proc LLVMInitializeHexagonAsmPrinter()
+internal extern proc LLVMInitializeLanaiAsmPrinter()
+internal extern proc LLVMInitializeMipsAsmPrinter()
+internal extern proc LLVMInitializeMSP430AsmPrinter()
+internal extern proc LLVMInitializeNVPTXAsmPrinter()
+internal extern proc LLVMInitializePowerPCAsmPrinter()
+internal extern proc LLVMInitializeRISCVAsmPrinter()
+internal extern proc LLVMInitializeSparcAsmPrinter()
+internal extern proc LLVMInitializeSystemZAsmPrinter()
+internal extern proc LLVMInitializeWebAssemblyAsmPrinter()
+internal extern proc LLVMInitializeX86AsmPrinter()
+internal extern proc LLVMInitializeXCoreAsmPrinter()
+
+internal extern proc LLVMInitializeAArch64AsmParser()
+internal extern proc LLVMInitializeAMDGPUAsmParser()
+internal extern proc LLVMInitializeARMAsmParser()
+internal extern proc LLVMInitializeAVRAsmParser()
+internal extern proc LLVMInitializeBPFAsmParser()
+internal extern proc LLVMInitializeHexagonAsmParser()
+internal extern proc LLVMInitializeLanaiAsmParser()
+internal extern proc LLVMInitializeMipsAsmParser()
+internal extern proc LLVMInitializeMSP430AsmParser()
+internal extern proc LLVMInitializeNVPTXAsmParser()
+internal extern proc LLVMInitializePowerPCAsmParser()
+internal extern proc LLVMInitializeRISCVAsmParser()
+internal extern proc LLVMInitializeSparcAsmParser()
+internal extern proc LLVMInitializeSystemZAsmParser()
+internal extern proc LLVMInitializeWebAssemblyAsmParser()
+internal extern proc LLVMInitializeX86AsmParser()
+internal extern proc LLVMInitializeXCoreAsmParser()
+
+internal extern proc LLVMInitializeAArch64Disassembler()
+internal extern proc LLVMInitializeAMDGPUDisassembler()
+internal extern proc LLVMInitializeARMDisassembler()
+internal extern proc LLVMInitializeAVRDisassembler()
+internal extern proc LLVMInitializeBPFDisassembler()
+internal extern proc LLVMInitializeHexagonDisassembler()
+internal extern proc LLVMInitializeLanaiDisassembler()
+internal extern proc LLVMInitializeMipsDisassembler()
+internal extern proc LLVMInitializeMSP430Disassembler()
+internal extern proc LLVMInitializeNVPTXDisassembler()
+internal extern proc LLVMInitializePowerPCDisassembler()
+internal extern proc LLVMInitializeRISCVDisassembler()
+internal extern proc LLVMInitializeSparcDisassembler()
+internal extern proc LLVMInitializeSystemZDisassembler()
+internal extern proc LLVMInitializeWebAssemblyDisassembler()
+internal extern proc LLVMInitializeX86Disassembler()
+internal extern proc LLVMInitializeXCoreDisassembler()
+
+internal extern proc LLVMShutdown()
+internal extern proc LLVMDisposeMessage(message: cstring)
+
+internal extern proc LLVMGetGlobalContext() -> LLVMContextRef
+
+internal extern proc LLVMGetEnumAttributeKindForName(name: cstring, length: u64) -> u32
+internal extern proc LLVMCreateEnumAttribute(ctx: LLVMContextRef, kind_id: u32, value: u64) -> LLVMAttributeRef
+internal extern proc LLVMCreateTypeAttribute(ctx: LLVMContextRef, kind_id: u32, type_ref: LLVMTypeRef) -> LLVMAttributeRef
+
+internal extern proc LLVMGetDefaultTargetTriple() -> cstring
+internal extern proc LLVMGetTargetFromTriple(triple: cstring, target: *LLVMTargetRef, error_message: *cstring) -> LLVMBool
+internal extern proc LLVMCreateTargetMachine(
+  target: LLVMTargetRef,
+  triple: cstring,
+  cpu: cstring,
+  features: cstring,
+  level: LLVMCodeGenOptLevel,
+  reloc: LLVMRelocMode,
+  code_model: LLVMCodeModel,
+) -> LLVMTargetMachineRef
+internal extern proc LLVMDisposeTargetMachine(machine: LLVMTargetMachineRef)
+internal extern proc LLVMCreateTargetDataLayout(machine: LLVMTargetMachineRef) -> LLVMTargetDataRef
+internal extern proc LLVMDisposeTargetData(data: LLVMTargetDataRef)
+internal extern proc LLVMTargetMachineEmitToFile(
+  machine: LLVMTargetMachineRef,
+  module: LLVMModuleRef,
+  filename: cstring,
+  codegen: LLVMCodeGenFileType,
+  error_message: *cstring,
+) -> LLVMBool
+internal extern proc LLVMGetHostCPUFeatures() -> cstring
+
+internal extern proc LLVMModuleCreateWithName(module_id: cstring) -> LLVMModuleRef
+internal extern proc LLVMDisposeModule(module: LLVMModuleRef)
+internal extern proc LLVMVerifyModule(module: LLVMModuleRef, action: LLVMVerifierFailureAction, out_message: *cstring) -> LLVMBool
+internal extern proc LLVMPrintModuleToFile(module: LLVMModuleRef, filename: cstring, error_message: *cstring)
+internal extern proc LLVMSetModuleDataLayout(module: LLVMModuleRef, data_layout: LLVMTargetDataRef)
+internal extern proc LLVMSetTarget(module: LLVMModuleRef, triple: cstring)
+internal extern proc LLVMAddModuleFlag(module: LLVMModuleRef, behaviour: LLVMModuleFlagBehavior, key: cstring, key_length: u64, value: LLVMMetadataRef)
+
+internal extern proc LLVMCreatePassManager() -> LLVMPassManagerRef
+internal extern proc LLVMRunPassManager(pm: LLVMPassManagerRef, module: LLVMModuleRef) -> LLVMBool
+internal extern proc LLVMCreateFunctionPassManagerForModule(module: LLVMModuleRef) -> LLVMPassManagerRef
+internal extern proc LLVMInitializeFunctionPassManager(fpm: LLVMPassManagerRef) -> LLVMBool
+internal extern proc LLVMRunFunctionPassManager(fpm: LLVMPassManagerRef, function: LLVMValueRef) -> LLVMBool
+internal extern proc LLVMFinalizeFunctionPassManager(fpm: LLVMPassManagerRef) -> LLVMBool
+internal extern proc LLVMDisposePassManager(pm: LLVMPassManagerRef)
+
+internal extern proc LLVMAddAnalysisPasses(machine: LLVMTargetMachineRef, pm: LLVMPassManagerRef)
+internal extern proc LLVMAddConstantMergePass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddMergeFunctionsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddCalledValuePropagationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddDeadArgEliminationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddFunctionAttrsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddFunctionInliningPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddAlwaysInlinerPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddGlobalDCEPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddGlobalOptimizerPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddIPSCCPPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddStripDeadPrototypesPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddAggressiveDCEPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddDCEPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddBitTrackingDCEPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddAlignmentFromAssumptionsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddCFGSimplificationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddDeadStoreEliminationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddScalarizerPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddMergedLoadStoreMotionPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddGVNPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddNewGVNPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddIndVarSimplifyPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddInstructionCombiningPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddInstructionSimplifyPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddJumpThreadingPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLICMPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopDeletionPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopIdiomPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopRotatePass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopRerollPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopUnrollPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopUnrollAndJamPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLowerAtomicPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddMemCpyOptPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddPartiallyInlineLibCallsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddReassociatePass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddSCCPPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddScalarReplAggregatesPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddScalarReplAggregatesPassSSA(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddScalarReplAggregatesPassWithThreshold(pm: LLVMPassManagerRef, threshold: i32)
+internal extern proc LLVMAddSimplifyLibCallsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddTailCallEliminationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddDemoteMemoryToRegisterPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddVerifierPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddCorrelatedValuePropagationPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddEarlyCSEPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddEarlyCSEMemSSAPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLowerExpectIntrinsicPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLowerConstantIntrinsicsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddTypeBasedAliasAnalysisPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddScopedNoAliasAAPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddUnifyFunctionExitNodesPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLowerSwitchPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddPromoteMemoryToRegisterPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddAddDiscriminatorsPass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddLoopVectorizePass(pm: LLVMPassManagerRef)
+internal extern proc LLVMAddSLPVectorizePass(pm: LLVMPassManagerRef)
+
+internal extern proc LLVMTypeOf(value: LLVMValueRef) -> LLVMTypeRef
+internal extern proc LLVMGetTypeKind(type: LLVMTypeRef) -> LLVMTypeKind
+internal extern proc LLVMSetValueName2(value: LLVMValueRef, name: cstring, length: uint)
+internal extern proc LLVMIsConstant(value: LLVMValueRef) -> LLVMBool
+internal extern proc LLVMIsUndef(value: LLVMValueRef) -> LLVMBool
+internal extern proc LLVMIsPoison(value: LLVMValueRef) -> LLVMBool
+internal extern proc LLVMIsNull(value: LLVMValueRef) -> LLVMBool
+
+internal extern proc LLVMAddFunction(module: LLVMModuleRef, name: cstring, function_type: LLVMTypeRef) -> LLVMValueRef
+internal extern proc LLVMVerifyFunction(function: LLVMValueRef, action: LLVMVerifierFailureAction) -> LLVMBool
+internal extern proc LLVMAppendBasicBlock(function: LLVMValueRef, name: cstring) -> LLVMBasicBlockRef
+internal extern proc LLVMDeleteBasicBlock(block: LLVMBasicBlockRef)
+internal extern proc LLVMGetFirstInstruction(block: LLVMBasicBlockRef) -> LLVMValueRef
+internal extern proc LLVMGetLastInstruction(block: LLVMBasicBlockRef) -> LLVMValueRef
+internal extern proc LLVMCountParams(function: LLVMValueRef) -> u32
+internal extern proc LLVMGetParam(function: LLVMValueRef, index: u32) -> LLVMValueRef
+internal extern proc LLVMGetFirstParam(function: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMGetLastParam(function: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMGetNextParam(parameter: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMGetPreviousParam(parameter: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMSetFunctionCallConv(function: LLVMValueRef, call_conv: LLVMCallConv)
+internal extern proc LLVMAddAttributeAtIndex(function: LLVMValueRef, index: u32, attribute: LLVMAttributeRef)
+internal extern proc LLVMLookupIntrinsicID(name: cstring, name_length: u64) -> u32
+internal extern proc LLVMGetIntrinsicDeclaration(module: LLVMModuleRef, id: u32, param_types: *LLVMTypeRef, param_count: u64) -> LLVMValueRef
+internal extern proc LLVMIntrinsicGetType(ctx: LLVMContextRef, id: u32, param_types: *LLVMTypeRef, param_count: u64) -> LLVMTypeRef
+
+internal extern proc LLVMAddGlobal(module: LLVMModuleRef, type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMSetInitializer(global_variable: LLVMValueRef, contant_value: LLVMValueRef)
+internal extern proc LLVMSetGlobalConstant(global_variable: LLVMValueRef, is_constant: LLVMBool)
+internal extern proc LLVMSetThreadLocal(global_variable: LLVMValueRef, is_thread_local: LLVMBool)
+
+internal extern proc LLVMSetLinkage(global_symobl: LLVMValueRef, linkage: LLVMLinkage)
+internal extern proc LLVMSetSection(global_symobl: LLVMValueRef, section: cstring)
+
+internal extern proc LLVMCreateBuilder() -> LLVMBuilderRef
+internal extern proc LLVMDisposeBuilder(builder: LLVMBuilderRef)
+internal extern proc LLVMPositionBuilderAtEnd(builder: LLVMBuilderRef, block: LLVMBasicBlockRef)
+internal extern proc LLVMSetCurrentDebugLocation2(builder: LLVMBuilderRef, location: LLVMMetadataRef)
+
+internal extern proc LLVMValueAsMetadata(value: LLVMValueRef) -> LLVMMetadataRef
+internal extern proc LLVMIsATerminatorInst(instruction: LLVMValueRef) -> LLVMValueRef
+
+internal extern proc LLVMBuildRetVoid(builder: LLVMBuilderRef) -> LLVMValueRef
+internal extern proc LLVMBuildRet(builder: LLVMBuilderRef, return_value: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMBuildBr(builder: LLVMBuilderRef, destination: LLVMBasicBlockRef) -> LLVMValueRef
+internal extern proc LLVMBuildCondBr(builder: LLVMBuilderRef, condition: LLVMValueRef, then_block: LLVMBasicBlockRef, else_block: LLVMBasicBlockRef) -> LLVMValueRef
+internal extern proc LLVMBuildSwitch(builder: LLVMBuilderRef, v: LLVMValueRef, default: LLVMBasicBlockRef, num_cases: u32) -> LLVMValueRef
+internal extern proc LLVMBuildAlloca(builder: LLVMBuilderRef, type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildStore(builder: LLVMBuilderRef, value: LLVMValueRef, pointer: LLVMValueRef) -> LLVMValueRef
+internal extern proc LLVMBuildLoad2(builder: LLVMBuilderRef, type: LLVMTypeRef, pointer_value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildGEP2(
+  builder: LLVMBuilderRef,
+  type: LLVMTypeRef,
+  pointer: LLVMValueRef,
+  indices: *LLVMValueRef,
+  num_indices: u32,
+  name: cstring,
+) -> LLVMValueRef
+internal extern proc LLVMBuildInBoundsGEP2(
+  builder: LLVMBuilderRef,
+  type: LLVMTypeRef,
+  pointer: LLVMValueRef,
+  indices: *LLVMValueRef,
+  num_indices: u32,
+  name: cstring,
+) -> LLVMValueRef
+internal extern proc LLVMBuildStructGEP2(builder: LLVMBuilderRef, type: LLVMTypeRef, pointer: LLVMValueRef, index: u32, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildGlobalStringPtr(builder: LLVMBuilderRef, str: cstring, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildTrunc(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildZExt(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildSExt(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFPToUI(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFPToSI(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildUIToFP(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildSIToFP(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFPTrunc(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFPExt(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildPtrToInt(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildIntToPtr(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildBitCast(builder: LLVMBuilderRef, value: LLVMValueRef, destination_type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildAdd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNSWAdd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNUWAdd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFAdd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildSub(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNSWSub(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNUWSub(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFSub(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildMul(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNSWMul(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNUWMul(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFMul(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildUDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildExactUDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildSDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildExactSDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFDiv(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildURem(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildSRem(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFRem(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildShl(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildLShr(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildAShr(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildAnd(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildOr(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildXor(builder: LLVMBuilderRef, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNeg(builder: LLVMBuilderRef, value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNSWNeg(builder: LLVMBuilderRef, value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNUWNeg(builder: LLVMBuilderRef, value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFNeg(builder: LLVMBuilderRef, value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildNot(builder: LLVMBuilderRef, value: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildICmp(builder: LLVMBuilderRef, operator: LLVMIntPredicate, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildFCmp(builder: LLVMBuilderRef, operator: LLVMRealPredicate, lhs: LLVMValueRef, rhs: LLVMValueRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildPhi(builder: LLVMBuilderRef, type: LLVMTypeRef, name: cstring) -> LLVMValueRef
+internal extern proc LLVMBuildCall2(
+  builder: LLVMBuilderRef,
+  type: LLVMTypeRef,
+  function: LLVMValueRef,
+  args: *LLVMValueRef,
+  num_args: u32,
+  name: cstring,
+) -> LLVMValueRef
+internal extern proc LLVMBuildSelect(
+  builder: LLVMBuilderRef,
+  condition: LLVMValueRef,
+  then_value: LLVMValueRef,
+  else_value: LLVMValueRef,
+  name: cstring,
+) -> LLVMValueRef
+internal extern proc LLVMBuildInsertValue(
+  builder: LLVMBuilderRef,
+  aggregate_value: LLVMValueRef,
+  element_value: LLVMValueRef,
+  index: u32,
+  name: cstring,
+) -> LLVMValueRef
+internal extern proc LLVMBuildExtractValue(builder: LLVMBuilderRef, aggregate_value: LLVMValueRef, index: u32, name: cstring) -> LLVMValueRef
+
+internal extern proc LLVMAddCase(switch_value: LLVMValueRef, on_value: LLVMValueRef, destination: LLVMBasicBlockRef)
+internal extern proc LLVMAddIncoming(phi_value: LLVMValueRef, incoming_values: *LLVMValueRef, incoming_blocks: *LLVMBasicBlockRef, count: u32)
+
+internal extern proc LLVMVoidType() -> LLVMTypeRef
+internal extern proc LLVMInt1Type() -> LLVMTypeRef
+internal extern proc LLVMInt8Type() -> LLVMTypeRef
+internal extern proc LLVMInt16Type() -> LLVMTypeRef
+internal extern proc LLVMInt32Type() -> LLVMTypeRef
+internal extern proc LLVMInt64Type() -> LLVMTypeRef
+internal extern proc LLVMInt128Type() -> LLVMTypeRef
+internal extern proc LLVMHalfType() -> LLVMTypeRef
+internal extern proc LLVMFloatType() -> LLVMTypeRef
+internal extern proc LLVMDoubleType() -> LLVMTypeRef
+internal extern proc LLVMPointerType(element_type: LLVMTypeRef, address_space: u32) -> LLVMTypeRef
+internal extern proc LLVMArrayType(element_type: LLVMTypeRef, element_count: u32) -> LLVMTypeRef
+internal extern proc LLVMStructType(element_types: *LLVMTypeRef, element_count: u32, packed: LLVMBool) -> LLVMTypeRef
+internal extern proc LLVMStructCreateNamed(ctx: LLVMContextRef, name: cstring) -> LLVMTypeRef
+internal extern proc LLVMStructSetBody(type: LLVMTypeRef, element_types: *LLVMTypeRef, element_count: u32, packed: LLVMBool)
+internal extern proc LLVMFunctionType(return_type: LLVMTypeRef, param_types: *LLVMTypeRef, param_count: u32, is_var_arg: LLVMBool) -> LLVMTypeRef
+
+internal extern proc LLVMGetUndef(type: LLVMTypeRef) -> LLVMValueRef
+internal extern proc LLVMConstNull(type: LLVMTypeRef) -> LLVMValueRef
+internal extern proc LLVMConstInt(int_type: LLVMTypeRef, n: u64, sign_extend: LLVMBool) -> LLVMValueRef
+internal extern proc LLVMConstIntOfArbitraryPrecision(int_type: LLVMTypeRef, number_of_words: u32, words: *u64) -> LLVMValueRef
+internal extern proc LLVMConstAllOnes(int_type: LLVMTypeRef) -> LLVMValueRef
+internal extern proc LLVMConstReal(float_type: LLVMTypeRef, n: f64) -> LLVMValueRef
+internal extern proc LLVMConstArray(element_type: LLVMTypeRef, constant_values: *LLVMValueRef, constant_count: u32) -> LLVMValueRef
+internal extern proc LLVMConstStruct(constant_values: *LLVMValueRef, constant_count: u32, packed: LLVMBool) -> LLVMValueRef
+internal extern proc LLVMConstNamedStruct(struct_type: LLVMTypeRef, constant_values: *LLVMValueRef, constant_count: u32) -> LLVMValueRef
+
+internal extern proc LLVMCreateDIBuilder(module: LLVMModuleRef) -> LLVMDIBuilderRef
+internal extern proc LLVMDisposeDIBuilder(builder: LLVMDIBuilderRef)
+internal extern proc LLVMDIBuilderFinalize(builder: LLVMDIBuilderRef)
+
+internal extern proc LLVMDIScopeGetFile(scope: LLVMMetadataRef) -> LLVMMetadataRef
+
+internal extern proc LLVMDIBuilderCreateCompileUnit(
+  builder: LLVMDIBuilderRef,
+  lang: LLVMDWARFSourceLanguage,
+  file: LLVMMetadataRef,
+  producer: cstring,
+  producer_length: u64,
+  is_optimized: LLVMBool,
+  flags: cstring,
+  flags_length: u64,
+  runtime_version: u32,
+  split_name: cstring,
+  split_name_length: u64,
+  kind: LLVMDWARFEmissionKind,
+  dwo_id: u32,
+  split_debug_inlining: LLVMBool,
+  debug_info_for_profiling: LLVMBool,
+  sys_root: cstring,
+  sys_root_length: u64,
+  sdk: cstring,
+  sdk_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateFile(
+  builder: LLVMDIBuilderRef,
+  filename: cstring,
+  filename_length: u64,
+  directory: cstring,
+  directory_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateFunction(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  linkage_name: cstring,
+  linkage_name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  type: LLVMMetadataRef,
+  is_local_to_unit: LLVMBool,
+  is_definition: LLVMBool,
+  scope_line: u32,
+  flags: LLVMDIFlags,
+  is_optimized: LLVMBool,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateDebugLocation(
+  ctx: LLVMContextRef,
+  line: u32,
+  column: u32,
+  scope: LLVMMetadataRef,
+  inlined_at: LLVMMetadataRef,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateAutoVariable(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  type: LLVMMetadataRef,
+  always_preserve: LLVMBool,
+  flags: LLVMDIFlags,
+  align_in_bits: u32,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateParameterVariable(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  argument_number: u32,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  type: LLVMMetadataRef,
+  always_preserve: LLVMBool,
+  flags: LLVMDIFlags,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateExpression(builder: LLVMDIBuilderRef, address: *u64, length: u64) -> LLVMMetadataRef
+
+internal extern proc LLVMDIBuilderCreateBasicType(
+  builder: LLVMDIBuilderRef,
+  name: cstring,
+  name_length: u64,
+  size_in_bits: u64,
+  encoding: LLVMDWARFTypeEncoding,
+  flags: LLVMDIFlags,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreatePointerType(
+  builder: LLVMDIBuilderRef,
+  pointee_type: LLVMMetadataRef,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  address_space: u32,
+  name: cstring,
+  name_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateStructType(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  flags: LLVMDIFlags,
+  derived_from: LLVMMetadataRef,
+  elements: *LLVMMetadataRef,
+  element_count: u32,
+  runtime_lang: u32,
+  vtable_holder: LLVMMetadataRef,
+  uniqued_id: cstring,
+  uniqued_id_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateMemberType(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  offset_in_bits: u64,
+  flags: LLVMDIFlags,
+  type: LLVMMetadataRef,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateArrayType(
+  builder: LLVMDIBuilderRef,
+  size: u64,
+  align_in_bits: u32,
+  type: LLVMMetadataRef,
+  subscripts: *LLVMMetadataRef,
+  num_subscripts: u32,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateUnionType(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  flags: LLVMDIFlags,
+  elements: *LLVMMetadataRef,
+  element_count: u32,
+  runtime_lang: u32,
+  uniqued_id: cstring,
+  uniqued_id_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateEnumerationType(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  name: cstring,
+  name_length: u64,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  elements: *LLVMMetadataRef,
+  element_count: u32,
+  class_type: LLVMMetadataRef,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateEnumerator(builder: LLVMDIBuilderRef, name: cstring, name_length: u64, value: i64, is_unsigned: LLVMBool) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateReplaceableCompositeType(
+  builder: LLVMDIBuilderRef,
+  tag: LLVMDWARFTag,
+  name: cstring,
+  name_length: u64,
+  scope: LLVMMetadataRef,
+  file: LLVMMetadataRef,
+  line_number: u32,
+  runtime_lang: u32,
+  size_in_bits: u64,
+  align_in_bits: u32,
+  flags: LLVMDIFlags,
+  uniqued_id: cstring,
+  uniqued_id_length: u64,
+) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateSubroutineType(
+  builder: LLVMDIBuilderRef,
+  file: LLVMMetadataRef,
+  parameter_types: *LLVMMetadataRef,
+  num_parameter_types: u32,
+  flags: LLVMDIFlags,
+) -> LLVMMetadataRef
+
+internal extern proc LLVMDIBuilderGetOrCreateSubrange(builder: LLVMDIBuilderRef, lower_bound: i64, count: i64) -> LLVMMetadataRef
+internal extern proc LLVMDIBuilderCreateLexicalBlock(
+  builder: LLVMDIBuilderRef,
+  scope: LLVMMetadataRef,
+  file: LLVMMetadataRef,
+  line: u32,
+  column: u32,
+) -> LLVMMetadataRef
+internal extern proc LLVMMetadataReplaceAllUsesWith(temp_target_metadata: LLVMMetadataRef, replacement: LLVMMetadataRef)
+
+internal extern proc LLVMSetSubprogram(function: LLVMValueRef, sub_program: LLVMMetadataRef)
+internal extern proc LLVMInstructionSetDebugLoc(instruction: LLVMValueRef, location: LLVMMetadataRef)
+internal extern proc LLVMDIBuilderInsertDeclareAtEnd(
+  builder: LLVMDIBuilderRef,
+  storage: LLVMValueRef,
+  variable_info: LLVMMetadataRef,
+  expr: LLVMMetadataRef,
+  debug_location: LLVMMetadataRef,
+  block: LLVMBasicBlockRef,
+) -> LLVMValueRef
+internal extern proc LLVMDIBuilderInsertDbgValueAtEnd(
+  builder: LLVMDIBuilderRef,
+  value: LLVMValueRef,
+  variable_info: LLVMMetadataRef,
+  expr: LLVMMetadataRef,
+  debug_location: LLVMMetadataRef,
+  block: LLVMBasicBlockRef,
+) -> LLVMValueRef
+
+internal proc LLVMInitializeAllTargetInfos() {
+  LLVMInitializeAArch64TargetInfo();
+  LLVMInitializeAMDGPUTargetInfo();
+  LLVMInitializeARMTargetInfo();
+  LLVMInitializeAVRTargetInfo();
+  LLVMInitializeBPFTargetInfo();
+  LLVMInitializeHexagonTargetInfo();
+  LLVMInitializeLanaiTargetInfo();
+  LLVMInitializeMipsTargetInfo();
+  LLVMInitializeMSP430TargetInfo();
+  LLVMInitializeNVPTXTargetInfo();
+  LLVMInitializePowerPCTargetInfo();
+  LLVMInitializeRISCVTargetInfo();
+  LLVMInitializeSparcTargetInfo();
+  LLVMInitializeSystemZTargetInfo();
+  LLVMInitializeWebAssemblyTargetInfo();
+  LLVMInitializeX86TargetInfo();
+  LLVMInitializeXCoreTargetInfo();
+}
+
+internal proc LLVMInitializeAllTargets() {
+  LLVMInitializeAArch64Target();
+  LLVMInitializeAMDGPUTarget();
+  LLVMInitializeARMTarget();
+  LLVMInitializeAVRTarget();
+  LLVMInitializeBPFTarget();
+  LLVMInitializeHexagonTarget();
+  LLVMInitializeLanaiTarget();
+  LLVMInitializeMipsTarget();
+  LLVMInitializeMSP430Target();
+  LLVMInitializeNVPTXTarget();
+  LLVMInitializePowerPCTarget();
+  LLVMInitializeRISCVTarget();
+  LLVMInitializeSparcTarget();
+  LLVMInitializeSystemZTarget();
+  LLVMInitializeWebAssemblyTarget();
+  LLVMInitializeX86Target();
+  LLVMInitializeXCoreTarget();
+}
+
+internal proc LLVMInitializeAllTargetMCs() {
+  LLVMInitializeAArch64TargetMC();
+  LLVMInitializeAMDGPUTargetMC();
+  LLVMInitializeARMTargetMC();
+  LLVMInitializeAVRTargetMC();
+  LLVMInitializeBPFTargetMC();
+  LLVMInitializeHexagonTargetMC();
+  LLVMInitializeLanaiTargetMC();
+  LLVMInitializeMipsTargetMC();
+  LLVMInitializeMSP430TargetMC();
+  LLVMInitializeNVPTXTargetMC();
+  LLVMInitializePowerPCTargetMC();
+  LLVMInitializeRISCVTargetMC();
+  LLVMInitializeSparcTargetMC();
+  LLVMInitializeSystemZTargetMC();
+  LLVMInitializeWebAssemblyTargetMC();
+  LLVMInitializeX86TargetMC();
+  LLVMInitializeXCoreTargetMC();
+}
+
+internal proc LLVMInitializeAllAsmPrinters() {
+  LLVMInitializeAArch64AsmPrinter();
+  LLVMInitializeAMDGPUAsmPrinter();
+  LLVMInitializeARMAsmPrinter();
+  LLVMInitializeAVRAsmPrinter();
+  LLVMInitializeBPFAsmPrinter();
+  LLVMInitializeHexagonAsmPrinter();
+  LLVMInitializeLanaiAsmPrinter();
+  LLVMInitializeMipsAsmPrinter();
+  LLVMInitializeMSP430AsmPrinter();
+  LLVMInitializeNVPTXAsmPrinter();
+  LLVMInitializePowerPCAsmPrinter();
+  LLVMInitializeRISCVAsmPrinter();
+  LLVMInitializeSparcAsmPrinter();
+  LLVMInitializeSystemZAsmPrinter();
+  LLVMInitializeWebAssemblyAsmPrinter();
+  LLVMInitializeX86AsmPrinter();
+  LLVMInitializeXCoreAsmPrinter();
+}
+
+internal proc LLVMInitializeAllAsmParsers() {
+  LLVMInitializeAArch64AsmParser();
+  LLVMInitializeAMDGPUAsmParser();
+  LLVMInitializeARMAsmParser();
+  LLVMInitializeAVRAsmParser();
+  LLVMInitializeBPFAsmParser();
+  LLVMInitializeHexagonAsmParser();
+  LLVMInitializeLanaiAsmParser();
+  LLVMInitializeMipsAsmParser();
+  LLVMInitializeMSP430AsmParser();
+  LLVMInitializePowerPCAsmParser();
+  LLVMInitializeRISCVAsmParser();
+  LLVMInitializeSparcAsmParser();
+  LLVMInitializeSystemZAsmParser();
+  LLVMInitializeWebAssemblyAsmParser();
+  LLVMInitializeX86AsmParser();
+}
+
+internal proc LLVMInitializeAllDisassemblers() {
+  LLVMInitializeAArch64Disassembler();
+  LLVMInitializeAMDGPUDisassembler();
+  LLVMInitializeARMDisassembler();
+  LLVMInitializeAVRDisassembler();
+  LLVMInitializeBPFDisassembler();
+  LLVMInitializeHexagonDisassembler();
+  LLVMInitializeLanaiDisassembler();
+  LLVMInitializeMipsDisassembler();
+  LLVMInitializeMSP430Disassembler();
+  LLVMInitializePowerPCDisassembler();
+  LLVMInitializeRISCVDisassembler();
+  LLVMInitializeSparcDisassembler();
+  LLVMInitializeSystemZDisassembler();
+  LLVMInitializeWebAssemblyDisassembler();
+  LLVMInitializeX86Disassembler();
+  LLVMInitializeXCoreDisassembler();
+}

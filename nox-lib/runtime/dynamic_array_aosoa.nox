@@ -1,0 +1,155 @@
+import "std:memory"
+import "std:libc"
+
+/**
+* Example for the following 'Foo' struct:
+* struct Foo {
+*   i: int,
+*   s: string,  
+* }
+*
+* The AoSoA layout is divided into 'chunks' or 'inner' arrays.
+*
+* The number of elements inside an AoSoA chunk is determined by the size of the biggest field of the struct:
+* number_of_elements = L1_CACHE_LINE_SIZE / biggest_field_size
+* In this case the biggest field is the string 's' with 16 bytes:
+* number_of_elements = 64 / 16 = 4
+* 
+* A single AoSoA chunk is then defined as the following:
+* struct Array_AoSoA_Chunk {
+*   i: int[4],
+*   s: string[4],
+* }
+* In this case the chunk has a combined size of 96 bytes.
+*
+* In memory the layout for two chunks would look like this:
+* iiiissss|iiiissss
+* ^^^^         ^^^^
+* 32 bytes     64 bytes
+*/
+
+/**
+* Adds a new element to the end of a dynamic AoSoA array.
+* 
+* @param !T      The type of the array data (must be trivial copyable).
+* @param a       The dynamic AoSoA array to add the element to.
+* @param element The element to add.
+*/
+public proc array_aosoa_add!(T)(a: *aosoa[dynamic]T, element: T) where (type_is_trivial_copyable!(T)()) where (!NOX_RTTR_DISABLED) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  current_capacity := array.capacity;
+  if (current_capacity < array.length + 1) {
+    new_capacity := max(current_capacity * 2, DYNAMIC_ARRAY_DEFAULT_CAPACITY);
+    array_aosoa_reserve(a, new_capacity);
+  }
+
+  field_count := type_struct_field_count!(T)();
+  items_in_chunk := type_aosoa_items_in_chunk!(aosoa[dynamic]T)();
+  chunk_size := cast(int) type_aosoa_chunk_size!(aosoa[dynamic]T)();
+  struct_type := type_info_of(typeid_of(:T));
+  field_types := struct_type.variant.(Type_Info_Struct).types;
+  field_offsets := struct_type.variant.(Type_Info_Struct).offsets;
+
+  element_copy := element;
+  element_pointer := cast(*byte) &element_copy;
+
+  data_pointer := cast(*byte) array.data;
+
+  // We loop over all fields of the element as we need to copy them over individually.
+  aosoa_array_element_offset := 0;
+  for (i := 0; i < field_count; i++) {
+    field_type := field_types[i];
+    field_size := cast(int) field_type.size;
+    field_alignment := cast(int) field_type.alignment;
+
+    // We need to take into account the proper alignment of each chunk.
+    rest_alignment := aosoa_array_element_offset % field_alignment;
+    if (rest_alignment != 0) then aosoa_array_element_offset += field_alignment - rest_alignment;
+
+    // We need to setup the proper destination and source pointers of the memory we need to copy.
+
+    // We first calculate the offset to get the 'inner' destination array.
+    data_array_offset: ^*byte = (array.length / items_in_chunk) * chunk_size + aosoa_array_element_offset;
+    destination_array := data_pointer + data_array_offset;
+    // Then we get the offset to the element inside the 'inner' array.
+    destination_array_offset: ^*byte = (array.length % items_in_chunk) * field_size;
+    destination := destination_array + destination_array_offset;
+
+    item_offset := cast(int) field_offsets[i];
+    element_pointer_offset: ^*byte = item_offset;
+    source := element_pointer + element_pointer_offset;
+
+    memory.copy(destination, source, cast(uint) field_size);
+    
+    aosoa_array_element_offset += field_size * items_in_chunk;
+  }
+
+  array.length += 1;
+}
+
+/**
+* Reserves more capacity for a dynamic AoSoA array.
+* 
+* @param !T           The type of the array data.
+* @param a            The dynamic AoSoA array to reserve more capacity for.
+* @param new_capacity The new capacity of the dynamic AoSoA array.
+*/
+public proc array_aosoa_reserve!(T)(a: *aosoa[dynamic]T, new_capacity: int) where (type_is_trivial_copyable!(T)()) where (!NOX_RTTR_DISABLED) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  old_capacity := array.capacity;
+  if (new_capacity <= old_capacity) then return;
+
+  if (array.allocator.procedure == null) then array.allocator = context.allocator;
+
+  chunk_size := cast(int) type_aosoa_chunk_size!(aosoa[dynamic]T)();
+  items_in_chunk := type_aosoa_items_in_chunk!(aosoa[dynamic]T)();
+
+  // We make sure that we always allocate memory for a full chunk.
+  chunk_count := new_capacity / items_in_chunk;
+  if (new_capacity % items_in_chunk != 0) then chunk_count++;
+
+  new_size := chunk_count * chunk_size;
+  new_data := cast(*byte) memory.allocate(cast(uint) new_size, array.allocator);
+
+  if (array.capacity > 0) {
+    old_data := cast(*byte) array.data;
+    old_size := (array.capacity / items_in_chunk) * chunk_size;
+    memory.copy(new_data, old_data, cast(uint) old_size);
+    memory.free(old_data, array.allocator);
+  }
+
+  array.data = new_data;
+  array.capacity = chunk_count * items_in_chunk;
+}
+
+/**
+* Clears the elements of a dynamic AoSoA array.
+* 
+* @param !T The type of the array data.
+* @param a  The dynamic AoSoA array to clear.
+*/
+public proc array_aosoa_clear!(T)(a: *[dynamic]T) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array != null) then array.length = 0;
+}
+
+/**
+* Destroys the resources of a dynamic AoSoA array.
+* 
+* @param !T The type of the array data.
+* @param a  The dynamic AoSoA array to destroy.
+*/
+public proc array_aosoa_destroy!(T)(a: *aosoa[dynamic]T) {
+  array := cast(*memory.Raw_Dynamic_Array) a;
+  if (array == null) then return;
+
+  memory.free(array.data, array.allocator);
+
+  array.data = null;
+  array.length = 0;
+  array.capacity = 0;
+}

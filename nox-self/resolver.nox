@@ -1,0 +1,1104 @@
+import "std:memory"
+import "std:strings"
+
+internal const SPECIAL_NAME_SELF    := "self";
+internal const SPECIAL_NAME_CONTEXT := "context";
+internal const SPECIAL_NAME_DISCARD := "_";
+
+/**
+* Represents a local block scope.
+*/
+internal struct Local_Scope {
+  parent_block: *Local_Scope,       // The parent block scope.
+  symbols: map[string]Local_Symbol, // The symbols in the local block.
+}
+
+/**
+* Represents a single field in the special 'Context' struct.
+*/
+internal struct Context_Field {
+  name: string, // The name of the context field.
+  type: *Type,  // The type of the context field.
+}
+
+/**
+* Represents a resolved member to be consumed by the generator.
+*/
+internal struct Resolved_Member {
+  index: int,            // The resolved index of the accessed member.
+  indices: [dynamic]int, // The resolved indices when accessing multiple fields (will be empty if just a single index is needed).
+  type: *Type,           // The type of the resolved member.
+}
+
+/**
+* Reprsents a resolved compound field.
+*/
+internal struct Resolved_Compound_Field {
+  index: int,  // The index of the compound field.
+  type: *Type, // The type of the compound field.
+}
+
+/**
+* Represents the output of the resolver to be consumed by the generator.
+*/
+internal struct Unreachable_Symbol {
+  // This is intentionally empty.
+}
+
+/**
+* Represents the output of the resolver to be consumed by the generator.
+*/
+internal struct Resolver_Output {
+  reachable_sorted_symbols: [dynamic]*Symbol,                                                            // Holds reachable symbols in a sorted way.
+  reachable_types: [dynamic]*Type,                                                                       // Holds reachable types.
+  reachable_interface_implementations: map[Resolved_Implementation_Key][dynamic]Resolved_Implementation, // Holds reachable interface implementations.
+
+  resolved_symbols: map[*Expression]*Symbol,                                                             // Holds resolved symbols.
+  // The key has to be a 'rawptr' as both '*Expression' and '*Type_Sepcification' are valid.
+  resolved_types: map[rawptr]*Type,                                                                      // Holds resolved types.
+  resolved_overwrite_types: map[*Expression]*Type,                                                       // Holds resolved overwritten types.
+  resolved_constants: map[*Expression]Operand,                                                           // Holds resolved constants.
+  resolved_members: map[*Expression]Resolved_Member,                                                     // Holds resolved members.
+  resolved_compound_fields: map[*Expression]Resolved_Compound_Field,                                     // Holds resolved compound fields.
+  resolved_implementations: map[Resolved_Implementation_Key][dynamic]Resolved_Implementation,            // Holds resolved implementations (interfaces and others).
+}
+
+/**
+* Holds necessary data for the resolver.
+*/
+internal struct Resolver {
+  // This is bookkeeping while resolving.
+  symbol_pool: memory.Pool,                                                         // The backing pool for the symbol allocator.
+  symbol_allocator: Allocator,                                                      // The allocator used for symbols
+  always_reachable_symbols: [dynamic]*Symbol,                                       // Symbols that are always reachable (get resolved before 'main').
+  reachable_symbols: [dynamic]*Symbol,                                              // Symbols that are reachable (will get resolved and sorted).
+  unreachable_symbols: map[*Symbol]Unreachable_Symbol,                              // Symbols that are unreachable (will get resolved but not sorted).
+  sorted_symbols: [dynamic]*Symbol,                                                 // Contains the symbols ordered by their dependency.
+  instantiated_generic_routines: map[*Symbol][dynamic]Instantiated_Generic_Routine, // Map of instantiated generic routines where the key is the uninstantiated symbol.
+  unresolved_implementations: aosoa[dynamic]Unresolved_Implementation,              // Unresolved implementations (get resolved before 'main').
+  types_implementing_interface: map[*Type][dynamic]*Type,                           // Map of interfaces with the corresponding types that implement them.
+  context_fields: aosoa[dynamic]Context_Field,                                      // List of fields that got added through the '#expand_context' directive.
+  name_pool: memory.Pool,                                                           // The backing pool for the symbol allocator.
+  name_allocator: Allocator,                                                        // The allocator used for symbol names.
+
+  // The following is 'local' storage which gets reset after resolving the body of a routine.
+  current_routine: *Symbol,                                                         // The routine whose body is currently being resolved.
+  local_scope: *Local_Scope,                                                        // This stores the current local symbol block (the 'deepest' one in the stack).
+  
+  output: Resolver_Output,                                                          // The output of the resolver.
+}
+
+/**
+* Makes a new resolver.
+*
+* @return The new resolver.
+*/
+internal proc resolver_make() -> *Resolver {
+  resolver := memory.new!(Resolver)();
+  resolver.init();
+  return resolver;
+}
+
+/**
+* Destroys the resouces assocociated with a resolver.
+*
+* @param resolver The resolver to destroy.
+*/
+internal proc resolver_destroy(resolver: *Resolver) {
+  memory.pool_destroy(&resolver.symbol_pool);
+  array_destroy(&resolver.always_reachable_symbols);
+  array_destroy(&resolver.reachable_symbols);
+  map_destroy(&resolver.unreachable_symbols);
+  array_destroy(&resolver.sorted_symbols);
+  foreach (_, instantiated_generic_routines in resolver.instantiated_generic_routines) {
+    instantiated_generic_routines_local := instantiated_generic_routines;
+    foreach (instantiated_generic_symbol in instantiated_generic_routines_local) {
+      array_destroy(&instantiated_generic_symbol.generic_types);
+    }
+    array_destroy(&instantiated_generic_routines_local);
+  }
+  map_destroy(&resolver.instantiated_generic_routines);
+  array_aosoa_destroy(&resolver.unresolved_implementations);
+  foreach (_, types_implementing_interface in resolver.types_implementing_interface) {
+    types_implementing_interface_local := types_implementing_interface;
+    array_destroy(&types_implementing_interface_local);
+  }
+  map_destroy(&resolver.types_implementing_interface);
+  array_aosoa_destroy(&resolver.context_fields);
+
+  memory.pool_destroy(&resolver.name_pool);
+
+  array_destroy(&resolver.output.reachable_sorted_symbols);
+  array_destroy(&resolver.output.reachable_types);
+  map_destroy(&resolver.output.resolved_symbols);
+  map_destroy(&resolver.output.resolved_types);
+  map_destroy(&resolver.output.resolved_overwrite_types);
+  map_destroy(&resolver.output.resolved_constants);
+  foreach (_, resolved_member in resolver.output.resolved_members) {
+    array_destroy(&resolved_member.indices);
+  }
+  map_destroy(&resolver.output.resolved_members);
+  map_destroy(&resolver.output.resolved_compound_fields);
+  foreach (_, resolved_implementations in resolver.output.resolved_implementations) {
+    resolved_implementations_local := resolved_implementations;
+    foreach (resolved_implementation in resolved_implementations_local) {
+      map_destroy(&resolved_implementation.symbols);
+    }
+    array_destroy(&resolved_implementations_local);
+  }
+  map_destroy(&resolver.output.resolved_implementations);
+  map_destroy(&resolver.output.reachable_interface_implementations);
+
+  map_destroy(&INTRINSIC_ROUTINES);
+
+  memory.free(resolver);
+}
+
+implement Resolver {
+
+  /**
+  * Initializes a resolver.
+  */
+  internal proc init() {
+    memory.pool_init(&self.symbol_pool);
+    self.symbol_allocator = memory.pool_allocator(&self.symbol_pool);
+
+    memory.pool_init(&self.name_pool);
+    self.name_allocator = memory.pool_allocator(&self.name_pool);
+
+    map_set(&INTRINSIC_ROUTINES, "entry_point", .Entry_Point);
+    map_set(&INTRINSIC_ROUTINES, "data", .Data);
+    map_set(&INTRINSIC_ROUTINES, "length", .Length);
+    map_set(&INTRINSIC_ROUTINES, "capacity", .Capacity);
+    map_set(&INTRINSIC_ROUTINES, "hash_function_of_type", .Hash_Function_Of_Type);
+    map_set(&INTRINSIC_ROUTINES, "compare_function_of_type", .Compare_Function_Of_Type);
+    map_set(&INTRINSIC_ROUTINES, "trap", .Trap);
+    map_set(&INTRINSIC_ROUTINES, "type_is_scalar", .Type_Is_Scalar);
+    map_set(&INTRINSIC_ROUTINES, "type_is_enum", .Type_Is_Enum);
+    map_set(&INTRINSIC_ROUTINES, "type_is_struct", .Type_Is_Struct);
+    map_set(&INTRINSIC_ROUTINES, "type_is_aosoa", .Type_Is_AoSoA);
+    map_set(&INTRINSIC_ROUTINES, "type_is_trivial_copyable", .Type_Is_Trivial_Copyable);
+    map_set(&INTRINSIC_ROUTINES, "type_enum_item_count", .Type_Enum_Item_Count);
+    map_set(&INTRINSIC_ROUTINES, "type_struct_field_count", .Type_Struct_Field_Count);
+    map_set(&INTRINSIC_ROUTINES, "type_aosoa_chunk_size", .Type_AoSoA_Chunk_Size);
+    map_set(&INTRINSIC_ROUTINES, "type_aosoa_items_in_chunk", .Type_AoSoA_Items_In_Chunk);
+  }
+
+  /**
+  * Imports all built-in types.
+  *
+  * @param file The package file the built-in types will live in.
+  */
+  internal proc import_builtin_types(file: *Package_File) {
+    storage := context.storage;
+
+    self.add_builtin_type(file, storage.type_b8);
+    self.add_builtin_type(file, storage.type_b16);
+    self.add_builtin_type(file, storage.type_b32);
+    self.add_builtin_type(file, storage.type_b64);
+    self.add_builtin_type(file, storage.type_bool);
+    self.add_builtin_type(file, storage.type_i8);
+    self.add_builtin_type(file, storage.type_i16);
+    self.add_builtin_type(file, storage.type_i32);
+    self.add_builtin_type(file, storage.type_i64);
+    self.add_builtin_type(file, storage.type_int);
+    self.add_builtin_type(file, storage.type_u8);
+    self.add_builtin_type(file, storage.type_u16);
+    self.add_builtin_type(file, storage.type_u32);
+    self.add_builtin_type(file, storage.type_u64);
+    self.add_builtin_type(file, storage.type_uint);
+    self.add_builtin_type(file, storage.type_f32);
+    self.add_builtin_type(file, storage.type_f64);
+    self.add_builtin_type(file, storage.type_char);
+    self.add_builtin_type(file, storage.type_string);
+    self.add_builtin_type(file, storage.type_cstring);
+    self.add_builtin_type(file, storage.type_rawptr);
+    self.add_builtin_type(file, storage.type_any);
+    self.add_builtin_type(file, storage.type_typeid);
+
+    self.add_builtin_type(file, storage.type_u8, "byte");
+
+    self.add_builtin_constant(file, "null", storage.type_untyped_null, {});
+
+    context_symbol := self.add_builtin_type(file, null, "Context");
+    context_type := storage.make_type_incomplete(.Struct, context_symbol);
+    context_symbol.type = context_type;
+    storage.cached_runtime_types.context_struct = context_type;
+  }
+
+  /**
+  * Adds a built-in type.
+  *
+  * @param file The package file the built-in type will live in.
+  * @param name The name of the built-in type.
+  * @return The symbol of the built-in type.
+  */
+  private proc add_builtin_type(file: *Package_File, type: *Type, name: string = "") -> *Symbol {
+    name := name;
+    if (name == "") {
+      name = type.name;
+    }
+
+    symbol := symbol_make(self, .Type, .Public, file, name, null);
+    symbol.state = .Resolved;
+    symbol.type = type;
+    set_flag(&symbol.flags, .Reachable);
+    self.add_global_symbol(file, name, symbol);
+
+    if (type != null) {
+      type.symbol = symbol;
+    }
+
+    return symbol;
+  }
+
+  /**
+  * Adds a built-in constant.
+  *
+  * @param file  The package file the built-in contant will live in.
+  * @param name  The name of the built-in contant.
+  * @param type  The type of the built-in contant.
+  * @param value The value of the built-in contant.
+  */
+  private proc add_builtin_constant(file: *Package_File, name: string, type: *Type, value: Value) {
+    symbol := symbol_make(self, .Constant, .Public, file, name, null);
+    symbol.state = .Resolved;
+    symbol.type = type;
+    symbol.value = value;
+    set_flag(&symbol.flags, .Reachable);
+    self.add_global_symbol(file, name, symbol);
+  }
+
+  /**
+  * Cache the special types of the 'runtime' package.
+  *
+  * @param runtime_package The 'runtime' package.
+  */
+  internal proc cache_runtime_package_types(runtime_package: *Package) {
+    storage := context.storage;
+
+    self.cache_runtime_package_type(runtime_package, "Operating_System_Kind", &storage.cached_runtime_types.operating_system_kind);
+    self.cache_runtime_package_type(runtime_package, "Source_Location", &storage.cached_runtime_types.source_location);
+    self.cache_runtime_package_type(runtime_package, "Allocator", &storage.cached_runtime_types.allocator);
+    self.cache_runtime_package_type(runtime_package, "Type_Info", &storage.cached_runtime_types.type_info);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Variant", &storage.cached_runtime_types.type_info_variant);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Integer", &storage.cached_runtime_types.type_info_integer);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Enumeration", &storage.cached_runtime_types.type_info_enumeration);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_String", &storage.cached_runtime_types.type_info_string);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Pointer", &storage.cached_runtime_types.type_info_pointer);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Relative_Pointer", &storage.cached_runtime_types.type_info_relative_pointer);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Layout_Pointer", &storage.cached_runtime_types.type_info_layout_pointer);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Dynamic_Pointer", &storage.cached_runtime_types.type_info_dynamic_pointer);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Array", &storage.cached_runtime_types.type_info_array);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Dynamic_Array", &storage.cached_runtime_types.type_info_dynamic_array);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Slice", &storage.cached_runtime_types.type_info_slice);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Map", &storage.cached_runtime_types.type_info_map);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Tuple", &storage.cached_runtime_types.type_info_tuple);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Struct", &storage.cached_runtime_types.type_info_struct);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Union", &storage.cached_runtime_types.type_info_union);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Routine", &storage.cached_runtime_types.type_info_routine);
+    self.cache_runtime_package_type(runtime_package, "Type_Info_Interface", &storage.cached_runtime_types.type_info_interface);
+  }
+
+  /**
+  * Cache a special 'runtime' package type.
+  *
+  * @param runtime_package The 'runtime' package.
+  * @param name            The name of the special 'runtime' package type.
+  * @param type_storage    Pointer to the type that will hold the special 'runtime' package type.
+  */
+  private proc cache_runtime_package_type(runtime_package: *Package, name: string, type_to_store: **Type) {
+    symbol := package_get_symbol_defined_anywhere_in_package(runtime_package, name, .All);
+    assert(symbol != null);
+    self.resolve_symbol(symbol);
+    self.complete_type(symbol.declaration.position, symbol.type);
+    *type_to_store = symbol.type;
+  }
+
+  /**
+  * Setup the compiler constants of the 'runtime' package.
+  *
+  * @param file The package file the constants will live in.
+  */
+  internal proc setup_compiler_constants(file: *Package_File) {
+    compiler := context.compiler;
+    storage := context.storage;
+
+    nox_operating_system_kind_value: Value;
+    #if (NOX_OS == .Windows) {
+      nox_operating_system_kind_value = cast(int) 0;
+    } else #if (NOX_OS == .Linux) {
+      nox_operating_system_kind_value = cast(int) 1;
+    } else {
+      assert(false);
+    }
+    self.add_builtin_constant(file, "NOX_OS", storage.cached_runtime_types.operating_system_kind, nox_operating_system_kind_value);
+
+    nox_debug_constant: Value = cast(bool) compiler.arguments.build_debug;
+    self.add_builtin_constant(file, "NOX_DEBUG", storage.type_bool, nox_debug_constant);
+    nox_rttr_disabled_constant: Value = cast(bool) compiler.arguments.rttr_disabled;
+    self.add_builtin_constant(file, "NOX_RTTR_DISABLED", storage.type_bool, nox_rttr_disabled_constant);
+    nox_assert_disabled_constant: Value = cast(bool) compiler.arguments.assert_disabled;
+    self.add_builtin_constant(file, "NOX_ASSERT_DISABLED", storage.type_bool, nox_assert_disabled_constant);
+  }
+
+  /**
+  * Resolves all directives in a package.
+  *
+  * @param pack The package whose directives to resolve.
+  */
+  internal proc resolve_package_directives(package: *Package) {
+    foreach (_, file in package.files) {
+      foreach (declaration in file.declarations) {
+        if (declaration.kind == .Directive) {
+          self.resolve_directive(file, declaration);
+        }
+      }
+    }
+  }
+
+  /**
+  * Resolves a directive in a package file.
+  *
+  * @param file        The package file the directive belongs to.
+  * @param declaration The directive declaration.
+  */
+  private proc resolve_directive(file: *Package_File, declaration: *Declaration) {
+    declaration := cast(*Declaration_Directive) declaration;
+
+    switch (declaration.directive_kind) {
+      case .Assert: self.resolve_directive_assert(declaration.position, cast(*Declaration_Directive_Assert) declaration);
+      case .If: self.resolve_directive_if(file, cast(*Declaration_Directive_If) declaration);
+      case .Expand_Context: self.resolve_directive_expand_context(declaration.position, cast(*Declaration_Directive_Expand_Context) declaration);
+    }
+  }
+
+  /**
+  * Resolves an assertion directive.
+  *
+  * @param position                     The position of the directive.
+  * @param declaration_directive_assert The assertion directive declaration.
+  */
+  private proc resolve_directive_assert(position: Source_Position, declaration_directive_assert: *Declaration_Directive_Assert) {
+    assertion := self.resolve_directive_condition(cast(*Expression) declaration_directive_assert.expression);
+    if (!assertion.value.(bool)) {
+      report_error_fatal(position, "Static assertion failed");
+    }
+  }
+
+  /**
+  * Resolves an if directive.
+  *
+  * @param position                 The position of the directive.
+  * @param declaration_directive_if The if directive declaration.
+  */
+  private proc resolve_directive_if(file: *Package_File, declaration_directive_if: *Declaration_Directive_If) {
+    condition := self.resolve_directive_condition(cast(*Expression) declaration_directive_if.condition);
+    if (condition.value.(bool)) {
+      self.resolve_directive_if_block(file, declaration_directive_if.then_declarations);
+    } else {
+      else_ifs := declaration_directive_if.else_ifs;
+      foreach (else_if in else_ifs) {
+        else_if_condition := self.resolve_directive_condition(else_if.condition);
+        if (else_if_condition.value.(bool)) {
+          self.resolve_directive_if_block(file, else_if.declarations);
+          // We stop when we found a condition we resolved. 
+          return;
+        }
+      }
+
+      self.resolve_directive_if_block(file, declaration_directive_if.else_declarations);
+    }
+  }
+
+  /**
+  * Resolves an if directive block.
+  *
+  * @param file         The file the directive belongs to.
+  * @param declarations The declarations of the if directive block.
+  */
+  private proc resolve_directive_if_block(file: *Package_File, declarations: [dynamic]*Declaration) {
+    foreach (declaration in declarations) {
+      if (declaration.kind == .Directive) {
+        // We do not append directives to 'file.directive_declarations' as we can simply recursively resolve them here directly.
+        self.resolve_directive(file, declaration);
+      } else if (declaration.kind == .Import) {
+        package_process_import(file, declaration);
+      } else {
+        self.add_package_declaration(file, declaration);
+      }
+    }
+  }
+
+  /**
+  * Resolves an if directive block.
+  *
+  * @param expression The condition expression of the if directive.
+  * @return The resolved operand.
+  */
+  internal proc resolve_directive_condition(expression: *Expression) -> Operand {
+    operand := self.resolve_expression_constant(expression, statement_context_default());
+    if (!has_flag(operand.flags, .Is_Constant)) {
+      report_error_fatal(expression.position, "Condition in static directive must be constant");
+    }
+    if (!operand.type.is_boolean()) {
+      report_error_fatal(expression.position, "Condition in static directive must have a boolean type. Got '%'", operand.type.name);
+    }
+    return operand;
+  }
+
+  /**
+  * Resolves an expand context directive.
+  *
+  * @param resolver                             The reference to the resolver.
+  * @param position                             The position of the directive.
+  * @param declaration_directive_expand_context The expand context directive declaration.
+  */
+  private proc resolve_directive_expand_context(position: Source_Position, declaration_directive_expand_context: *Declaration_Directive_Expand_Context) {
+    field_name := declaration_directive_expand_context.field_name;
+    field_type := self.resolve_type_specification(cast(*Type_Specification) declaration_directive_expand_context.field_type);
+
+    // For now we do a simple check for duplicate field entries and bail out.
+    foreach (field in self.context_fields) {
+      if (field.name == field_name){
+        report_error_fatal(position, "Duplicate field name '%' in context", field_name);
+      }
+    }
+
+    array_aosoa_add(&self.context_fields, {field_name, field_type});
+  }
+
+  /**
+  * Adds all declarations of package.
+  *
+  * @param pack The package whose declarations to add.
+  */
+  internal proc add_package_declarations(package: *Package) {
+    foreach (_, file in package.files) {
+      foreach (declaration in file.declarations) {
+        self.add_package_declaration(file, declaration);
+      }
+    }
+  }
+
+  /**
+  * Adds a single declarations of package file.
+  *
+  * @param file        The package file the declaration belongs to.
+  * @param declaration The declaration to add.
+  */
+  private proc add_package_declaration(file: *Package_File, declaration: *Declaration) {
+    if (declaration.kind == .Import || declaration.kind == .Directive) {
+      return;
+    } else if (declaration.kind == .Implementation) {
+      self.add_global_implementation(file, declaration);
+    } else {
+      symbol := symbol_make_declaration(self, file, declaration);
+      self.add_global_symbol(file, symbol.name, symbol);
+      self.check_declaration_attributes(file, declaration, symbol);
+    }
+  }
+
+  /**
+  * Checks the attributes of a declaration.
+  *
+  * @param file        The package file the declaration belongs to.
+  * @param declaration The declaration to check.
+  * @param symbol      The symbol of the declaration.
+  */
+  private proc check_declaration_attributes(file: *Package_File, declaration: *Declaration, symbol: *Symbol) {
+    attributes := declaration.attributes.attributes;
+    foreach (attribute in attributes) {
+      attribute_kind := attribute.kind;
+      switch (attribute_kind) {
+        case .Flags: {
+          if (declaration.kind != .Enumeration) {
+            report_error_fatal(attribute.position, "The attribute '%' is only valid for enum declarations", ATTRIBUTE_NAMES[attribute_kind]);
+          }
+          if (length(attribute.arguments) > 0) {
+            report_error_fatal(attribute.position, "The attribute '%v' does not have any arguments", ATTRIBUTE_NAMES[attribute_kind]);
+          }
+          set_flag(&symbol.flags, .Enum_Flags);
+        }
+        case .Thread_Local: {
+          if (declaration.kind != .Global) {
+            report_error_fatal(attribute.position, "The attribute '%' is only valid for global variable declarations", ATTRIBUTE_NAMES[attribute_kind]);
+          }
+          if (length(attribute.arguments) > 0) {
+            report_error_fatal(attribute.position, "The attribute '%v' does not have any arguments", ATTRIBUTE_NAMES[attribute_kind]);
+          }
+          set_flag(&symbol.flags, .Global_Thread_Local);
+        }
+        case .Disabled, .Intrinsic, .Builtin: {
+          if (declaration.kind != .Procedure && declaration.kind != .Function) {
+            report_error_fatal(attribute.position, "The attribute '%' is only valid for procedures or functions", ATTRIBUTE_NAMES[attribute_kind]);
+          }
+          if (attribute_kind == .Intrinsic || attribute_kind == .Builtin) {
+            if (length(attribute.arguments) > 0) {
+              report_error_fatal(attribute.position, "The attribute '%v' does not have any arguments", ATTRIBUTE_NAMES[attribute_kind]);
+            }
+            if (file.package != context.compiler.runtime_package) {
+              report_error_fatal(attribute.position, "The attribute '%' is not allowed outside the 'runtime' package", ATTRIBUTE_NAMES[attribute_kind]);
+            }
+
+            if (attribute_kind == .Builtin) {
+              // We consider builtin routines to be always reachable.
+              array_add(&self.always_reachable_symbols, symbol);
+              set_flag(&symbol.flags, .Routine_Builtin);
+            } else {
+              assert(attribute_kind == .Intrinsic);
+              set_flag(&symbol.flags, .Routine_Intrinsic);
+            }
+          }
+        }
+        case .Invalid: fallthrough;
+        case: assert(false);
+      }
+    }
+  }
+
+  /**
+  * Start the resolving phase.
+  */
+  internal proc resolve() {
+    self.resolve_context();
+
+    // We resolve always reachable symbols first.
+    foreach (always_reachable_symbol, _ in self.always_reachable_symbols) {
+      self.resolve_symbol(always_reachable_symbol);
+    }
+
+    // We have to resolve implementations manually here as they are not directly a global symbol.
+    self.resolve_implementations();
+
+    // We iterate manually here as 'reachable_symbols' gets populated inside the loop.
+    for (i := 0; i < length(self.reachable_symbols); i += 1) {
+      reachable_symbol := self.reachable_symbols[i];
+      self.finalize_symbol(reachable_symbol);
+    }
+
+    // All reachable symbols are now found and ordered so copy them over to the resolver output to be consumed by the Generator.
+    array_reserve(&self.output.reachable_sorted_symbols, length(self.sorted_symbols));
+    foreach (reachable_sorted_symbol in self.sorted_symbols) {
+      array_add(&self.output.reachable_sorted_symbols, reachable_sorted_symbol);
+    }
+
+    // We also manually copy over all reachable implementations that correspond to interfaces.
+    // That way the Generator can easily consume them and generate the appropriate vtables.
+    foreach (key, resolved_implementation in self.output.resolved_implementations) {
+      if (key.interface_type == null || !has_flag(key.interface_type.symbol.flags, .Reachable)) then continue;
+      map_set(&self.output.reachable_interface_implementations, key, resolved_implementation);
+    }
+
+    // Every type that is now stored in the storage after resolving every reachable symbol is now a reachable type.
+    foreach (type in context.storage.types) {
+      array_add(&self.output.reachable_types, type);
+    }
+    
+    // At the end we resolve and finalize every unreachable symbol.
+    // We make a copy of the unreachable symbols here as elements would otherwise get removed while iterating.
+    // We allocate the array globally for now as the temporary allocate is being used when finalizing a symbol.
+    unreachable_symbols_copy := array_make!(*Symbol)(0, length(self.unreachable_symbols));
+    defer array_destroy(&unreachable_symbols_copy);
+    foreach (unreachable_symbol, _ in self.unreachable_symbols) {
+      array_add(&unreachable_symbols_copy, unreachable_symbol);
+    }
+    foreach (unreachable_symbol in unreachable_symbols_copy) {
+      self.resolve_symbol(unreachable_symbol);
+      self.finalize_symbol(unreachable_symbol);
+    }
+  }
+
+  /**
+  * Resolves the special 'Context' struct.
+  */
+  private proc resolve_context() {
+    context_symbol := package_get_symbol_defined_anywhere_in_package(context.compiler.runtime_package, "Context", .All);
+    context_type := context_symbol.type;
+
+    fields: aosoa[dynamic]Type_Struct_Field;
+    foreach (field in self.context_fields) {
+      self.complete_type(SOURCE_POSITION_BUILTIN, field.type);
+      array_aosoa_add(&fields, {.Public, false, field.name, field.type, 0});
+    }
+    context.storage.complete_type_struct(context_type, fields, SOA_INFO_NONE);
+    context_type.state = .Completed;
+  }
+
+  /**
+  * Trys to get the attribute of declaration.
+  *
+  * @param declaration The declaration whose attribute to get.
+  * @param kind        The kind of the attribute to get.
+  * @return 1. The attribute if found; 2. True if the attribute could be found otherwise false.
+  */
+  internal proc try_get_attribute(declaration: *Declaration, kind: Attribute_Kind) -> (Attribute, bool) {
+    attributes := declaration.attributes.attributes;
+    foreach (attribute in attributes) {
+      if (attribute.kind == kind) {
+        return {*attribute, true};
+      }
+    }
+    return {{}, false};
+  }
+
+  /**
+  * Completes a type.
+  *
+  * @param position The position of the type declaration.
+  * @param type     The type to complete.
+  */
+  internal proc complete_type(position: Source_Position, type: *Type) {
+    if (has_flag(type.flags, .Uninstantiated_Generic)) {
+      return;
+    } else if (type.state == .Completed) {
+      return;
+    } else if (type.state == .Completing) {
+      report_error_fatal(position, "Illegal cyclic dependency of type '%'", type.name);
+      return;
+    }
+
+    assert(type.state == .Incomplete);
+    type.state = .Completing;
+
+    symbol := type.symbol;
+    declaration := symbol.declaration;
+    
+    previous_packge := package_enter(symbol.package_file.package);
+
+    if (declaration.kind == .Struct) {
+      self.complete_type_struct(type, declaration);
+    } else if (declaration.kind == .Union) {
+      self.complete_type_union(type, declaration);
+    } else {
+      assert(false);
+    }
+
+    type.state = .Completed;
+    array_add(&self.sorted_symbols, type.symbol);
+
+    package_leave(previous_packge);
+  }
+
+  /**
+  * Completes a struct type.
+  *
+  * @param type        The struct type to complete.
+  * @param declaration The declaration of the type.
+  */
+  internal proc complete_type_struct(type: *Type, declaration: *Declaration) {
+    type := cast(*Type_Struct) type;
+    declaration := cast(*Declaration_Struct) declaration;
+
+    generic_context: Generic_Context;
+    generic_context.type_names = declaration.generic_type_names;
+    generic_context.generic_types = type.generic_types;
+
+    struct_name := declaration.name;
+
+    field_names := array_make!(string)(0, 0, context.temporary_allocator);
+    fields: aosoa[dynamic]Type_Struct_Field;
+    foreach (field in declaration.fields) {
+      field_position := field.position;
+      field_type := self.resolve_type_specification(field.type, generic_context);
+      self.complete_type(field_position, field_type);
+      if (has_flag(field_type.flags, .Not_Allowed_As_Field)) {
+        report_error_fatal(field_position, "Type '%' is not allowed as a struct field", field_type.name);
+      }
+      is_composite := field.is_composite;
+      if (is_composite && !field_type.is_struct()) {
+        report_error_fatal(field_position, "Only fields with a struct type can be composited. Got '%'", field_type.name);
+      }
+
+      access_modifier := field.access_modifier;
+      if (access_modifier == .Member_Unspecified) {
+        access_modifier = declaration.access_modifier;
+      }
+      if (declaration.access_modifier < access_modifier) {
+        report_error_fatal(field_position, "Field has a higher access modifier than the struct it is defined in");
+      }
+      if (field_type.symbol != null) {
+        if (field_type.symbol.access_modifier < access_modifier) {
+          report_error_fatal(field.type.position, "Type '%' has a higher access modifier than '%'", field_type.name, declaration.name);
+        }
+      }
+
+      name := field.name;
+      
+      foreach (field_name in field_names) {
+        if (field_name == name) {
+          report_error_fatal(field_position, "Struct '%' already defines a field with the name '%'", struct_name, name);
+        }
+      }
+
+      self.check_for_method_name_clash(field_position, type.methods, name, struct_name);
+      foreach (inter in type.interfaces) {
+        self.check_for_method_name_clash(field_position, inter.methods, name, struct_name);
+      }
+
+      self.add_struct_field_names_recursive(&field_names, name, is_composite, field_type);
+      array_aosoa_add(&fields, {access_modifier, is_composite, name, field_type, 0  });
+    }
+
+    context.storage.complete_type_struct(cast(*Type) type, fields, SOA_INFO_NONE);
+  }
+
+  /**
+  * Recursively add the fields of a struct.
+  *
+  * @param names        The names .
+  * @param field_name   The name of the field.
+  * @param is_composite Is the field marked with the 'composite' keyword.
+  * @param field_type   The type of the field.
+  */
+  internal proc add_struct_field_names_recursive(names: *[dynamic]string, field_name: string, is_composite: bool, field_type: *Type) {
+    array_add(names, field_name);
+    if (is_composite) {
+      field_type := cast(*Type_Struct) field_type;
+      foreach (field in field_type.fields) {
+        self.add_struct_field_names_recursive(names, field.name, field.is_composite, field.type);
+      }
+    }
+  }
+
+  /**
+  * Check for name clashes with already existing methods.
+  *
+  * @param position    The position of the method.
+  * @param methods     The methods to check in.
+  * @param method_name The name of the method to check.
+  * @param type_name   The name of the method type.
+  */
+  internal proc check_for_method_name_clash(position: Source_Position, methods: aosoa[dynamic]Type_Method, method_name: string, type_name: string) {
+    foreach (method in methods) {
+      if (method.name == method_name) {
+        report_error_fatal(position, "Type '%' already implements a method named '%'", type_name, method_name);
+      }
+    }
+  }
+
+  /**
+  * Completes a union type.
+  *
+  * @param type        The union type to complete.
+  * @param declaration The declaration of the type.
+  */
+  internal proc complete_type_union(type: *Type, declaration: *Declaration) {
+    type := cast(*Type_Union) type;
+    declaration := cast(*Declaration_Union) declaration;
+
+    variants: [dynamic]*Type;
+    foreach (variant_spec in declaration.variants) {
+      variant := self.resolve_type_specification(variant_spec);
+      self.complete_type(variant_spec.position, variant);
+      if (has_flag(variant.flags, .Not_Allowed_As_Union)) {
+        report_error_fatal(variant_spec.position,  "Type '%' is not allowed as a union variant", variant.name);
+      }
+      array_add(&variants, variant);
+    }
+
+    for (i := 0; i < length(variants) - 1; i += 1) {
+      type_a := variants[i];
+      type_b := variants[i + 1];
+      type_spec_b := declaration.variants[i + 1];
+
+      if (type_a == type_b) {
+        report_error_fatal(type_spec_b.position, "Duplicate type '%' in union is not allowed", type_a.name);
+      }
+    }
+
+    context.storage.complete_type_union(cast(*Type) type, variants);
+  }
+
+  /**
+  * Marks a type for RTTR generation.
+  *
+  * @param position The position of the type.
+  * @param type     The type to mark.
+  */
+  internal proc mark_type_for_rttr_generation(position: Source_Position, type: *Type) {
+    if (has_flag(type.flags, .Generate_RTTR)) then return;
+
+    self.complete_type(position, type);
+    set_flag(&type.flags, .Generate_RTTR);
+
+    if (type.base != null) {
+      self.mark_type_for_rttr_generation(position, type.base);
+    }
+
+    switch (type.kind) {
+      case .Self_Relative_Pointer, .Offset_Relative_Pointer: {
+        type := cast(*Type_Relative_Pointer) type;
+        self.mark_type_for_rttr_generation(position, type.relative_base);
+      }
+      case .Map: {
+        type := cast(*Type_Map) type;
+        self.mark_type_for_rttr_generation(position, type.key);
+        self.mark_type_for_rttr_generation(position, type.value);
+      }
+      case .Struct: {
+        type := cast(*Type_Struct) type;
+        foreach (field in type.fields) {
+          self.mark_type_for_rttr_generation(position, field.type);
+        }
+      }
+      case .Union: {
+        type := cast(*Type_Union) type;
+        foreach (variant in type.variants) {
+          self.mark_type_for_rttr_generation(position, variant);
+        }
+      }
+      case .Procedure, .Function: {
+        type := cast(*Type_Routine) type;
+        foreach (parameter in type.parameters) {
+          self.mark_type_for_rttr_generation(position, parameter.type);
+        }
+        self.mark_type_for_rttr_generation(position, type.return_type);
+      }
+    }
+  }
+
+  /**
+  * Resolves a name to a symbol.
+  *
+  * @param position The position of the name to resolve.
+  * @param pack     The package to resolve the name in.
+  * @param name     The name to resolve.
+  * @return The resolved symbol.
+  */
+  internal proc resolve_name(position: Source_Position, package: *Package, name: string) -> *Symbol {
+    local_symbol := self.get_local_symbol(name);
+    if (local_symbol != null) {
+      set_flag(&local_symbol.flags, .Local_Used);
+      return local_symbol;
+    }
+
+    symbol := package_get_symbol(package, position, name, .All);
+    self.resolve_symbol(symbol);
+
+    return symbol;
+  }
+
+  /** 
+  * Resolves an initializer.
+  *
+  * @param position          The position of the initializer.
+  * @param statement_context The statement context to use.
+  * @param typespec          The type specification of the initializer to resolve.
+  * @param expression        The expression of the initializer to resolve.
+  * @return The resolved type.
+  */
+  internal proc resolve_initializer(position: Source_Position, statement_context: Statement_Context, typespec: *Type_Specification, expression: *Expression) -> *Type {
+    type: *Type;
+    if (typespec != null) {
+      declared_type := self.resolve_type_specification(typespec);
+      type = declared_type;
+
+      if (expression != null) {
+        inferred_type, success := self.resolve_initializer_typed(statement_context, declared_type, expression);
+        if (!success) {
+          report_error_fatal(position, "Invalid type in initializer. Expected '%' got '%'", declared_type.name, inferred_type.name);
+        }
+        if (type.is_array_and_incomplete()) {
+          self.set_resolved_type(typespec, inferred_type);
+          type = inferred_type;
+        }
+      }
+    } else {
+      assert(expression != null);
+
+      resolved_expression := self.resolve_expression(expression, statement_context);
+      operand_remove_untyped(expression.position, &resolved_expression);
+      type = resolved_expression.type;
+
+      if (type.is_untyped_null()) {
+        report_error_fatal(position, "Cannot deduce type from 'untyped null'");
+      }
+
+      self.set_resolved_type(expression, type);
+      self.set_resolved_overwrite_type(expression, type);
+    }
+
+    // Incomplete array types need explicit handling here as they are allowed as variables but only with an corresponding initializer expression.
+    if (has_flag(type.flags, .Not_Allowed_As_Variable)) {
+      if (type.is_void() && expression != null && expression.kind == .Call) {
+        report_error_fatal(position, "Routine call does not return a value and cannot be used as a value");
+      } else {
+        report_error_fatal(position, "Type '%' is not allowed as a local or global variable", type.name);
+      }
+    } else if (type.is_array_and_incomplete() && expression == null) {
+      report_error_fatal(position, "Incomplete array of type '%' is missing its initializer expression", type.name);
+    }
+
+    self.complete_type(position, type);
+
+    return type;
+  }
+
+  /**
+  * Resolves a initializer with an expected type.
+  *
+  * @param statement_context The statement context to use.
+  * @param type              The expected type of the initializer.
+  * @param expression        The expression of the initializer to resolve.
+  * @return 1. The resolved type; 2. True if the initializer could be converted to the expected type otherwise false.
+  */
+  internal proc resolve_initializer_typed(statement_context: Statement_Context, type: *Type, expression: *Expression) -> (*Type, bool) {
+    expected_type := type.unqualify();
+    operand := self.resolve_expression_expected(expression, statement_context, expected_type);
+
+    if (type.is_array_and_incomplete()) {
+      if (type.base == operand.type.base) {
+        complete_array := context.storage.get_or_make_type_array(SOA_INFO_NONE, operand.type.base, (cast(*Type_Array) operand.type).number_of_elements, false);
+        self.set_resolved_type(expression, complete_array);
+        self.set_resolved_overwrite_type(expression, complete_array);
+        return {complete_array, true};
+      }
+    }
+
+    if (!self.operand_convert(expression.position, &operand, expected_type)) {
+      return {operand.type, false};
+    }
+
+    self.set_resolved_overwrite_type(expression, operand.type);
+
+    return {operand.type, true};
+  }
+
+  /**
+  * Gets a local symbol by name.
+  *
+  * @param name The name of the local symbol.
+  * @return The local symbol.
+  */
+  private proc get_local_symbol(name: string) -> *Symbol {
+    return self.get_local_symbol_in_block_recursive(self.local_scope, name);
+  }
+
+  /**
+  * Gets a local symbol by name recursively by looking into parent scopes.
+  *
+  * @param local_scope The current local scope to look in.
+  * @param name        The name of the local symbol.
+  * @return The local symbol.
+  */
+  private proc get_local_symbol_in_block_recursive(local_scope: *Local_Scope, name: string) -> *Symbol {
+    if (local_scope == null) then return null;
+
+    contains_local := map_contains(&local_scope.symbols, name);
+    if (contains_local) {
+      local_symbol := map_get_address(&local_scope.symbols, name);
+      return &local_symbol.symbol;
+    }
+
+    return self.get_local_symbol_in_block_recursive(local_scope.parent_block, name);
+  }
+
+  /**
+  * Set a resolved symbol.
+  *
+  * @param key    The AST key of the resolved symbol.
+  * @param symbol The resolved symbol.
+  */
+  internal proc set_resolved_symbol(key: *Expression, symbol: *Symbol) {
+    // Locals and parameters are not persistent and are therefore never 'globally' resolved.
+    if (symbol.kind != .Local && symbol.kind != .Parameter) {
+      map_set(&self.output.resolved_symbols, key, symbol);
+    }
+  }
+    
+  /**
+  * Set a resolved type.
+  *
+  * @param key  The AST key of the resolved type.
+  * @param type The resolved type.
+  */
+  internal proc set_resolved_type(key: rawptr, type: *Type) {
+    map_set(&self.output.resolved_types, key, type);
+  }
+
+  /**
+  * Set a resolved overwritten type.
+  *
+  * @param key  The AST key of the resolved overwritten type.
+  * @param type The resolved overwritten type.
+  */
+  internal proc set_resolved_overwrite_type(key: *Expression, type: *Type) {
+    map_set(&self.output.resolved_overwrite_types, key, type);
+  }
+
+  /**
+  * Set a resolved constant.
+  *
+  * @param key      The AST key of the resolved constant.
+  * @param constant The resolved constant.
+  */
+  internal proc set_resolved_constant(key: *Expression, constant: Operand) {
+    map_set(&self.output.resolved_constants, key, constant);
+  }
+
+  /**
+  * Set a resolved member.
+  *
+  * @param key    The AST key of the resolved member.
+  * @param member The resolved member.
+  */
+  internal proc set_resolved_member(key: *Expression, member: Resolved_Member) {
+    map_set(&self.output.resolved_members, key, member);
+  }
+
+  /**
+  * Set a resolved compound field.
+  *
+  * @param key            The AST key of the resolved compound field.
+  * @param compound_field The resolved compound field.
+  */
+  internal proc set_resolved_compound_field(key: *Expression, compound_field: Resolved_Compound_Field) {
+    map_set(&self.output.resolved_compound_fields, key, compound_field);
+  }
+
+  /**
+  * Enters a new local scope.
+  */
+  internal proc enter_local_scope() {
+    scope := self.local_scope;
+
+    local_scope := memory.new!(Local_Scope)();
+    local_scope.parent_block = scope;
+    self.local_scope = local_scope;
+  }
+
+  /**
+  * Leaves the current local scope.
+  */
+  internal proc leave_local_scope() {
+    scope := self.local_scope;
+
+    foreach (name, local_symbol in scope.symbols) {
+      if (has_flag(local_symbol.symbol.flags, .Local_Declared) && !has_flag(local_symbol.symbol.flags, .Local_Used)) {
+        symbol_description_name := local_symbol.symbol.kind == .Parameter ? "parameter" : "local variable";
+        report_warning(local_symbol.position, "The % '%' got declared but not used", symbol_description_name, name);
+      }
+    }
+
+    if (scope != null) {
+      self.local_scope = scope.parent_block;
+      map_destroy(&scope.symbols);
+      memory.free(scope);
+    }
+  }
+
+  /**
+  * Makes a formatted symbol.
+  *
+  * @param format The format of the name.
+  * @param args   The arguments of the format.
+  * @return The formatted symbol name.
+  */
+  internal proc make_formatted_symbol_name(format: string, params args: []any) -> string {
+    builder := strings.builder_make(self.name_allocator);
+    builder.write_format(format, args);
+    return builder.to_string();
+  }
+
+}

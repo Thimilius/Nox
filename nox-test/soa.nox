@@ -1,0 +1,114 @@
+/**
+* Test the functionality of SoA collections.
+*/
+internal proc test_soa() {
+  test_soa_array();
+  test_soa_dynamic_array();
+  test_soa_slices();
+  test_soa_pointers();
+}
+
+private proc test_soa_array() {
+  array: soa[4]Foo;
+
+  array[0] = {1, "1", {}};
+  assert(array[0].i == 1);
+  assert(array[0].s == "1");
+
+  array[1] = {2, "2", {}};
+  array[1].a[0] = {3, "3"};
+
+  assert(array[1].i == 2);
+  assert(array[1].s == "2");
+  assert(array[1].a[0].i == 3);
+  assert(array[1].a[0].s == "3");
+
+  array[2].i = 13;
+  assert(array[2].i == 13);
+
+  pointer_to_array := &array;
+
+  pointer_to_array[0].i = 19;
+  assert(pointer_to_array[0].i == 19);
+
+  raw_array: soa[4]Foo;
+  raw_array[0] = {0, "0", {}};
+  raw_array[1] = {1, "1", {}};
+  raw_array[2] = {2, "2", {}};
+  raw_array[3] = {3, "3", {}};
+  foreach (element, i in raw_array) {
+    assert(element.i == i);
+  }
+}
+
+private proc test_soa_dynamic_array() {
+  dynamic_array: soa[dynamic]Foo;
+  array_soa_add(&dynamic_array, {0, "0", {}});
+  array_soa_add(&dynamic_array, {1, "1", {}});
+  array_soa_add(&dynamic_array, {2, "2", {}});
+  array_soa_add(&dynamic_array, {3, "3", {}});
+  array_soa_add(&dynamic_array, {4, "4", {}});
+  array_soa_add(&dynamic_array, {5, "5", {}});
+
+  assert(length(dynamic_array) == 6);
+  for (i := 0; i < length(dynamic_array); i++) {
+    assert(dynamic_array[i].i == i);
+  }
+  foreach (element, i in dynamic_array) {
+    assert(element.i == i);
+  }
+}
+
+private proc test_soa_slices() {
+  array: soa[4]Foo;
+  array[0].i = 0;
+  array[1].i = 1;
+  array[2].i = 2;
+  array[3].i = 3;
+
+  slice := array[:];
+
+  assert(length(slice) == 4);
+  for (i := 0; i < length(slice); i++) {
+    assert(slice[i].i == i);
+  }
+  foreach (element, i in slice) {
+    assert(element.i == i);
+  }
+}
+
+private proc test_soa_pointers() {
+  array: soa[8]Foo;
+  array[0] = {0, "0", {}};
+  array[1] = {1, "1", {}};
+  array[2] = {2, "2", {}};
+
+  p_1 := &array[1];
+  assert(p_1.i == 1);
+  assert(p_1.s == "1");
+
+  p_2: soa*soa[8]Foo = &array[2];
+  assert(p_2.i == 2);
+  assert(p_2.s == "2");
+
+  slice := array[:];
+  p_slice := &slice[1];
+  assert(p_slice.i == 1);
+  assert(p_slice.s == "1");
+
+  *p_slice = {123, "123", {}};
+  element := *p_slice;
+  assert(element.i == 123);
+  assert(element.s == "123");
+}
+
+private struct Bar {
+  i: int,
+  s: string,
+}
+
+private struct Foo {
+  i: int,
+  s: string,
+  a: soa[4]Bar,
+}

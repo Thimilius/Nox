@@ -1,0 +1,33 @@
+/**
+* Test the functionality of regular pointers.
+*/
+internal proc test_pointers() {
+  variable := 14;
+
+  pointer: *int = &variable;
+  assert(pointer == &variable);
+
+  pointer = null;
+  assert(pointer == null);
+
+  pointer = &variable;
+  *pointer = 123;
+  assert(variable == 123);
+
+  double_pointer := &pointer;
+  value_from_double_pointer := **double_pointer;
+  assert(value_from_double_pointer == 123);
+  **double_pointer = 42;
+  assert(**double_pointer == 42);
+
+  triple_pointer := &double_pointer;
+  value_from_triple_pointer := ***triple_pointer;
+  assert(value_from_triple_pointer == 42);
+
+  quadruple_pointer := &triple_pointer;
+  value_from_quadruple_pointer := ****quadruple_pointer;
+  assert(value_from_quadruple_pointer == 42);
+
+  v := *&variable;
+  assert(v == 42);
+}

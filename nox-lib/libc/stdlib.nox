@@ -1,0 +1,13 @@
+public extern proc abort()
+public extern proc exit(exit_code: i32)
+public extern proc system(command: cstring) -> i32
+
+public extern proc malloc(size: size_t) -> rawptr
+public extern proc calloc(num: size_t, size: size_t) -> rawptr
+public extern proc realloc(ptr: rawptr, new_size: size_t) -> rawptr
+public extern proc free(ptr: rawptr)
+
+public extern proc strtod(str: cstring, str_end: *cstring) -> f64
+
+const INFINITY := 1e5000;
+const HUGE_VAL := cast(f64) INFINITY;

@@ -1,0 +1,39 @@
+#if (NOX_OS == .Linux) {
+
+  public type_alias ino_t               := u64;
+  public type_alias off_t               := i64;
+  public type_alias Dir                 := rawptr;
+  public type_alias pthread_t           := rawptr;
+  public type_alias pthread_attr_t      := [56]byte;
+  public type_alias pthread_mutex_t     := [40]byte;
+  public type_alias pthread_mutexattr_t := [4]byte;
+
+  public const O_RDONLY: i32 = 0x00000;
+  public const O_WRONLY: i32 = 0x00001;
+  public const O_RDWR  : i32 = 0x00002;
+
+  public const DT_DIR: u8 = 4;
+  public const DT_REG: u8 = 8;
+
+  public const _SC_LEVEL1_DCACHE_LINESIZE: i32 = 190;
+
+  public const PTHREAD_CREATE_JOINABLE: i32 = 0;
+
+  // This is assumed to be the same on all Linux distributions (may or may not be true).
+  // Taken from: https://man7.org/linux/man-pages/man3/readdir.3.html.
+  public struct Dirent {
+    ino:      ino_t,
+    off:      off_t,
+    reclen:   u16,
+    type:     u8,
+    name:     [256]byte,
+  }
+  
+  public const CLOCK_REALTIME: u64 = 0;
+
+  public struct Timespec {
+    tv_sec:  i64,
+    tv_nsec: i64,
+  }
+
+}

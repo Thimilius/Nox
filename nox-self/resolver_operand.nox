@@ -1,0 +1,591 @@
+import "std:math"
+
+/**
+* Represents flags for an operand.
+*/
+@flags internal enum Operand_Flags : u8 {
+  Is_LValue,    // Is the operand an lvalue?
+  Is_Constant,  // Is the operand a constant?
+  Is_Pure,      // Is the operand pure?
+  Is_Immutable, // Is the operand immutable?
+  Is_Parameter, // Is the operand a parameter?
+}
+
+/**
+* Represents an operand.
+*/
+internal struct Operand {
+  type: *Type,          // The type of the operand.
+  flags: Operand_Flags, // The flags of the operand.
+  value: Value,         // The value of the operand (if constant).
+}
+
+/**
+* Creates an rvalue operand.
+*
+* @param type         The type of the operand.
+* @param is_pure      Is the operand pure?
+* @param is_immutable Is the operand immutable?
+* @return The rvalue operand.
+*/
+internal proc operand_rvalue(type: *Type, is_pure: bool, is_immutable: bool) -> Operand {
+  flags: Operand_Flags;
+  if (is_pure) {
+    set_flag(&flags, .Is_Pure);
+  }
+  if (is_immutable) {
+    set_flag(&flags, .Is_Immutable);
+  }
+  return {type.unqualify(), flags, {}};
+}
+
+/**
+* Creates an lvalue operand.
+*
+* @param type         The type of the operand.
+* @param is_pure      Is the operand pure?
+* @param is_immutable Is the operand immutable?
+* @return The lvalue operand.
+*/
+internal proc operand_lvalue(type: *Type, is_pure: bool, is_immutable: bool) -> Operand {
+  flags := Operand_Flags.Is_LValue;
+  if (is_pure) {
+    set_flag(&flags, .Is_Pure);
+  }
+  if (is_immutable) {
+    set_flag(&flags, .Is_Immutable);
+  }
+  return {type.unqualify(), flags, {}};
+}
+
+/**
+* Creates a constant operand.
+*
+* @param type  The type of the operand.
+* @param value The constant value of the operand.
+* @return The constant operand.
+*/
+internal proc operand_constant(type: *Type, value: Value) -> Operand {
+  flags: Operand_Flags;
+  set_flag(&flags, .Is_Constant);
+  set_flag(&flags, .Is_Pure);
+  set_flag(&flags, .Is_Immutable);
+  return {type.unqualify(), flags, value};
+}
+
+/**
+* Creates a parameter operand.
+*
+* @param type         The type of the operand.
+* @param is_immutable Is the operand immutable?
+* @return The parameter operand.
+*/
+internal proc operand_parameter(type: *Type, is_immutable: bool) -> Operand {
+  flags: Operand_Flags;
+  set_flag(&flags, .Is_LValue);
+  set_flag(&flags, .Is_Pure);
+  set_flag(&flags, .Is_Parameter);
+  if (is_immutable) {
+    set_flag(&flags, .Is_Immutable);
+  }
+  return {type.unqualify(), flags, {}};
+}
+
+implement Resolver {
+
+  /**
+  * Trys to convert an operand into a given type.
+  *
+  * @param position The position of the conversion.
+  * @param operand  The operand to convert.
+  * @param type     The type to convert into.
+  * @return True if the conversion was successful otherwise false.
+  */
+  internal proc operand_convert(position: Source_Position, operand: *Operand, type: *Type) -> bool {
+    self.complete_type(position, type);
+    actual_type_to_cast_to, is_convertible := self.operand_is_convertible(position, operand, type);
+    if (is_convertible) {
+      operand_cast_unchecked(position, operand, actual_type_to_cast_to);
+      remove_flag(&operand.flags, .Is_LValue);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+  * Checks whether or not a conversion is possible.
+  *
+  * @param position The position of the conversion.
+  * @param operand  The operand to check the conversion for.
+  * @param type     The type to convert into.
+  * @return 1. The type that can be converted into; 2. True if the conversion is possible otherwise false.
+  */
+  internal proc operand_is_convertible(position: Source_Position, operand: *Operand, type: *Type) -> (*Type, bool) {
+    destination_type := type.unqualify();
+    source_type := operand.type.unqualify();
+
+    // It should never occur that we are trying to convert into an untyped type.
+    assert(!destination_type.is_untyped());
+
+    if (source_type == destination_type) {
+      return {type, true};
+    } if (destination_type.is_union()) {
+      return self.operand_can_convert_to_union(position, operand, destination_type);
+    } else if (destination_type.is_any()) {
+      // Converting something to an 'any' automatically marks the source type for RTTR.
+      self.mark_type_for_rttr_generation(position, source_type);
+      return {type, !source_type.is_void() && !source_type.is_routine_intrinsic()};
+    } else if (source_type.is_untyped_boolean()) {
+      return {type, destination_type.is_boolean()};
+    } else if (source_type.is_untyped_integer()) {
+      // Untyped integers are allowed to be converted to floats as well.
+      can_convert_untyped_integer := destination_type.is_integer() || destination_type.is_float() || destination_type.is_offset_relative_pointer();
+      return {type, can_convert_untyped_integer};
+    } else if (source_type.is_untyped_float()) {
+      return {type, destination_type.is_float()};
+    } else if (source_type.is_untyped_char()) {
+      return {type, destination_type.is_char()};
+    } else if (source_type.is_untyped_string()) {
+      return {type, destination_type.is_string_like()};
+    }
+    
+    // The reason we seperate these checks from the ones before is the handling of distintly defined types through 'type_define' declarations.
+
+    result := false;
+    if (source_type.is_slice()) {
+      result = destination_type.is_slice() && destination_type.base == source_type.base;
+    } else if (source_type.is_untyped_null()) {
+      result = destination_type.is_string_like() || destination_type.is_absolute_or_relative_pointer_like() || destination_type.is_dynamic_pointer();
+    } else if (destination_type.is_raw_pointer()) {
+      result = source_type.is_absolute_pointer_like();
+    } else if (destination_type.is_self_relative_pointer()) {
+      result = source_type.is_absolute_pointer() && destination_type.base == source_type.base;
+    } else if (destination_type.is_offset_relative_pointer()) {
+      result = (cast(*Type_Relative_Pointer) destination_type).relative_base == source_type;
+    } else if (destination_type.is_dynamic_pointer()) {
+      if (source_type.is_absolute_pointer()) {
+        foreach (inter in source_type.base.interfaces) {
+          if (inter == destination_type.base) {
+            result = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (has_flag(source_type.flags, .Defined_Distinct)) {
+      result = false;
+    }
+
+    return {type, result};
+  }
+
+  /**
+  * Checks whether or not type can be converted into a union.
+  *
+  * @param position         The position of the conversion.
+  * @param operand          The operand to check the conversion for.
+  * @param destination_type The type to convert into.
+  * @return 1. The type that can be converted into; 2. True if the conversion is possible otherwise false.
+  */
+  internal proc operand_can_convert_to_union(position: Source_Position, operand: *Operand, destination_type: *Type) -> (*Type, bool) {
+    // For unions our source must match with any of the types in the union.
+    type_union := cast(*Type_Union) destination_type;
+    can_convert_to_union := false;
+
+    // We allow 'null' as a default value for unions (as we also allow comparing with 'null').
+    if (operand.type.is_untyped_null()) {
+      return {destination_type, true};
+    }
+
+    ambiguous_types := array_make!(*Type)(0, length(type_union.variants), context.temporary_allocator);
+    foreach (variant in type_union.variants) {
+      _, convertible := self.operand_is_convertible(position, operand, variant);
+      if (convertible) {
+        can_convert_to_union = true;
+        array_add(&ambiguous_types, variant);
+      }
+    }
+
+    if (length(ambiguous_types) > 1) {
+      ambiguous_type_names := get_type_names(ambiguous_types);
+      report_error_fatal(position, "Cannot implicitly convert type '%' to union. Ambigous types:\n%", operand.type.name, ambiguous_type_names);
+    }
+
+    if (!can_convert_to_union) {
+      possible_types := get_type_names(type_union.variants);
+      report_error_fatal(position, "Cannot implicitly convert type '%' to union '%'. Possible types:\n%", operand.type.name, destination_type.name, possible_types);
+    }
+
+    actual_union_type: *Type;
+    if (length(ambiguous_types) > 0) {
+      actual_union_type = ambiguous_types[0];
+    }
+
+    return {actual_union_type, can_convert_to_union};
+  }
+
+  /**
+  * Checks whether or not a cast is possible.
+  *
+  * @param position The position of the cast.
+  * @param operand  The operand to check the cast for.
+  * @param type     The type to convert into.
+  * @return 1. The type that can be converted into; 2. True if the cast is possible otherwise false.
+  */
+  internal proc operand_is_castable(position: Source_Position, operand: *Operand, type: *Type) -> bool {
+    destination_type := type.unqualify();
+    source_type := operand.type.unqualify();
+
+    _, is_convertible := self.operand_is_convertible(position, operand, type);
+    if (is_convertible) {
+      return true;
+    } else if (source_type.is_scalar() && destination_type.is_scalar()) {
+      if (source_type.is_untyped_integer()) {
+        // Untyped integers can be casted to: bool, char, enums and any integer type of course.
+        return destination_type.is_boolean() || destination_type.is_integer() || destination_type.is_char() || destination_type.is_enumeration();
+      } else if (source_type.is_untyped_float()) {
+        // Untyped floats can only be casted to typed floats.
+        return destination_type.is_float();
+      } else if (source_type.is_untyped_char()) {
+        // Untyped chars can be casted to: any integer or char of course.
+        return destination_type.is_integer() || destination_type.is_char();
+      } else if (source_type.is_float() && destination_type.is_boolean()) {
+        // Floats cannot be casted to bool.
+        return false;
+      } else if (source_type.is_boolean()) {
+        // Bool cannot be casted to float.
+        return !destination_type.is_float();
+      } else {
+        return true;
+      }
+    } else if (source_type.is_absolute_pointer_like() || source_type.is_cstring()) {
+      // We treat cstrings as pointers (which they are).
+      return destination_type.is_absolute_pointer_like() || destination_type.kind == .UInt || destination_type.is_cstring();
+    } else if (destination_type.is_absolute_pointer_like() || destination_type.is_cstring()) {
+      return source_type.is_absolute_pointer_like() || source_type.is_self_relative_pointer() || source_type.kind == .UInt || source_type.is_cstring();
+    } else {
+      return false;
+    }
+  }
+
+  /**
+  * Trys to cast an operand into a given type.
+  *
+  * @param position The position of the cast.
+  * @param operand  The operand to cast.
+  * @param type     The type to cast into.
+  * @return True if the cast was successful otherwise false.
+  */
+  internal proc operand_cast(position: Source_Position, operand: *Operand, type: *Type) -> bool {
+    if (self.operand_is_castable(position, operand, type.unqualify())) {
+      operand_cast_unchecked(position, operand, type);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+}
+
+/**
+* Makes an unchecked cast.
+*
+* @param position The position of the cast.
+* @param operand  The operand to cast.
+* @param type     The type to cast into.
+*/
+internal proc operand_cast_unchecked(position: Source_Position, operand: *Operand, type: *Type) {
+  destination_type := type.unqualify();
+  source_type := operand.type.unqualify();
+
+  // We only need to perform the actual cast when we have a constant we are working with.
+  if (has_flag(operand.flags, .Is_Constant) && !destination_type.is_any()) {
+    real_type := destination_type;
+
+    // Convert enums to their base type.
+    if (source_type.is_enumeration()) {
+      source_type = source_type.base;
+    }
+    if (destination_type.is_enumeration()) {
+      destination_type = destination_type.base;
+    }
+
+    // Convert offset-relative pointers to their relative base.
+    if (destination_type.is_offset_relative_pointer()) {
+      destination_type = (cast(*Type_Relative_Pointer) destination_type).relative_base;
+    }
+
+    switch (source_type.kind) {
+      case .B8:   operand_cast_boolean!(b8)(operand, destination_type);
+      case .B16:  operand_cast_boolean!(b16)(operand, destination_type);
+      case .B32:  operand_cast_boolean!(b32)(operand, destination_type);
+      case .B64:  operand_cast_boolean!(b64)(operand, destination_type);
+      case .Bool: operand_cast_boolean!(bool)(operand, destination_type);
+
+      case .I8:   operand_cast_integer!(i8)(operand, destination_type);
+      case .I16:  operand_cast_integer!(i16)(operand, destination_type);
+      case .I32:  operand_cast_integer!(i32)(operand, destination_type);
+      case .I64:  operand_cast_integer!(i64)(operand, destination_type);
+      case .Int:  operand_cast_integer!(int)(operand, destination_type);
+      case .U8:   operand_cast_integer!(u8)(operand, destination_type);
+      case .U16:  operand_cast_integer!(u16)(operand, destination_type);
+      case .U32:  operand_cast_integer!(u32)(operand, destination_type);
+      case .U64:  operand_cast_integer!(u64)(operand, destination_type);
+      case .UInt: operand_cast_integer!(uint)(operand, destination_type);
+      case .Untyped_Integer: operand_cast_untyped_integer(position, operand, destination_type, real_type);
+
+      case .F32: operand_cast_float!(f32)(operand, destination_type);
+      case .F64: operand_cast_float!(f64)(operand, destination_type);
+      case .Untyped_Float: operand_cast_untyped_float(operand, destination_type);
+
+      case .Char, .Untyped_Char: operand_cast_char(operand, destination_type);
+
+      // For these we do not need to convert the values as setting the new type is enough.
+      case .Untyped_String, .Untyped_Null, .Typeid:
+
+      case: remove_flag(&operand.flags, .Is_Constant);
+    }
+
+  }
+
+  operand.type = type;
+}
+
+/**
+* Casts an operand as a boolean.
+*
+* @param T                The type of the operand value.
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+*/
+private proc operand_cast_boolean!(T)(operand: *Operand, destination_type: *Type) {
+  switch (destination_type.kind) {
+    case .B8:   operand.value = cast(b8)   operand.value.(T);
+    case .B16:  operand.value = cast(b16)  operand.value.(T);
+    case .B32:  operand.value = cast(b32)  operand.value.(T);
+    case .B64:  operand.value = cast(b64)  operand.value.(T);
+    case .Bool: operand.value = cast(bool) operand.value.(T);
+    case .I8:   operand.value = cast(i8)   operand.value.(T);
+    case .I16:  operand.value = cast(i16)  operand.value.(T);
+    case .I32:  operand.value = cast(i32)  operand.value.(T);
+    case .I64:  operand.value = cast(i64)  operand.value.(T);
+    case .Int:  operand.value = cast(int)  operand.value.(T);
+    case .U8:   operand.value = cast(u8)   operand.value.(T);
+    case .U16:  operand.value = cast(u16)  operand.value.(T);
+    case .U32:  operand.value = cast(u32)  operand.value.(T);
+    case .U64:  operand.value = cast(u64)  operand.value.(T);
+    case .UInt: operand.value = cast(uint) operand.value.(T);
+    case: assert(false);
+  }
+}
+
+/**
+* Casts an operand as an integer.
+*
+* @param T                The type of the operand value.
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+*/
+private proc operand_cast_integer!(T)(operand: *Operand, destination_type: *Type) {
+  switch (destination_type.kind) {
+    case .B8:   operand.value = cast(b8)   operand.value.(T);
+    case .B16:  operand.value = cast(b16)  operand.value.(T);
+    case .B32:  operand.value = cast(b32)  operand.value.(T);
+    case .B64:  operand.value = cast(b64)  operand.value.(T);
+    case .Bool: operand.value = cast(bool) operand.value.(T);
+    case .I8:   operand.value = cast(i8)   operand.value.(T);
+    case .I16:  operand.value = cast(i16)  operand.value.(T);
+    case .I32:  operand.value = cast(i32)  operand.value.(T);
+    case .I64:  operand.value = cast(i64)  operand.value.(T);
+    case .Int:  operand.value = cast(int)  operand.value.(T);
+    case .U8:   operand.value = cast(u8)   operand.value.(T);
+    case .U16:  operand.value = cast(u16)  operand.value.(T);
+    case .U32:  operand.value = cast(u32)  operand.value.(T);
+    case .U64:  operand.value = cast(u64)  operand.value.(T);
+    case .UInt: operand.value = cast(uint) operand.value.(T);
+    case .F32:  operand.value = cast(f32)  operand.value.(T);
+    case .F64:  operand.value = cast(f64)  operand.value.(T);
+    case .Char: operand.value = cast(char) operand.value.(T);
+    case: assert(false);
+  }
+}
+
+/**
+* Casts an operand as an untyped integer.
+*
+* @param position         The position of the cast.
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+* @param real_type        The real type of the operand value.
+*/
+private proc operand_cast_untyped_integer(position: Source_Position, operand: *Operand, destination_type: *Type, real_type: *Type) {
+  switch (destination_type.kind) {
+    case .B8:   operand.value = cast(b8)   operand.value.(u64);
+    case .B16:  operand.value = cast(b16)  operand.value.(u64);
+    case .B32:  operand.value = cast(b32)  operand.value.(u64);
+    case .B64:  operand.value = cast(b64)  operand.value.(u64);
+    case .Bool: operand.value = cast(bool) operand.value.(u64);
+    case .I8:   operand_cast_untyped_integer_signed!(i8)(position, operand, real_type, math.I8_MIN, math.I8_MAX);
+    case .I16:  operand_cast_untyped_integer_signed!(i16)(position, operand, real_type, math.I16_MIN, math.I16_MAX);
+    case .I32:  operand_cast_untyped_integer_signed!(i32)(position, operand, real_type, math.I32_MIN, math.I32_MAX);
+    case .I64:  operand_cast_untyped_integer_signed!(i64)(position, operand, real_type, math.I64_MIN, math.I64_MAX);
+    case .Int:  operand_cast_untyped_integer_signed!(int)(position, operand, real_type, math.INT_MIN, math.INT_MAX);
+    case .U8:   operand_cast_untyped_integer_unsigned!(u8)(position, operand, real_type, math.U8_MAX);
+    case .U16:  operand_cast_untyped_integer_unsigned!(u16)(position, operand, real_type, math.U16_MAX);
+    case .U32:  operand_cast_untyped_integer_unsigned!(u32)(position, operand, real_type, math.U32_MAX);
+    case .U64:  operand_cast_untyped_integer_unsigned!(u64)(position, operand, real_type, math.U64_MAX);
+    case .UInt: operand_cast_untyped_integer_unsigned!(uint)(position, operand, real_type, math.UINT_MAX);
+    case .F32:  operand.value = cast(f32)  operand.value.(u64);
+    case .F64:  operand.value = cast(f64)  operand.value.(u64);
+    case .Char: operand.value = cast(char) operand.value.(u64);
+    case .Offset_Relative_Pointer: operand_cast_untyped_integer(position, operand, destination_type.base, real_type);
+    case: assert(false);
+  }
+}
+
+/**
+* Casts an operand as an untyped signed integer.
+*
+* @param T         The type of the operand value.
+* @param position  The position of the cast.
+* @param operand   The operand to cast.
+* @param type      The destination type to cast into.
+* @param real_type The real type of the operand value.
+* @parma min       The minimum value.
+* @parma min       The maximum value.
+*/
+private proc operand_cast_untyped_integer_signed!(T)(position: Source_Position, operand: *Operand, real_type: *Type, min: T, max: T) {
+  value := cast(i64) operand.value.(u64);
+
+  if (value < cast(i64) min || value > cast(i64) max) {
+    if (real_type.is_enumeration()) {
+      report_error_fatal(position, "Integer constant is out of range for enumeration '%' with underlying type '%'", real_type.name, real_type.base.name);
+    } else {
+      report_error_fatal(position, "Integer constant is out of range for type '%'", real_type.name);
+    }
+  }
+
+  operand.value = cast(T) value;
+}
+
+/**
+* Casts an operand as an untyped unsigned integer.
+*
+* @param T         The type of the operand value.
+* @param position  The position of the cast.
+* @param operand   The operand to cast.
+* @param type      The destination type to cast into.
+* @param real_type The real type of the operand value.
+* @parma min       The minimum value.
+* @parma min       The maximum value.
+*/
+private proc operand_cast_untyped_integer_unsigned!(T)(position: Source_Position, operand: *Operand, real_type: *Type, max: T) {
+  value := operand.value.(u64);
+
+  if (value > cast(u64) max) {
+    if (real_type.is_enumeration()) {
+      report_error_fatal(position, "Integer constant is out of range for enumeration '%' with underlying type '%'", real_type.name, real_type.base.name);
+    } else {
+      report_error_fatal(position, "Integer constant is out of range for type '%'", real_type.name);
+    }
+  }
+
+  operand.value = cast(T) value;
+}
+
+/**
+* Casts an operand as a float.
+*
+* @param T                The type of the operand value.
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+*/
+private proc operand_cast_float!(T)(operand: *Operand, destination_type: *Type) {
+  switch (destination_type.kind) {
+    case .I8:   operand.value = cast(i8)   operand.value.(T);
+    case .I16:  operand.value = cast(i16)  operand.value.(T);
+    case .I32:  operand.value = cast(i32)  operand.value.(T);
+    case .I64:  operand.value = cast(i64)  operand.value.(T);
+    case .Int:  operand.value = cast(int)  operand.value.(T);
+    case .U8:   operand.value = cast(u8)   operand.value.(T);
+    case .U16:  operand.value = cast(u16)  operand.value.(T);
+    case .U32:  operand.value = cast(u32)  operand.value.(T);
+    case .U64:  operand.value = cast(u64)  operand.value.(T);
+    case .UInt: operand.value = cast(uint) operand.value.(T);
+    case .F32:  operand.value = cast(f32)  operand.value.(T);
+    case .F64:  operand.value = cast(f64)  operand.value.(T);
+    case: assert(false);
+  }
+}
+
+/**
+* Casts an operand as an untyped float.
+*
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+*/
+private proc operand_cast_untyped_float(operand: *Operand, destination_type: *Type) {
+  switch (destination_type.kind) {
+    case .F32: operand.value = cast(f32) operand.value.(f64);
+    case .F64: operand.value = cast(f64) operand.value.(f64);
+    case: assert(false);
+  }
+}
+
+/**
+* Casts an operand as a char.
+*
+* @param operand          The operand to cast.
+* @param destination_type The destination type to cast into.
+*/
+private proc operand_cast_char(operand: *Operand, destination_type: *Type) {
+  switch (destination_type.kind) {
+    case .I8:   operand.value = cast(i8)   operand.value.(char);
+    case .I16:  operand.value = cast(i16)  operand.value.(char);
+    case .I32:  operand.value = cast(i32)  operand.value.(char);
+    case .I64:  operand.value = cast(i64)  operand.value.(char);
+    case .Int:  operand.value = cast(int)  operand.value.(char);
+    case .U8:   operand.value = cast(u8)   operand.value.(char);
+    case .U16:  operand.value = cast(u16)  operand.value.(char);
+    case .U32:  operand.value = cast(u32)  operand.value.(char);
+    case .U64:  operand.value = cast(u64)  operand.value.(char);
+    case .UInt: operand.value = cast(uint) operand.value.(char);
+    case .Char: operand.value = cast(char) operand.value.(char);
+    case: assert(false);
+  }
+}
+
+/**
+* Removes an untyped type from an operand.
+* 
+* @param storage  The reference to the type storage.
+* @param position The position of the removal.
+* @param operand  The operand to remove the untyped type of.
+*/
+internal proc operand_remove_untyped(position: Source_Position, operand: *Operand) {
+  storage := context.storage;
+  if (operand.type.is_untyped_boolean()) {
+    operand_cast_unchecked(position, operand, storage.type_bool);
+  } else if (operand.type.is_untyped_integer()) {
+    operand_cast_unchecked(position, operand, storage.type_int);
+  } else if (operand.type.is_untyped_float()) {
+    operand_cast_unchecked(position, operand, storage.type_f64);
+  } else if (operand.type.is_untyped_char()) {
+    operand_cast_unchecked(position, operand, storage.type_char);
+  } else if (operand.type.is_untyped_string()) {
+    operand_cast_unchecked(position, operand, storage.type_string);
+  }
+}
+
+/**
+* Decays an operand.
+* 
+* @param operand The operand to decay.
+* @return The decayed operand.
+*/
+internal proc operand_decay(operand: Operand) -> Operand {
+  result := operand;
+  remove_flag(&result.flags, .Is_LValue);
+  return result;
+}

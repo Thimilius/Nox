@@ -1,0 +1,223 @@
+import "std:strings"
+
+/**
+* Represents a directory iterator.
+*/
+public struct Directory_Iterator {
+  public is_valid: bool,           // Is the iterator still valid?
+  public is_error: bool,           // Had the iterator an error?
+
+  private handle: uint,            // The native handle to the directory that is iterated over.
+  public path_base: string,        // The base path of the director that is iterated over.
+
+  public entry_is_directory: bool, // Is the current entry a directory?
+  public entry_name: string,       // The name of the current entry.
+  public entry_size: uint,         // The size in bytes of the current entry.
+
+  private allocator: Allocator,    // The allocator to be used.
+}
+
+/**
+* Get all entries of a directory (non recursive).
+*
+* @path The path to the directory.
+* @return All entries inside the directory.
+*/
+public proc directory_get_all_entries(path: string) -> [dynamic]string {
+  result: [dynamic]string;
+
+  for (iterator := directory_iterator_make(path); iterator.is_valid; directory_iterator_next(&iterator)) {
+    clone := strings.clone(iterator.entry_name);
+    array_add(&result, clone);
+  }
+
+  return result;
+}
+
+/**
+* Checks whether or not the current entry of a directory iterator should be excluded.
+*
+* @return True if the directory should exclude the current entry otherwise false.
+*/
+private proc directory_iterator_should_exclude_name(iterator: *Directory_Iterator) -> bool {
+  return iterator.is_valid && (iterator.entry_name == "." || iterator.entry_name == "..");
+}
+
+#if (NOX_OS == .Windows) {
+
+  import "std:libc"
+  import "std:memory"
+  import "std:system"
+  import "std:system/windows"
+
+  /**
+  * Makes a new directory iterator.
+  *
+  * @param path      The path to the directory to iterate over.
+  * @param allocator The allocator to be used.
+  * @return The new directory iterator.
+  */
+  public proc directory_iterator_make(path: string, allocator: Allocator = context.allocator) -> Directory_Iterator {
+    iterator: Directory_Iterator;
+    iterator.path_base = path;
+    iterator.allocator = allocator;
+
+    file_spec := strings.concatenate({path, "*"}, allocator);
+    defer string_destroy(file_spec, allocator);
+    file_spec_wide := system.utf8_to_utf16(file_spec, allocator);
+    defer memory.free(file_spec_wide, allocator);
+
+    file_info: windows._wfinddata64_t;
+    handle := windows._wfindfirst64(file_spec_wide, &file_info);
+    iterator.handle = cast(uint) handle;
+
+    directory_iterator_update(&iterator, handle == -1, &file_info);
+    if (directory_iterator_should_exclude_name(&iterator)) {
+      directory_iterator_next(&iterator);
+    }
+
+    return iterator;
+  }
+
+  /**
+  * Moves a directory iterator to the next entry of the the directory.
+  * 
+  * @param iterator The iterator to move.
+  */
+  public proc directory_iterator_next(iterator: *Directory_Iterator) {
+    if (!iterator.is_valid) {
+      return;
+    }
+
+    file_info: windows._wfinddata64_t;
+    result := windows._wfindnext64(iterator.handle, &file_info);
+    directory_iterator_update(iterator, result != 0, &file_info);
+    if (result != 0) {
+      directory_iterator_destroy(iterator);
+      return;
+    }
+
+    for (directory_iterator_should_exclude_name(iterator)) {
+      file_info: windows._wfinddata64_t;
+      result := windows._wfindnext64(iterator.handle, &file_info);
+      directory_iterator_update(iterator, result != 0, &file_info);
+      if (result != 0) {
+        directory_iterator_destroy(iterator);
+        return;
+      } 
+    }
+  }
+
+  /**
+  * Destroys the resources of a directory iterator.
+  * 
+  * @param iterator The iterator to destroy.
+  */
+  public proc directory_iterator_destroy(iterator: *Directory_Iterator) {
+    if (iterator.is_valid) {
+      string_destroy(iterator.entry_name, iterator.allocator);
+      windows._findclose(iterator.handle);
+      iterator.is_valid = false;
+      iterator.is_error = false;
+    }
+  }
+
+  /**
+  * Updates the state of a directory iterator.
+  * 
+  * @param iterator  The iterator to update.
+  * @param done      Is the iterator done?
+  * @param file_info The file info of the new current entry.
+  */
+  private proc directory_iterator_update(iterator: *Directory_Iterator, done: bool, file_info: *windows._wfinddata64_t) {
+    iterator.is_valid = !done;
+    iterator.is_error = false; // TODO: Currently we have no way of accessing libc's errno.
+    string_destroy(iterator.entry_name, iterator.allocator);
+    if (!done) {
+      iterator.entry_size = cast(uint) file_info.size;
+      iterator.entry_name = system.utf16_to_utf8(data(file_info.name));
+      iterator.entry_is_directory = (file_info.attrib & windows._A_SUBDIR) == windows._A_SUBDIR;
+    }
+  }
+
+} else {
+
+  import "std:system/unix"
+
+  /**
+  * Makes a new directory iterator.
+  *
+  * @param path      The path to the directory to iterate over.
+  * @param allocator The allocator to be used.
+  * @return The new directory iterator.
+  */
+  public proc directory_iterator_make(path: string, allocator: Allocator = context.allocator) -> Directory_Iterator {
+    iterator: Directory_Iterator;
+    iterator.path_base = path;
+    iterator.allocator = allocator;
+
+    cpath := strings.clone_to_cstring(path, allocator);
+    defer cstring_destroy(cpath, allocator);
+
+    dir := unix.opendir(cpath);
+    if (dir == null) {
+      iterator.is_valid = false;
+      iterator.is_error = true;
+      return iterator;
+    }
+
+    iterator.handle = cast(uint) dir;
+    iterator.is_valid = true;
+
+    directory_iterator_next(&iterator);
+
+    return iterator;
+  }
+
+  /**
+  * Moves a directory iterator to the next entry of the the directory.
+  * 
+  * @param iterator The iterator to move.
+  */
+  public proc directory_iterator_next(iterator: *Directory_Iterator) {
+    if (!iterator.is_valid) {
+      return;
+    }
+
+    directory_iterator_update(iterator);
+    for (directory_iterator_should_exclude_name(iterator)) {
+      directory_iterator_update(iterator);
+    }
+  }
+
+  /**
+  * Destroys the resources of a directory iterator.
+  * 
+  * @param iterator The iterator to destroy.
+  */
+  public proc directory_iterator_destroy(iterator: *Directory_Iterator) {
+    string_destroy(iterator.entry_name, iterator.allocator);
+    if (iterator.is_valid) {
+      iterator.is_valid = false;
+      iterator.is_error = false;
+      unix.closedir(cast(unix.Dir) iterator.handle);
+    }
+  }
+
+  /**
+  * Updates the state of a directory iterator.
+  * 
+  * @param iterator  The iterator to update.
+  */
+  private proc directory_iterator_update(iterator: *Directory_Iterator) {
+    entry := unix.readdir(cast(unix.Dir) iterator.handle);
+    if (entry == null) {
+      directory_iterator_destroy(iterator);
+      return;
+    }
+    string_destroy(iterator.entry_name, iterator.allocator);
+    iterator.entry_name = strings.clone_from_cstring(cast(cstring) cast(*u8) &entry.name, iterator.allocator);
+    iterator.entry_is_directory = entry.type & unix.DT_DIR == unix.DT_DIR;
+  }
+
+}

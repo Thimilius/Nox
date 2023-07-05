@@ -1,0 +1,639 @@
+/**
+* The restriction of allowed statements in a routine.
+*/
+internal enum Statement_Restriction {
+  Allow_All,       // Allow all statements.
+  Allow_Only_Pure, // Allow only pure statements.
+}
+
+/**
+* The restriction of allowed expressions.
+*/
+internal enum Expression_Restriction {
+  Allow_All, // Allow all expressions.
+  Restrict,  // Restrict expressions
+}
+
+/**
+* Allow legal statements.
+*/
+@flags internal enum Legal_Statements {
+  Return,                                       // The return statement.
+  Break,                                        // The break statement.
+  Continue,                                     // The continue statement.
+  Fallthrough,                                  // The fallthrough statement.
+  Defer,                                        // The defer statement.
+  Initialize,                                   // The initialize statement.
+  
+  Can_Refer_To_Enum_Item,                       // Can an enum item be referred to?
+  Can_Call_Routine_With_Nox_Calling_Convention, // Can a routine with the 'nox' calling convention be called?
+}
+
+/**
+* Represents a statement context.
+*/
+internal struct Statement_Context {
+  statement_restriction: Statement_Restriction,   // The statement restriction.
+  expression_restriction: Expression_Restriction, // The expression restriction.
+  legal_statements: Legal_Statements,             // The allowed legal statements.
+}
+
+/**
+* The kind of a scope to create.
+*/
+internal enum Scope_Kind {
+  New_Scope,  // Creates a new scope.
+  Keep_Scope, // Keeps the current scope.
+}
+
+/**
+* Gets the default statement context.
+*
+* @return The default statement context.
+*/
+internal proc statement_context_default() -> Statement_Context {
+  result: Statement_Context;
+  result.statement_restriction = .Allow_All;
+  result.expression_restriction = .Restrict;
+  set_flag(&result.legal_statements, .Return);
+  set_flag(&result.legal_statements, .Defer);
+  set_flag(&result.legal_statements, .Initialize);
+  set_flag(&result.legal_statements, .Can_Call_Routine_With_Nox_Calling_Convention);
+  return result;
+}
+
+implement Resolver {
+
+  /**
+  * Resolves a statement.
+  *
+  * @param statement         The statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @return True if the statement returns otherwise false.
+  */
+  internal proc resolve_statement(statement: *Statement, statement_context: Statement_Context, return_type: *Type) -> bool {
+    switch (statement.kind) {
+      case .Return: self.resolve_statement_return(statement, statement_context, return_type); return true;
+      case .Break: self.resolve_statement_break(statement, statement_context); return false;
+      case .Continue: self.resolve_statement_continue(statement, statement_context); return false;
+      case .Fallthrough: self.resolve_statement_fallthrough(statement, statement_context); return false;
+      case .Defer: self.resolve_statement_defer(statement, statement_context, return_type); return false;
+      case .Push_Context: return self.resolve_statement_push_context(statement, statement_context, return_type);
+
+      case .Scope: return self.resolve_statement_block((cast(*Statement_Scope) statement).block, statement_context, return_type, .New_Scope);
+      case .If: return self.resolve_statement_if(statement, statement_context, return_type);
+      case .Static_If: return self.resolve_statement_static_if(statement, statement_context, return_type);
+      case .For: self.resolve_statement_for(statement, statement_context, return_type); return false;
+      case .Foreach: self.resolve_statement_foreach(statement, statement_context, return_type); return false;
+      case .Switch: return self.resolve_statement_switch(statement, statement_context, return_type);
+
+      case .Assign: self.resolve_statement_assign(statement, statement_context); return false;
+      case .Initialize: self.resolve_statement_initialize(statement, statement_context); return false;
+      case .Expression: self.resolve_statement_expression(statement, statement_context); return false;
+
+      case .None: fallthrough;
+      case: assert(false);
+    }
+
+    return false;
+  }
+
+  /** 
+  * Resolves a return statement.
+  *
+  * @param statement         The return statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  */
+  private proc resolve_statement_return(statement: *Statement, statement_context: Statement_Context, return_type: *Type) {
+    statement := cast(*Statement_Return) statement;
+
+    if (!has_flag(statement_context.legal_statements, .Return)) {
+      report_error_fatal(statement.position, "Illegal return statement");
+    }
+
+
+    return_expression := cast(*Expression) statement.expression;
+    if (return_expression != null) {
+      if (return_type.is_void()) {
+        report_error_fatal(statement.position, "Trying to return a value from routine which has no return type");
+      }
+
+      operand := self.resolve_expression_expected(return_expression, statement_context, return_type);
+      if (!self.operand_convert(return_expression.position, &operand, return_type)) {
+        report_error_fatal(statement.position, "Invalid type in return expression. Expected '%' got '%'", return_type.name, operand.type.name);
+      }
+      self.set_resolved_overwrite_type(return_expression, operand.type);
+    } else if (!return_type.is_void()) {
+      report_error_fatal(statement.position, "Empty return expression for routine with non-void return type");
+    }
+  }
+
+  /**
+  * Resolves a break statement.
+  *
+  * @param statement         The break statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_break(statement: *Statement, statement_context: Statement_Context) {
+    if (!has_flag(statement_context.legal_statements, .Return)) {
+      report_error_fatal(statement.position, "Illegal break statement");
+    }
+  }
+
+  /**
+  * Resolves a continue statement.
+  *
+  * @param statement         The continue statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_continue(statement: *Statement, statement_context: Statement_Context) {
+    if (!has_flag(statement_context.legal_statements, .Continue)) {
+      report_error_fatal(statement.position, "Illegal continue statement");
+    }
+  }
+
+  /**
+  * Resolves a fallthrough statement.
+  *
+  * @param statement         The fallthrough statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_fallthrough(statement: *Statement, statement_context: Statement_Context) {
+    if (!has_flag(statement_context.legal_statements, .Fallthrough)) {
+      report_error_fatal(statement.position, "Illegal fallthrough statement");
+    }
+  }
+
+  /**
+  * Resolves a defer statement.
+  *
+  * @param statement         The defer statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  */
+  private proc resolve_statement_defer(statement: *Statement, statement_context: Statement_Context, return_type: *Type) {
+    statement := cast(*Statement_Defer) statement;
+
+    if (!has_flag(statement_context.legal_statements, .Defer)) {
+      report_error_fatal(statement.position, "Illegal defer statement");
+    }
+
+    // We disallow every special statement inside a defer statement.
+    new_statement_context := statement_context;
+    new_statement_context.legal_statements = .Can_Call_Routine_With_Nox_Calling_Convention;
+
+    self.resolve_statement(cast(*Statement) statement.statement, new_statement_context, return_type);
+  }
+
+  /**
+  * Resolves a push context statement.
+  *
+  * @param statement         The push context statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @return True if the statement returns otherwise false.
+  */
+  private proc resolve_statement_push_context(statement: *Statement, statement_context: Statement_Context, return_type: *Type) -> bool {
+    statement := cast(*Statement_Push_Context) statement;
+
+    storage := context.storage;
+
+    operand := self.resolve_expression(cast(*Expression) statement.expression, statement_context);
+    context_type := storage.cached_runtime_types.context_struct;
+    if (operand.type != context_type) {
+      report_error_fatal(statement.expression.position, "Need type 'Context' in push_context statement. Got '%'", operand.type.name);
+    }
+
+    self.enter_local_scope();
+    context_pointer_type := storage.get_or_make_type_pointer(context_type);
+    self.add_local_symbol(statement.position, SPECIAL_NAME_CONTEXT, context_pointer_type);
+    new_statement_context := statement_context;
+    set_flag(&new_statement_context.legal_statements, .Can_Call_Routine_With_Nox_Calling_Convention);
+    returns := self.resolve_statement_block(statement.block, new_statement_context, return_type, .Keep_Scope);
+    self.leave_local_scope();
+    return returns;
+  }
+
+  /**
+  * Resolves a block statement.
+  *
+  * @param statement         The block statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @param scope_kind        The kind of the scope to create.
+  * @return True if the statement returns otherwise false.
+  */
+  internal proc resolve_statement_block(block: Statement_Block, statement_context: Statement_Context, return_type: *Type, scope_kind: Scope_Kind) -> bool {
+    if (scope_kind == .New_Scope) then self.enter_local_scope();
+
+    new_statement_context := statement_context;
+    set_flag(&new_statement_context.legal_statements, .Defer);
+    set_flag(&new_statement_context.legal_statements, .Initialize);
+
+    returns := false;
+    foreach (statement, i in block.statements) {
+      returns = self.resolve_statement(statement, statement_context, return_type) || returns;
+
+      // We try to detect dead code here, which occurs when there are:
+      //   1. Statements after 'return'
+      //   2. Statements after 'break'
+      //   3. Statements after 'continue'
+      //   4. Statements after 'fallthrough'
+      // This does not however detect dead code after fully returning blocks like a returning if/else block.
+      is_last_statement := i == length(block.statements) - 1;
+      if ((statement.kind == .Return && !is_last_statement) || (statement.kind == .Static_If && !is_last_statement && returns)) {
+        report_error_fatal(statement.position, "Statements after 'return' are never executed");
+      } else if (statement.kind == .Break && !is_last_statement) {
+        report_error_fatal(statement.position, "Statements after 'break' are never executed");
+      } else if (statement.kind == .Continue && !is_last_statement) {
+        report_error_fatal(statement.position, "Statements after 'continue' are never executed");
+      } else if (statement.kind == .Fallthrough && !is_last_statement) {
+        report_error_fatal(statement.position, "Statements after 'fallthrough' are never executed");
+      }
+    }
+
+    if (scope_kind == .New_Scope) then self.leave_local_scope();
+    return returns;
+  }
+
+  /**
+  * Resolves an if statement.
+  *
+  * @param statement         The if statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @return True if the statement returns otherwise false.
+  */
+  private proc resolve_statement_if(statement: *Statement, statement_context: Statement_Context, return_type: *Type) -> bool {
+    statement := cast(*Statement_If) statement;
+
+    returns := false;
+    self.resolve_expression_condition(cast(*Expression) statement.condition, statement_context);
+
+    returns = self.resolve_statement_block(statement.then_block, statement_context, return_type, .New_Scope);
+
+    foreach (else_if in statement.else_ifs) {
+      self.resolve_expression_condition(else_if.condition, statement_context);
+      returns = self.resolve_statement_block(else_if.block, statement_context, return_type, .New_Scope) && returns;
+    }
+
+    if (length(statement.else_block.statements) > 0) {
+      returns = self.resolve_statement_block(statement.else_block, statement_context, return_type, .New_Scope) && returns;
+    } else {
+      returns = false;
+    }
+
+    return returns;
+  }
+
+  /**
+  * Resolves a static if statement.
+  *
+  * @param statement         The static if statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @return True if the statement returns otherwise false.
+  */
+  private proc resolve_statement_static_if(statement: *Statement, statement_context: Statement_Context, return_type: *Type) -> bool {
+    statement := cast(*Statement_If) statement;
+
+    condition := self.resolve_directive_condition(cast(*Expression) statement.condition);
+    self.set_resolved_constant(cast(*Expression) statement.condition, condition);
+    if (condition.value.(bool)) {
+      return self.resolve_statement_block(statement.then_block, statement_context, return_type, .Keep_Scope);
+    } else {
+      foreach (else_if in statement.else_ifs) {
+        else_if_condition := self.resolve_directive_condition(else_if.condition);
+        self.set_resolved_constant(else_if.condition, else_if_condition);
+        if (else_if_condition.value.(bool)) {
+          return self.resolve_statement_block(else_if.block, statement_context, return_type, .Keep_Scope);
+        }
+      }
+
+      return self.resolve_statement_block(statement.else_block, statement_context, return_type, .Keep_Scope);
+    }
+  }
+
+  /**
+  * Resolves a for statement.
+  *
+  * @param statement         The for statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  */
+  private proc resolve_statement_for(statement: *Statement, statement_context: Statement_Context, return_type: *Type) {
+    statement := cast(*Statement_For) statement;
+
+    self.enter_local_scope();
+    {
+      if (statement.initializer != null) {
+        new_statement_context := statement_context;
+        new_statement_context.expression_restriction = .Allow_All;
+        self.resolve_statement(cast(*Statement) statement.initializer, new_statement_context, return_type);
+      }
+      if (statement.condition != null) {
+        self.resolve_expression_condition(cast(*Expression) statement.condition, statement_context);
+      }
+      if (statement.next != null) {
+        new_statement_context := statement_context;
+        new_statement_context.expression_restriction = .Allow_All;
+        self.resolve_statement(cast(*Statement) statement.next, new_statement_context, return_type);
+      }
+
+      new_statement_context := statement_context;
+      set_flag(&new_statement_context.legal_statements, .Break);
+      set_flag(&new_statement_context.legal_statements, .Continue);
+      self.resolve_statement_block(statement.block, new_statement_context, return_type, .Keep_Scope);
+    }
+    self.leave_local_scope();
+  }
+
+  /**
+  * Resolves a foreach statement.
+  *
+  * @param statement         The foreach statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  */
+  private proc resolve_statement_foreach(statement: *Statement, statement_context: Statement_Context, return_type: *Type) {
+    statement := cast(*Statement_Foreach) statement;
+
+    self.enter_local_scope();
+    {
+      collection_operand := self.resolve_expression_rvalue(cast(*Expression) statement.collection, statement_context);
+      collection_type := collection_operand.type;
+      self.complete_type(statement.position, collection_type);
+      if (collection_type.is_absolute_pointer() || collection_type.is_self_relative_pointer()) {
+        collection_type = collection_type.base;
+      }
+
+      is_map := collection_type.is_map();
+      if (!collection_type.is_array() && !collection_type.is_dynamic_array() && !collection_type.is_slice() && !is_map) {
+        report_error_fatal(statement.position, "Foreach only works on arrays, dynamic arrays, slices and maps. Got '%'", collection_type.name);
+      }
+
+      element_type := collection_type.base;
+      if (is_map) {
+        element_type = (cast(*Type_Map) collection_type).key;
+      } else if (collection_type.is_soa()) {
+        element_type = context.storage.get_or_make_type_soa_pointer(collection_type);
+      } else if (collection_type.is_aosoa()) {
+        element_type = context.storage.get_or_make_type_aosoa_pointer(collection_type);
+      }
+      self.complete_type(statement.position, element_type);
+
+      if (statement.element_name != SPECIAL_NAME_DISCARD) {
+        flags: Symbol_Flags;
+        set_flag(&flags, .Local_Declared);
+        set_flag(&flags, .Local_Immutable);
+        self.add_local_symbol(statement.position, statement.element_name, element_type, flags);
+      }
+      if (statement.index_name != "" && statement.index_name != SPECIAL_NAME_DISCARD) {
+        index_type := is_map ? (cast(*Type_Map) collection_type).value : context.storage.type_int;
+        flags: Symbol_Flags;
+        set_flag(&flags, .Local_Declared);
+        set_flag(&flags, .Local_Immutable);
+        self.add_local_symbol(statement.position, statement.index_name, index_type, flags);
+      }
+
+      new_statement_context := statement_context;
+      set_flag(&new_statement_context.legal_statements, .Break);
+      set_flag(&new_statement_context.legal_statements, .Continue);
+      self.resolve_statement_block(statement.block, new_statement_context, return_type, .Keep_Scope);
+    }
+    self.leave_local_scope();
+  }
+
+  /**
+  * Resolves a switch statement.
+  *
+  * @param statement         The switch statement to resolve.
+  * @param statement_context The statement context to use.
+  * @param return_type       The return type to expect.
+  * @return True if the statement returns otherwise false.
+  */
+  private proc resolve_statement_switch(statement: *Statement, statement_context: Statement_Context, return_type: *Type) -> bool {
+    statement := cast(*Statement_Switch) statement;
+
+    operand := self.resolve_expression_rvalue(cast(*Expression) statement.expression, statement_context);
+    operand_remove_untyped(statement.expression.position, &operand);
+    if (!operand.type.is_integer() && !operand.type.is_char() && !operand.type.is_enumeration()) {
+      report_error_fatal(statement.position, "Switch expression must have an integer, char or enumeration type. Got '%'", operand.type.name);
+    }
+
+    new_statement_context := statement_context;
+    set_flag(&new_statement_context.legal_statements, .Break);
+    set_flag(&new_statement_context.legal_statements, .Fallthrough);
+
+    // NOTE: We currently do not detect if we return when 'fallthrough' statements are present.
+    returns := true;
+    has_default_case := false;
+
+    switch_case_constants := map_make!(int, int)(context.temporary_allocator);
+    foreach (switch_case in statement.cases) {
+      if (length(switch_case.patterns) == 0) then has_default_case = true;
+      foreach (pattern in switch_case.patterns) {
+        case_operand := self.resolve_expression_constant_expected(pattern, statement_context, operand.type);
+
+        if (!self.operand_cast(pattern.position, &case_operand, context.storage.type_int)) {
+          report_error_fatal(pattern.position, "Invalid type in switch case expression. Expected: '%' got '%'", case_operand.type.name, operand.type.name);
+        }
+
+        case_value := case_operand.value.(int);
+        if (map_contains(&switch_case_constants, case_value)) {
+          report_error_fatal(pattern.position, "Duplicate case value '%'", case_value);
+        }
+
+        map_set(&switch_case_constants, case_value, case_value);
+      }
+
+      returns = self.resolve_statement_block(switch_case.block, new_statement_context, return_type, .New_Scope) && returns;
+    }
+
+    return returns && has_default_case;
+  }
+
+  /**
+  * Resolves a assignment statement.
+
+  * @param statement         The assignment statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_assign(statement: *Statement, statement_context: Statement_Context) {
+    statement := cast(*Statement_Assign) statement;
+
+    if (length(statement.left_expressions) == 1) {
+      self.resolve_statement_assign_simple(statement, statement_context);
+    } else {
+      self.resolve_statement_assign_tuple(statement, statement_context);
+    }
+  }
+
+  /**
+  * Resolves a simple assignment statement.
+  *
+  * @param statement         The simple assignment statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_assign_simple(statement: *Statement_Assign, statement_context: Statement_Context) {
+    expression_left := statement.left_expressions[0];
+    expression_right := cast(*Expression) statement.right_expression;
+
+    left := self.resolve_expression(expression_left, statement_context);
+    if (!has_flag(left.flags, .Is_LValue)) {
+      report_error_fatal(statement.position, "Cannot assign to non-lvalue");
+    }
+    if (has_flag(left.flags, .Is_Immutable)) {
+      report_error_fatal(statement.position, "Cannot assign to immutable");
+    }
+    if (has_flag(left.flags, .Is_Parameter)) {
+      report_error_fatal(statement.position, "Cannot assign to parameter");
+    }
+
+    result: Operand;
+    right := self.resolve_expression_expected_rvalue(expression_right, statement_context, left.type);
+    if (statement.operator == .Assign) {
+      result = right;
+    } else {
+      binary_operation := ASSIGN_TOKEN_TO_BINARY_TOKEN[statement.operator];
+      result = self.resolve_expression_binary_operation(expression_right.position, binary_operation, left, right, expression_left, expression_right);
+    }
+
+    if (!self.operand_convert(expression_right.position, &result, left.type)) {
+      report_error_fatal(statement.position, "Invalid type in assignment. Expected '%' got '%'", left.type.name, result.type.name); 
+    }
+
+    self.set_resolved_overwrite_type(expression_right, result.type);
+  }
+
+  /**
+  * Resolves a tuple assignment statement.
+  *
+  * @param statement         The tuple assignment statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_assign_tuple(statement: *Statement_Assign, statement_context: Statement_Context) {
+    if (statement.operator != .Assign) {
+      report_error_fatal(statement.position, "Multiple names can only be assigned with '='. Got '%'", lexer_get_token_kind_name(statement.operator));
+    }
+
+    expression_right := cast(*Expression) statement.right_expression;
+    right := self.resolve_expression_rvalue(expression_right, statement_context);
+    right_type := right.type;
+    if (!right_type.is_tuple()) {
+      report_error_fatal(statement.position, "Multiple names can only be assigned by a tuple type. Got '%'", right.type.name);
+    }
+
+    type_tuple := cast(*Type_Tuple) right_type;
+
+    if (length(type_tuple.elements) != length(statement.left_expressions)) {
+      report_error_fatal(statement.position, "Invalid number of names in tuple assign statement. Expected % got %", length(type_tuple.elements), length(statement.left_expressions));
+    }
+
+    foreach (element, i in type_tuple.elements) {
+      element_type := element.type;
+      left_expression := statement.left_expressions[i];
+
+      left := self.resolve_expression(left_expression, statement_context);
+      if (!has_flag(left.flags, .Is_LValue)) {
+        report_error_fatal(statement.position, "Cannot assign to non-lvalue");
+      }
+      if (has_flag(left.flags, .Is_Immutable)) {
+        report_error_fatal(statement.position, "Cannot assign to immutable");
+      }
+      if (has_flag(left.flags, .Is_Parameter)) {
+        report_error_fatal(statement.position, "Cannot assign to parameter");
+      }
+      if (left.type != element_type) {
+        report_error_fatal(statement.position, "Invalid type in %. tuple assignment. Expected '%' got '%' from tuple", i + 1, left.type.name, element_type.name);
+      }
+    }
+  }
+
+  /**
+  * Resolves an initialize statement.
+  *
+  * @param statement         The initialize statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_initialize(statement: *Statement, statement_context: Statement_Context) {
+    statement := cast(*Statement_Initialize) statement;
+
+    type := self.resolve_initializer(statement.position, statement_context, cast(*Type_Specification) statement.type, cast(*Expression) statement.expression);
+    if (length(statement.names) == 1) {
+      name := statement.names[0];
+      if (self.resolve_statement_initialize_check_naming(statement.position, name)) {
+        self.add_local_symbol(statement.position, name, type, .Local_Declared);
+      }
+    } else if (type.is_tuple()) {
+      type_tuple := cast(*Type_Tuple) type;
+
+      if (length(type_tuple.elements) != length(statement.names)) {
+        report_error_fatal(
+          statement.position,
+          "Invalid number of names in tuple initialize statement. Expected % got %",
+          length(type_tuple.elements),
+          length(statement.names)
+        );
+      }
+
+      foreach (element, i in type_tuple.elements) {
+        name := statement.names[i];
+        if (self.resolve_statement_initialize_check_naming(statement.position, name)) {
+          self.add_local_symbol(statement.position, name, element.type, .Local_Declared);
+        }
+      }
+    } else {
+      report_error_fatal(statement.position, "Multiple names can only be initialized with a tuple type. Got '%'", type.name);
+    }
+  }
+
+  /**
+  * Checks the naming of an initialize statement.
+  *
+  * @param position The position of the initialized variable.
+  * @param name     The name of the initialized variable.
+  * @return True if the variable should be created otherwise false.
+  */
+  private proc resolve_statement_initialize_check_naming(position: Source_Position, name: string) -> bool {
+    type_routine := cast(*Type_Routine) self.current_routine.type;
+
+    if (type_routine.has_context() && name == SPECIAL_NAME_CONTEXT) {
+      report_error_fatal(position, "Local variable named 'context' is not allowed in routine with calling convention 'Nox'");
+      return false;
+    }
+    if (has_flag(self.current_routine.flags, .Routine_Method_Implemented) && name == SPECIAL_NAME_SELF) {
+      report_error_fatal(position, "Local variable named 'self' is not allowed in method");
+      return false;
+    }
+    if (name == SPECIAL_NAME_DISCARD) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+  * Resolves an expression statement.
+  *
+  * @param statement         The expression statement to resolve.
+  * @param statement_context The statement context to use.
+  */
+  private proc resolve_statement_expression(statement: *Statement, statement_context: Statement_Context) {
+    statement := cast(*Statement_Expression) statement;
+    expression := cast(*Expression) statement.expression;
+
+    self.resolve_expression(expression, statement_context);
+
+    // We want to check for expressions which are unused.
+    if (statement_context.expression_restriction == .Restrict) {
+      is_unused_statement := expression.kind != .Call && expression.kind != .Modify;
+      if (is_unused_statement) {
+        report_error_fatal(expression.position, "Expression in statement is not being used");
+      }
+    }
+  }
+
+}

@@ -1,0 +1,81 @@
+/**
+* Test the functionality of structs.
+*/
+internal proc test_structs() {
+  test_structs_simple();
+  test_struct_pointers();
+  test_struct_composited();
+}
+
+private struct Bar {
+  u: u32,
+}
+
+private struct Foo {
+  i: i32,
+  f: f32,
+  b: Bar,
+}
+
+private proc test_structs_simple() {
+  a: Foo;
+  b: Foo;
+
+  assert(a.i == 0);
+  assert(a.f == 0.0);
+  assert(a.b.u == 0);
+
+  a.i = 13;
+  assert(a.i == 13);
+
+  a.b.u = 9;
+  assert(a.b.u == 9);
+
+  b = a;
+  assert(b.i == 13);
+
+  ret := test_structs_as_arguments_and_return_value(a);
+  assert(ret.b.u == 9);
+}
+
+private proc test_structs_as_arguments_and_return_value(a: Foo) -> Foo {
+  return a;
+}
+
+private proc test_struct_pointers() {
+  foo: Foo;
+  foo.i = 23;
+
+  pointer_to_foo := &foo;
+  assert(pointer_to_foo.i == 23);
+
+  p := &foo.b.u;
+  *p = 36;
+  assert(foo.b.u == 36);
+
+  double_pointer_to_foo := &pointer_to_foo;
+  i := (**double_pointer_to_foo).i;
+  assert(i == 23);
+
+  foo2: Foo;
+  foo2.i = 18;
+  **double_pointer_to_foo = foo2;
+  assert(foo.i == 18);
+}
+
+private proc test_struct_composited() {
+  foo_composited: Foo_Composited;
+
+  foo_composited.i = 123;
+  assert(foo_composited.foo.i == 123);
+  assert(foo_composited.foo.i == foo_composited.i);
+
+  foo_composited.u = 18;
+  assert(foo_composited.bar.u == 18);
+  assert(foo_composited.bar.u == foo_composited.u);
+}
+
+private struct Foo_Composited {
+  composite foo: Foo,
+  composite bar: Bar,
+}

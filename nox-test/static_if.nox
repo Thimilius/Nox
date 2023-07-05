@@ -1,0 +1,37 @@
+/**
+* Test the functionality of static ifs.
+*/
+internal proc test_static_ifs() {
+  test_static_if_declaration();
+  test_static_if_statement();
+}
+
+#if (false) {
+  private const CONSTANT := 13;
+} else {
+  private const CONSTANT := 7;
+}
+
+private const FALSE_CONSTANT := false;
+
+private proc test_static_if_declaration() {
+  assert(CONSTANT == 7);
+}
+
+private proc test_static_if_statement() {
+  assert(test_static_if_return() == 9);
+}
+
+private proc test_static_if_return() -> int {
+  #if (false) {
+    return 13;
+  } else #if (FALSE_CONSTANT) {
+    return 7;
+  } else {
+    #if (true) {
+      return 9;
+    } else {
+      return CONSTANT;
+    }
+  }
+}

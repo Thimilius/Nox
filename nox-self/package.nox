@@ -1,0 +1,661 @@
+import "std:io"
+import "std:memory"
+import "std:strings"
+import "std:system"
+import "std:thread"
+
+/**
+* Represents a Nox package.
+*/
+internal struct Package {
+  name: string,                    // The name of the package.
+
+  import_path: string,             // The relative path the package got imported from.
+  full_path: string,               // The absolute path to the package directory on disk.
+
+  files: map[string]*Package_File, // Contains all files inside the package.
+}
+
+/**
+* Represents a single source file inside a package.
+*/
+internal struct Package_File {
+  package: *Package,                          // The package the file belongs to.
+
+  thread_allocator: Allocator,                // The allocator of the parsing thread which is used to allocate the source string and the file itself.
+
+  path: string,                               // The absolute path to the file on disk.
+  source: string,                             // The raw source code (will be kept alive until the compiler finishes).
+
+  ast_pool: memory.Pool,                      // The memory pool used by the AST allocator.
+  ast_allocator: Allocator,                   // The allocator used for the AST.
+  
+  declarations: [dynamic]*Declaration,        // Contains all declarations inside a file (including all the imports).
+  import_declarations: [dynamic]*Declaration, // Contains the import declarations at top scope only.
+  
+  symbols: map[string]*Symbol,                // Contains all symbols that are defined by the file.
+  imported_symbols: map[string]*Symbol,       // Contains all symbols imported by the file (either as a '.Package' symbol or directly into scope).
+}
+
+/**
+* The size of a single block for the AST allocator.
+*/
+private const AST_POOL_BLOCK_SIZE: uint = 4 * 1024 * 1024; // 4 Mebibyte.
+
+/**
+* Defines differents modes for retrieving a symbol from a package.
+*/
+internal enum Symbol_Retrieval_Mode {
+  All,         // All symbols regardless of their access modifier.
+  Public_Only, // Only symbols with a 'public' access modifier.
+}
+
+/**
+* Destroy all resources associated with a provided package.
+* 
+* @param package The package to destroy.
+*/
+internal proc package_destroy(package: *Package) {
+  string_destroy(package.full_path);
+
+  foreach (_, file in package.files) {
+    string_destroy(file.path);
+
+    map_destroy(&file.symbols);
+    map_destroy(&file.imported_symbols);
+
+    memory.pool_destroy(&file.ast_pool);
+
+    // For the source and the file itself we have to use the dedicated thread allocator as both got allocated on a seperate thread.
+    thread_context := *context;
+    thread_context.allocator = file.thread_allocator;
+    push_context (thread_context) {
+      string_destroy(file.source);
+      memory.free(file);
+    }
+  }
+  map_destroy(&package.files);
+
+  memory.free(package);
+}
+
+/**
+* Initializes the parsing threads.
+*/
+internal proc package_initialize_parsing_threads() {
+  compiler := context.compiler;
+
+  thread.mutex_init(&compiler.file_lock);
+  thread.mutex_init(&compiler.package_lock);
+
+  // The number of threads we want is based on the processor core count.
+  // We subtract one, so the main thread gets taken into account.
+  processor_count := system.get_processor_count() - 1;
+  compiler.parsing_threads = array_make!(*thread.Thread)(processor_count, processor_count);
+  for (i := 0; i < processor_count; i++) {
+    compiler.parsing_threads[i] = thread.thread_create_and_start(package_parsing_thread_procedure, compiler);
+  }
+}
+
+/**
+* Shutdowns the parsing threads.
+*/
+internal proc package_shutdown_parsing_threads() {
+  compiler := context.compiler;
+
+  // Tell the parsing threads to terminate.
+  thread.mutex_lock(&compiler.file_lock);
+  compiler.parsing_threads_should_terminate = true;
+  thread.mutex_unlock(&compiler.file_lock);
+
+  // Wait for the threads to finish and destroy them.
+  foreach (t in compiler.parsing_threads) {
+    thread.thread_destroy(t);
+  }
+
+  array_destroy(&compiler.file_queue);
+  array_destroy(&compiler.parsing_threads);
+
+  thread.mutex_destroy(&compiler.file_lock);
+  thread.mutex_destroy(&compiler.package_lock);
+}
+
+/**
+* Imports a package at a provided path that can be relative.
+*
+* @param import_path The path to import the package from.
+* @return The imported package.
+*/
+internal proc package_import(import_path: string) -> *Package {
+  package, found := map_get(&context.compiler.packages, import_path);
+  if (!found) {
+    package = memory.new!(Package)();
+    package.name = package_extract_name_from_import_path(import_path);
+    package.import_path = import_path;
+
+    full_path, success := package_find_absolute_path(import_path);
+    if (!success) {
+      return null;
+    }
+    package.full_path = full_path;
+
+    map_set(&context.compiler.packages, import_path, package);
+
+    nox_log_verbose("Importing package '%' at path '%'", package.name, full_path);
+
+    package_parse(package);
+    package_compile(package);
+  }
+  return package;
+}
+
+/**
+* Imports a single file as a Nox package.
+*
+* @param file_path The path to import the file from.
+* @return The imported package.
+*/
+internal proc package_import_single_file(file_path: string) -> *Package {
+  package := memory.new!(Package)();
+  extracted_package_name := package_extract_name_from_import_path(file_path);
+  package.name = extracted_package_name[:length(extracted_package_name) - 4]; // We know we have an '.nox' ending.
+  package.import_path = file_path;
+
+  full_path := io.get_absolute_path(file_path);
+  package.full_path = full_path;
+
+  map_set(&context.compiler.packages, full_path, package);
+
+  nox_log_verbose("Importing file '%' at path '%'", package.name, full_path);
+
+  file_path := strings.clone(full_path);
+  package_parse_file(context.compiler, package, file_path);
+  package_compile(package);
+
+  return package;
+}
+
+/**
+* Parses all files of a provided package.
+*
+* @param package The package to parse.
+*/
+private proc package_parse(package: *Package) {
+  entries := io.directory_get_all_entries(package.full_path);
+  defer array_destroy(&entries);
+
+  files := array_make!(string)(0, DYNAMIC_ARRAY_DEFAULT_CAPACITY, context.temporary_allocator);
+
+  foreach (entry in entries) {
+    defer string_destroy(entry);
+    if (!io.has_extension(entry, ".nox")) {
+      continue;
+    }
+
+    relative_path := strings.concatenate({package.full_path, entry}, context.temporary_allocator);
+    absolute_path := io.get_absolute_path(relative_path);
+
+    array_add(&files, absolute_path);
+  }
+
+  compiler := context.compiler;
+
+  // Now we reset the queue with the new files that need to be parsed.
+  // That includes resetting the counter and index which track the finished state.
+  thread.mutex_lock(&compiler.file_lock);
+  {
+    compiler.finished_files_count = 0;
+    compiler.file_queue_index = 0;
+    array_clear(&compiler.file_queue);
+    foreach (file in files) {
+      array_add(&compiler.file_queue, {package, file});
+    }
+  }
+  thread.mutex_unlock(&compiler.file_lock);
+
+  // Here we wait for the parsing threads to finish.
+  files_count := length(files);
+  for {
+    thread.mutex_lock(&compiler.package_lock);
+    finished_files_count := compiler.finished_files_count;
+    thread.mutex_unlock(&compiler.package_lock);
+    if (finished_files_count == files_count) {
+      break;
+    }
+  }
+}
+
+/**
+* Defines the procedure for a single thread used for parsing files.
+* 
+* @param data The data being passed in.
+*/
+private proc package_parsing_thread_procedure(data: rawptr) {
+  compiler := cast(*Compiler) data;
+
+  for {
+    // Check if we have a file in the queue we need to parse.
+    thread.mutex_lock(&compiler.file_lock);
+    should_terminate := compiler.parsing_threads_should_terminate;
+    has_remaining_file := compiler.file_queue_index < length(compiler.file_queue);
+    if (has_remaining_file) {
+      queued_file := compiler.file_queue[compiler.file_queue_index];
+      compiler.file_queue_index += 1;
+      thread.mutex_unlock(&compiler.file_lock);
+
+      package_parse_file(compiler, queued_file.package, queued_file.file_path);
+    } else {
+      thread.mutex_unlock(&compiler.file_lock);
+      if (should_terminate) {
+        break;
+      }
+    }
+  }
+}
+
+/**
+* Parses a single package file.
+*
+* @param compiler The reference to the compiler.
+* @param pack     The package to compile.
+* @param path     The path of the file to parse.
+*/
+private proc package_parse_file(compiler: *Compiler, package: *Package, path: string) {
+  source, success := io.read_file(path);
+  if (!success) {
+    report_error_fatal_simple("Failed to read source file at path: %", path);
+  }
+
+  package_file := memory.new!(Package_File)();
+  package_file.package = package;
+  package_file.thread_allocator = context.allocator;
+  package_file.path = path;
+  package_file.source = source;
+
+  memory.pool_init(&package_file.ast_pool, context.allocator, AST_POOL_BLOCK_SIZE);
+  package_file.ast_allocator = memory.pool_allocator(&package_file.ast_pool);
+
+  lexer := lexer_make(path, source);
+  parser := parser_make(&lexer, package_file.ast_allocator);
+
+  parser.parse_declarations();
+  package_file.declarations = parser.declarations;
+  package_file.import_declarations = parser.import_declarations;
+
+  thread.mutex_lock(&compiler.package_lock);
+  compiler.profiler.processed_lines += cast(uint) lexer.token.position.line;
+  map_set(&package.files, path, package_file);
+  compiler.finished_files_count += 1;
+  thread.mutex_unlock(&compiler.package_lock);
+}
+
+/**
+* Compiles a provided package which includes parsing and symbol creation.
+*
+* @param package The package to compile.
+*/
+private proc package_compile(package: *Package) {
+  compiler := context.compiler;
+  resolver := context.resolver;
+
+  previous_package := package_enter(package);
+  has_compiled_runtime := compiler.runtime_package != null;
+  if (has_compiled_runtime) {
+    // The symbols of the 'runtime' package (and all builtin types) get directly imported into the scope of every other package file that gets compiled.
+    // We do this before adding the declarations of the actual package being compiled.
+    // That way redeclarations get non-consufing error messages.
+    foreach (_, file in package.files) {
+      resolver.import_package_symbols(file, SOURCE_POSITION_BUILTIN, compiler.runtime_package);
+    }
+  } else {
+    compiler.runtime_package = package;
+  }
+
+  resolver.add_package_declarations(package);
+
+  if (!has_compiled_runtime) {
+    package_file := package_get_first_package_file(package);
+    resolver.import_builtin_types(package_file);
+    resolver.cache_runtime_package_types(package);
+    resolver.setup_compiler_constants(package_file);
+  }
+
+  // Process all imports in the top scope.
+  package_process_imports(package);
+
+  // Now resolve all directives to get all potentionally additional declarations and imports.
+  resolver.resolve_package_directives(package);
+
+  package_leave(previous_package);
+}
+
+/**
+* Processes all import declarations of a package.
+*
+* @param package The package to process all imports for.
+*/
+private proc package_process_imports(package: *Package) {
+  foreach (_, file in package.files) {
+    foreach (declaration in file.import_declarations) {
+      package_process_import(file, declaration);
+    }
+  }
+}
+
+/**
+* Processes all import declarations of a package file.
+*
+* @param file        The package file to process all imports for.
+* @param declaration The associated import declaration.
+*/
+public proc package_process_import(file: *Package_File, declaration: *Declaration) {
+  declaration_import := cast(*Declaration_Import) declaration;
+  import_path := declaration.name;
+  // TODO: Trim import_path.
+  path_is_empty := length(import_path) == 0;
+
+  if (has_flag(declaration_import.flags, .Extern)) {
+    if (path_is_empty) {
+      report_error_fatal(declaration.position, "Missing library name in extern import");
+    }
+
+    is_relative := strings.first_index_of(import_path, "/") != -1;
+    absolute_import_path: string;
+    if (is_relative) {
+      relative_import_path := strings.concatenate({file.package.full_path, import_path}, context.temporary_allocator);
+      absolute_import_path = io.get_absolute_path(relative_import_path);
+    } else {
+      absolute_import_path = strings.clone(import_path);
+    }
+    array_add(&context.compiler.libraries_to_link, absolute_import_path);
+    return;
+  }
+
+  if (path_is_empty) {
+    report_error_fatal(declaration.position, "Missing package name in import");
+  }
+
+  package_name := package_extract_name_from_import_path(import_path);
+  imported_package := package_import(import_path);
+  if (imported_package == null) {
+    report_error_fatal(declaration.position, "Failed to import package '%'", import_path);
+  }
+
+  resolver := context.resolver;
+
+  if (declaration_import.import_in_scope) {
+    resolver.import_package_symbols(file, declaration.position, imported_package);
+  }
+
+  // Currently we still add a package symbol which may be used to refer to symbols even when they are imported in scope.
+  package_symbol_name := declaration_import.alias == "" ? package_name : declaration_import.alias;
+  resolver.add_package_symbol(imported_package, file, package_symbol_name, declaration);
+}
+
+/**
+* Enters a new package to be set as the currently active package.
+*
+* @param package The package to enter.
+* @return The previously active package.
+*/
+internal proc package_enter(package: *Package) -> *Package {
+  compiler := context.compiler;
+  previous_package := compiler.current_package;
+  compiler.current_package = package;
+  return previous_package;
+}
+
+/**
+* Leaves the currently active package.
+*
+* @param previous_package The previously active package.
+*/
+internal proc package_leave(previous_package: *Package) {
+  compiler := context.compiler;
+  compiler.current_package = previous_package;
+}
+
+/**
+* Gets a symbol by name from a package based on the provided retrieval mode, reports an error when not found and performs an access check.
+*
+* @param package        The package to retrieve the symbol from.
+* @param position       The source position where the symbol to be retrieved is referenced.
+* @param name           The name of the symbol to get.
+* @param retrieval_mode The symbol retrieval mode.
+* @return The retrieved symbol.
+*/
+internal proc package_get_symbol(package: *Package, position: Source_Position, name: string, retrieval_mode: Symbol_Retrieval_Mode) -> *Symbol {
+  symbol := package_get_symbol_without_validation(package, null, position, name, retrieval_mode);
+
+  declaration := symbol.declaration;
+  if (declaration != null) {
+    access_modifier := declaration.access_modifier;
+    if (access_modifier == .Internal) {
+      if (symbol.package_file.package != context.compiler.current_package) {
+        report_error_fatal(position, "Trying to access internal declaration '%' defined in package '%'", symbol.name, symbol.package_file.package.name);
+      }
+    } else if (access_modifier == .Private) {
+      if (declaration.position.file != position.file) {
+        report_error_fatal(position, "Trying to access private declaration '%' defined in file '%'", symbol.name, declaration.position.file);
+      }
+    }
+  }
+
+  return symbol;
+}
+
+/**
+* Gets a symbol by name from a package based on the provided retrieval mode and reports an error when not found.
+*
+* @param package        The package to retrieve the symbol from.
+* @param file           A package file to look into first (Can be nil).
+* @param position       The source position where the symbol to be retrieved is referenced.
+* @param name           The name of the symbol to get.
+* @param retrieval_mode The symbol retrieval mode.
+* @return The retrieved symbol.
+*/
+internal proc package_get_symbol_without_validation(
+  package: *Package,
+  file: *Package_File,
+  position: Source_Position,
+  name: string,
+  retrieval_mode: Symbol_Retrieval_Mode
+) -> *Symbol {
+  file := file;
+  if (file == null) {
+    file = package_get_package_file_by_name(package, position.file);
+  }
+
+  symbol: *Symbol;
+  if (file == null) {
+    symbol = package_get_symbol_defined_anywhere_in_package(package, name, retrieval_mode);
+  } else {
+    symbol = package_get_symbol_defined_in_package(package, file, name, retrieval_mode);
+  }
+  if (symbol != null) {
+    return symbol;
+  }
+
+  // Now check for an imported symbol in the current package file.
+  if (file != null) {
+    symbol, found := map_get(&file.imported_symbols, name);
+    if (found) {
+      return symbol;
+    }
+  }
+
+  if (package != context.compiler.current_package) {
+    report_error_fatal(position, "Package '%' does not declare symbol '%'", package.name, name);
+  } else {
+    report_error_fatal(position, "Undeclared symbol '%'", name);
+  }
+  return null;
+}
+
+/**
+* Gets a defined symbol by name from a package based on the provided retrieval mode.
+*
+* @param package        The package to retrieve the symbol from.
+* @param file           A package file to look into first.
+* @param name           The name of the symbol to get.
+* @param retrieval_mode The symbol retrieval mode.
+* @return The retrieved symbol (or nil if not found).
+*/
+internal proc package_get_symbol_defined_in_package(package: *Package, package_file: *Package_File, name: string, retrieval_mode: Symbol_Retrieval_Mode) -> *Symbol {
+  symbol, found_in_file := map_get(&package_file.symbols, name);
+  if (found_in_file) {
+    if (retrieval_mode == .Public_Only) {
+      if (symbol.access_modifier == .Public) {
+        return symbol;
+      }
+    } else {
+      return symbol;
+    }
+  }
+
+  foreach (_, file in package.files) {
+    if (file == package_file) then continue;
+
+    symbol, found_in_another_file := map_get(&file.symbols, name);
+    if (found_in_another_file) {
+      if (retrieval_mode == .Public_Only) {
+        if (symbol.access_modifier == .Public) {
+          return symbol;
+        }
+      } else {
+        return symbol;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+* Gets a defined symbol by name from a package based on the provided retrieval mode.
+*
+* @param package        The package to retrieve the symbol from.
+* @param name           The name of the symbol to get.
+* @param retrieval_mode The symbol retrieval mode.
+* @return The retrieved symbol (or nil if not found).
+*/
+internal proc package_get_symbol_defined_anywhere_in_package(package: *Package, name: string, retrieval_mode: Symbol_Retrieval_Mode) -> *Symbol {
+  foreach (_, file in package.files) {
+    symbol, found := map_get(&file.symbols, name);
+    if (found) {
+      if (retrieval_mode == .Public_Only) {
+        if (symbol.access_modifier == .Public) {
+          return symbol;
+        }
+      } else {
+        return symbol;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+* Gets a symbol by name from a package based on the provided retrieval mode.
+*
+* @param package        The package to retrieve the symbol from.
+* @param file           A package file to look into first.
+* @param name           The name of the symbol to get.
+* @param retrieval_mode The symbol retrieval mode.
+* @return The retrieved symbol (or nil if not found).
+*/
+internal proc package_get_symbol_without_checks(package: *Package, file: *Package_File, name: string, retrieval_mode: Symbol_Retrieval_Mode) -> *Symbol {
+  symbol := package_get_symbol_defined_in_package(package, file, name, retrieval_mode);
+  if (symbol == null) {
+    imported_symbol, _ := map_get(&file.imported_symbols, name);
+    return imported_symbol;
+  } else {
+    return symbol;
+  }
+}
+
+/**
+* Gets a file inside a package by name.
+*
+* @param package   The package to get the file from.
+* @param file_name The file name of the package file to retrive.
+* @return The retrieved package file.
+*/
+internal proc package_get_package_file_by_name(package: *Package, file_name: string) -> *Package_File {
+  file, _ := map_get(&package.files, file_name);
+  return file;
+}
+
+/**
+* Gets the first file inside a package (not sorted).
+*
+* @param package The package to get the first file from.
+* @return The first file (or nil if no files are inside the package).
+*/
+internal proc package_get_first_package_file(package: *Package) -> *Package_File {
+  foreach (_, file in package.files) {
+    return file;
+  }
+  return null;
+}
+
+/**
+* Trys to find the absolute path of a relative package path.
+*
+* @param import_path The relative package path.
+* @return 1. The absolute package path; 2. True if successful otherwise false.
+*/
+internal proc package_find_absolute_path(import_path: string) -> (string, bool) {
+  // We extract the package source and package path.
+  seperator_index := strings.first_index_of(import_path, ":");
+  package_source := seperator_index >= 0 ? import_path[:seperator_index] : "";
+  package_path := seperator_index >= 0 ? import_path[seperator_index + 1:] : import_path;
+
+  package_search_path, search_path_found := map_get(&context.compiler.package_search_paths, package_source);
+  if (!search_path_found) {
+    return {"", false};
+  }
+
+  directory_path := strings.concatenate({package_search_path, package_path, system.PATH_SEPERATOR});
+  if (package_is_directory_suitable(directory_path)) {
+    return {directory_path, true};
+  }
+
+  return {"", false};
+}
+
+/**
+* Extracts the package name of a relative import path.
+*
+* @param The import path to extract the name from.
+* @return The extracted package name.
+*/
+private proc package_extract_name_from_import_path(import_path: string) -> string {
+  // First we strip of the potential package source.
+  seperator_index := strings.first_index_of(import_path, ":");
+  package_name := seperator_index >= 0 ? import_path[seperator_index + 1:] : import_path;
+
+  // Now we strip of any relative directories.
+  last_slash_index := strings.last_index_of(package_name, "/");
+  if (last_slash_index < 0) {
+    return package_name;
+  }
+  return package_name[last_slash_index + 1:];
+}
+
+/**
+* Checks whether or not a provided directory is a suitable Nox package (Contains .nox source files).
+*
+* @param directory_path The path to the directory.
+* @return True if suitable otherwise false.
+*/
+private proc package_is_directory_suitable(directory_path: string) -> bool {
+  for (iterator := io.directory_iterator_make(directory_path); iterator.is_valid; io.directory_iterator_next(&iterator)) {
+    if (io.has_extension(iterator.entry_name, ".nox")) {
+      io.directory_iterator_destroy(&iterator);
+      return true;
+    }
+  }
+
+  return false;
+}

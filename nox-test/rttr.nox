@@ -1,0 +1,24 @@
+/**
+* Test the functionality of runtime type information.
+*/
+public proc test_rttr() {
+  int_info := type_info_of(:int);
+  assert(int_info.kind == .Integer);
+  assert(int_info.size == 8);
+  assert(int_info.variant.(Type_Info_Integer).is_signed);
+
+  struct_info := type_info_of(:RTTR_Struct);
+  assert(struct_info.kind == .Struct);
+  assert(struct_info.size == 24);
+  struct_variant := struct_info.variant.(Type_Info_Struct);
+  assert(length(struct_variant.types) == 2);
+  assert(struct_variant.types[0].kind == .Integer);
+  assert(struct_variant.names[0] == "i");
+  assert(struct_variant.types[1].kind == .String);
+  assert(struct_variant.names[1] == "s");
+}
+
+struct RTTR_Struct {
+  i: int,
+  s: string,
+}

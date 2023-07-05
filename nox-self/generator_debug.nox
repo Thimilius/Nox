@@ -1,0 +1,873 @@
+import "std:libc"
+import "std:memory"
+import "std:strings"
+import "std:system"
+
+/**
+* Holds the debug data for the generator.
+*/
+internal struct Generator_Debug {
+  build_debug: bool,                                          // Should debug information be generated?
+
+  builder: LLVMDIBuilderRef,                                  // The LLVM debug builder.
+  
+  metadata_files: map[rawptr]LLVMMetadataRef,                 // The mapping of files to their metadata.
+  compile_unit: LLVMMetadataRef,                              // The compile unit the debug info lives in.
+
+  debug_types: map[*Type]LLVMMetadataRef,                     // The mapping of types to their debug representation.
+  incomplete_types: [dynamic]Generator_Debug_Incomplete_Type, // The incomplete types that need to be completed in a later step.
+}
+
+/**
+* Represents an incomplete debug type.
+*/
+internal struct Generator_Debug_Incomplete_Type {
+  incomplete_type: *Type,                // The incomplete type.
+  llvm_incomplete_type: LLVMMetadataRef, // The LLVM incomplete debug type.
+}
+
+/**
+* Holds the debug info for a local scope.
+*/
+internal struct Routine_Debug_Local_Scope {
+  scope: LLVMMetadataRef, // The debug scope of the local scope.
+}
+
+/**
+* Holds the debug info for a routine.
+*/
+internal struct Routine_Context_Debug {
+  scope: LLVMMetadataRef, // The debug scope of the routine.
+}
+
+/**
+* Destroy the debug data.
+* 
+* @param generator The reference to the generator.
+*/
+internal proc generator_debug_destroy(generator: *Generator) {
+  if (!generator.debug.build_debug) then return;
+
+  map_destroy(&generator.debug.metadata_files);
+  map_destroy(&generator.debug.debug_types);
+  array_destroy(&generator.debug.incomplete_types);
+}
+
+implement Generator {
+
+  /**
+  * Initializes the debug information.
+  *
+  * @param arguments The used generation arguments.
+  */
+  internal proc debug_init(arguments: Generation_Arguments) {
+    self.debug.build_debug = arguments.compilation_arguments.build_debug;
+    if (!self.debug.build_debug) then return;
+
+    self.debug.builder = LLVMCreateDIBuilder(self.module);
+
+    DEBUG_METADATA_VERSION: u64 = 3;
+    debug_metadata := LLVMValueAsMetadata(LLVMConstInt(LLVMInt32Type(), DEBUG_METADATA_VERSION, true));
+    LLVMAddModuleFlag(self.module, .Warning, "Debug Info Version", 18, debug_metadata);
+
+    #if (NOX_OS == .Windows) {
+      code_view_metadata := LLVMValueAsMetadata(LLVMConstInt(LLVMInt32Type(), 1, true));
+      LLVMAddModuleFlag(self.module, .Warning, "CodeView", 8, code_view_metadata);
+    }
+
+    foreach (_, package in context.compiler.packages) {
+      foreach (_, package_file in package.files) {
+        filename := self.debug_get_filename_from_path(package_file.path);
+        directory := self.debug_get_directory_from_path(package_file.path);
+
+        debug_file := LLVMDIBuilderCreateFile(
+          self.debug.builder,
+          cast(cstring) data(filename),
+          cast(u64) length(filename),
+          cast(cstring) data(directory),
+          cast(u64) length(directory),
+        );
+
+        map_set(&self.debug.metadata_files, package_file, debug_file);
+      }
+    }
+
+    main_file, _ := map_get(&self.debug.metadata_files, arguments.main_symbol.package_file);
+    producer := "nox";
+    is_optimized := arguments.compilation_arguments.optimization_level > 0;
+    
+    self.debug.compile_unit = LLVMDIBuilderCreateCompileUnit(
+      self.debug.builder,
+      .C99,
+      main_file,
+      cast(cstring) data(producer),
+      cast(u64) length(producer),
+      cast(LLVMBool) is_optimized,
+      "",
+      0,
+      1,
+      "",
+      0,
+      .Full,
+      0,
+      false,
+      false,
+      "",
+      0,
+      "",
+      0,
+    );
+  }
+
+  /**
+  * Initializes the debug information for a routine.
+  *
+  * @param routine_context The context of the rouinte.
+  */
+  internal proc debug_init_routine(routine_context: *Routine_Context) {
+    if (!self.debug.build_debug) then return;
+
+    name := routine_context.symbol.name;
+    line := routine_context.symbol.declaration.position.line;
+    file, _ := map_get(&self.debug.metadata_files, routine_context.symbol.package_file);
+    type := self.debug_get_type_routine(routine_context.symbol);
+    flags := LLVMDIFlags.StaticMember;
+    scope := file;
+
+    debug_info := LLVMDIBuilderCreateFunction(
+      self.debug.builder,
+      scope,
+      cast(cstring) data(name),
+      cast(u64) length(name),
+      cast(cstring) data(name),
+      cast(u64) length(name),
+      file,
+      cast(u32) line,
+      type,
+      false,
+      true,
+      cast(u32) line,
+      flags,
+      false,
+    );
+    routine_context.debug.scope = debug_info;
+    LLVMSetSubprogram(routine_context.llvm_symbol, debug_info);
+
+    map_set(&self.debug.metadata_files, cast(rawptr) debug_info, file);
+  }
+
+  /**
+  * Enters a local debug scope.
+  *
+  * @param routine_context The context of the rouinte.
+  * @param parent          The parent of the local scope to enter.
+  * @param position        The position of the local scope to enter.
+  */
+  internal proc debug_enter_local_scope(routine_context: *Routine_Context, parent: *Routine_Local_Scope, position: Source_Position) {
+    if (!self.debug.build_debug) then return;
+
+    parent_scope: LLVMMetadataRef;
+    if (parent == null) {
+      parent_scope = routine_context.debug.scope;
+    } else {
+      parent_scope = parent.debug.scope;
+    }
+    assert(parent_scope != null);
+
+    file := LLVMDIScopeGetFile(parent_scope);
+    routine_context.local_scope.debug.scope = LLVMDIBuilderCreateLexicalBlock(
+      self.debug.builder,
+      parent_scope,
+      file,
+      cast(u32) position.line,
+      cast(u32) position.column,
+    );
+  }
+
+  /**
+  * Emit debug info for a parameter.
+  *
+  * @param routine_context  The context of the rouinte.
+  * @param position         The position of the parameter.
+  * @param type             The type of the parameter.
+  * @param name             The name of the parameter.
+  * @param storage          The LLVM pointer where the parameter is stored.
+  * @param parameter_number The number of the parameter.
+  */
+  internal proc debug_emit_parameter(
+    routine_context: *Routine_Context,
+    position: Source_Position,
+    type: *Type,
+    name: string,
+    storage: LLVMValueRef,
+    parameter_number: u32,
+  ) {
+    if (!self.debug.build_debug) then return;
+    if (name == SPECIAL_NAME_DISCARD) then return;
+
+    scope := routine_context.debug.scope;
+    file, _ := map_get(&self.debug.metadata_files, cast(rawptr) scope);
+    assert(file != null);
+    always_preserve: LLVMBool = cast(LLVMBool) (context.compiler.arguments.optimization_level == 0);
+
+    llvm_parameter := LLVMDIBuilderCreateParameterVariable(
+      self.debug.builder,
+      scope,
+      to_cstring(name),
+      cast(u64) length(name),
+      parameter_number,
+      file,
+      cast(u32) position.line,
+      self.debug_get_type(type),
+      always_preserve,
+      .Zero,
+    );
+
+    location := self.debug_get_location(routine_context, position);
+    llvm_expression := LLVMDIBuilderCreateExpression(self.debug.builder, null, 0);
+    block := routine_context.declaration_block;
+
+    LLVMDIBuilderInsertDbgValueAtEnd(self.debug.builder, storage, llvm_parameter, llvm_expression, location, block);
+  }
+
+  /**
+  * Emit debug info for a local variable.
+  *
+  * @param routine_context  The context of the rouinte.
+  * @param position         The position of the local variable.
+  * @param type             The type of the local variable.
+  * @param name             The name of the local variable.
+  * @param storage          The LLVM pointer where the local variable is stored.
+  */
+  internal proc debug_emit_local_variable(routine_context: *Routine_Context, position: Source_Position, type: *Type, name: string, storage: LLVMValueRef) {
+    if (!self.debug.build_debug) then return;
+    if (name == SPECIAL_NAME_DISCARD) then return;
+
+    assert(routine_context.current_block != routine_context.declaration_block);
+
+    scope := self.debug_get_current_scope(routine_context);
+    file, _ := map_get(&self.debug.metadata_files, cast(rawptr) routine_context.debug.scope);
+    assert(file != null);
+
+    flags := LLVMDIFlags.Zero;
+    always_preserve: LLVMBool = cast(LLVMBool) (context.compiler.arguments.optimization_level == 0);
+    debug_type := self.debug_get_type(type);
+    alignment_in_bits: u32 = 8 * cast(u32) type.get_alignment();
+
+    variable_info := LLVMDIBuilderCreateAutoVariable(
+      self.debug.builder,
+      scope,
+      to_cstring(name),
+      cast(u64) length(name),
+      file,
+      cast(u32) position.line,
+      debug_type,
+      always_preserve,
+      flags,
+      alignment_in_bits,
+    );
+    
+    llvm_expression := LLVMDIBuilderCreateExpression(self.debug.builder, null, 0);
+    location := self.debug_get_location(routine_context, position);
+    block := routine_context.current_block;
+    LLVMDIBuilderInsertDeclareAtEnd(self.debug.builder, storage, variable_info, llvm_expression, location, block);
+  }
+
+  /**
+  * Emit debug location info for the current position.
+  *
+  * @param routine_context  The context of the rouinte.
+  * @param position         The current position.
+  */
+  internal proc debug_emit_location(routine_context: *Routine_Context, position: Source_Position) {
+    if (!self.debug.build_debug) then return;
+    location := self.debug_get_location(routine_context, position); 
+    LLVMSetCurrentDebugLocation2(self.builder, location);
+  }
+
+  /**
+  * Emit no debug location.
+  */
+  internal proc debug_emit_no_location() {
+    if (!self.debug.build_debug) then return;
+    LLVMSetCurrentDebugLocation2(self.builder, null);
+  }
+
+  /**
+  * Get the debug representation for a given type.
+  *
+  * @param type      The type to get the debug representation of.
+  * @return The debug representation corresponding to the type.
+  */
+  private proc debug_get_type(type: *Type) -> LLVMMetadataRef {
+    debug_type, found := map_get(&self.debug.debug_types, type);
+    if (found) {
+      return debug_type;
+    }
+    
+    size_in_bits := 8 * cast(u64) type.get_size();
+    align_in_bits := 8 * cast(u32) type.get_alignment();
+    word_size_in_bits: u64 = 64; // NOTE: This is hardcoded for 64-bit architectures which is the only one we support right now.
+
+    switch (type.kind) {
+      case .B8: debug_type = self.debug_create_type_basic("b8", size_in_bits, .Boolean);
+      case .B16: debug_type = self.debug_create_type_basic("b16", size_in_bits, .Boolean);
+      case .B32: debug_type = self.debug_create_type_basic("b32", size_in_bits, .Boolean);
+      case .B64: debug_type = self.debug_create_type_basic("b64", size_in_bits, .Boolean);
+      case .Bool: debug_type = self.debug_create_type_basic("bool", size_in_bits, .Boolean);
+
+      case .I8: debug_type = self.debug_create_type_basic("i8", size_in_bits, .Signed);
+      case .I16: debug_type = self.debug_create_type_basic("i16", size_in_bits, .Signed);
+      case .I32: debug_type = self.debug_create_type_basic("i32", size_in_bits, .Signed);
+      case .I64: debug_type = self.debug_create_type_basic("i64", size_in_bits, .Signed);
+      case .Int: debug_type = self.debug_create_type_basic("int", size_in_bits, .Signed);
+      
+      case .U8: debug_type = self.debug_create_type_basic("u8", size_in_bits, .Unsigned);
+      case .U16: debug_type = self.debug_create_type_basic("u16", size_in_bits, .Unsigned);
+      case .U32: debug_type = self.debug_create_type_basic("u32", size_in_bits, .Unsigned);
+      case .U64: debug_type = self.debug_create_type_basic("u64", size_in_bits, .Unsigned);
+      case .UInt: debug_type = self.debug_create_type_basic("uint", size_in_bits, .Unsigned);
+      
+      case .F32: debug_type =  self.debug_create_type_basic("f32", size_in_bits, .Float);
+      case .F64: debug_type =  self.debug_create_type_basic("f64", size_in_bits, .Float);
+      
+      case .Char: debug_type =  self.debug_create_type_basic("char", size_in_bits, .Utf);
+      
+      case .Enumeration: {
+        debug_type = self.debug_create_type_enumeration(type, size_in_bits, align_in_bits);
+      }
+      
+      case .String: {
+        scope := self.debug_get_runtime_package_scope();
+
+        elements: []LLVMMetadataRef = {
+          self.debug_create_member(scope, "data", context.storage.get_or_make_type_pointer(context.storage.type_u8), 0),
+          self.debug_create_member(scope, "length", context.storage.type_int, word_size_in_bits),
+        };
+        debug_type = self.debug_create_type_struct(scope, null, "string", size_in_bits, cast(u32) size_in_bits, elements);
+      }
+      case .CString: {
+        char_type := self.debug_create_type_basic("char", 8, .UnsignedChar);
+        debug_type = LLVMDIBuilderCreatePointerType(self.debug.builder, char_type, size_in_bits, cast(u32) size_in_bits, 0, "cstring", 7);
+      }
+      
+      case .Function, .Procedure, .Rawptr: {
+        debug_type = LLVMDIBuilderCreatePointerType(
+          self.debug.builder,
+          null,
+          size_in_bits,
+          cast(u32) size_in_bits,
+          cast(u32) LLVMDWARFTypeEncoding.Address,
+          to_cstring(type.name),
+          cast(u64) length(type.name),
+        );
+      }
+      case .Pointer: {
+        debug_type = LLVMDIBuilderCreatePointerType(self.debug.builder, self.debug_get_type(type.base), size_in_bits, cast(u32) size_in_bits, 0, null, 0);
+      }
+      case .Self_Relative_Pointer, .Offset_Relative_Pointer: {
+        debug_type = self.debug_get_type((cast(*Type_Relative_Pointer) type).relative_base);
+      }
+      case .SoA_Layout_Pointer, .AoSoA_Layout_Pointer: {
+        scope := self.debug_get_runtime_package_scope();
+
+        elements: []LLVMMetadataRef = {
+          self.debug_create_member(scope, "pointer", context.storage.type_rawptr, 0),
+          self.debug_create_member(scope, "index", context.storage.type_int, word_size_in_bits),
+        };
+        debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements);
+      }
+      case .Dynamic_Pointer: {
+        scope := self.debug_get_runtime_package_scope();
+
+        elements: []LLVMMetadataRef = {
+          self.debug_create_member(scope, "pointer", context.storage.type_rawptr, 0),
+          self.debug_create_member(scope, "vtable", context.storage.type_rawptr, word_size_in_bits),
+        };
+        debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements);
+      }
+      case .Constant: debug_type = self.debug_get_type(type.base);
+      case .Array: {
+        type_array := cast(*Type_Array) type;
+
+        scope := self.debug_get_runtime_package_scope();
+
+        if (type.is_array_soa_or_aosoa()) {
+          debug_type = self.debug_create_type_layout_struct(scope, type, size_in_bits);
+        } else {
+          subrange := LLVMDIBuilderGetOrCreateSubrange(self.debug.builder, 0, cast(i64) type_array.number_of_elements);
+          subranges: []LLVMMetadataRef = {subrange};
+
+          base_type := self.debug_get_type(type.base);
+          alignment_in_bits := 8 * cast(u32) type.get_alignment();
+          debug_type = LLVMDIBuilderCreateArrayType(self.debug.builder, size_in_bits, alignment_in_bits, base_type, data(subranges), cast(u32) length(subranges));
+        }
+      }
+      case .Dynamic_Array: {
+        scope := self.debug_get_runtime_package_scope();
+
+        if (type.is_dynamic_array_soa_or_aosoa()) {
+          debug_type = self.debug_create_type_layout_struct(scope, type, size_in_bits);
+        } else {
+          elements: []LLVMMetadataRef = {
+            self.debug_create_member(scope, "data", context.storage.get_or_make_type_pointer(type.base), 0),
+            self.debug_create_member(scope, "length", context.storage.type_int, word_size_in_bits),
+            self.debug_create_member(scope, "capacity", context.storage.type_int, word_size_in_bits * 2),
+            self.debug_create_member(scope, "allocator", context.storage.cached_runtime_types.allocator, word_size_in_bits * 3),
+          };
+          debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements);
+        }
+      }
+      case .Slice: {
+        scope := self.debug_get_runtime_package_scope();
+
+        if (type.is_slice_soa_or_aosoa()) {
+          debug_type = self.debug_create_type_layout_struct(scope, type, size_in_bits);
+        } else {
+          elements: []LLVMMetadataRef = {
+            self.debug_create_member(scope, "data", context.storage.get_or_make_type_pointer(type.base), 0),
+            self.debug_create_member(scope, "length", context.storage.type_int, word_size_in_bits),
+          };
+          debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements);
+        }
+      }
+      case .Map: {
+        scope := self.debug_get_runtime_package_scope();
+
+        elements: []LLVMMetadataRef = {
+          self.debug_create_member(scope, "data", context.storage.type_rawptr, 0),
+          self.debug_create_member(scope, "length", context.storage.type_int, word_size_in_bits),
+          self.debug_create_member(scope, "capacity", context.storage.type_int, word_size_in_bits * 2),
+          self.debug_create_member(scope, "allocator", context.storage.cached_runtime_types.allocator, word_size_in_bits * 3),
+          self.debug_create_member(scope, "hash_procedure", context.storage.type_rawptr, word_size_in_bits * 5), // '5' because Allocator is 16 bytes.
+          self.debug_create_member(scope, "compare_procedure", context.storage.type_rawptr, word_size_in_bits * 6),
+        };
+        debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements);
+      }
+      case .Tuple: {
+        type_tuple := cast(*Type_Tuple) type;
+
+        scope := self.debug_get_runtime_package_scope();
+
+        elements := array_make!(LLVMMetadataRef)(0, length(type_tuple.elements));
+        defer array_destroy(&elements);
+        foreach (element, i in type_tuple.elements) {
+          offset_in_bits := 8 * cast(u64) element.offset;
+          name := to_cstring_f("element_%", i);
+          array_add(&elements, self.debug_create_member(scope, name, element.type, offset_in_bits));
+        }
+
+        debug_type = self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, align_in_bits, elements[:]);
+      }
+
+      case .Struct: fallthrough;
+      case .Union: {
+        tag: LLVMDWARFTag = type.kind == .Union ? .Union : .Structure;
+        temp_forward_declaration := LLVMDIBuilderCreateReplaceableCompositeType(
+          self.debug.builder,
+          tag,
+          "",
+          0,
+          null,
+          null,
+          0,
+          0,
+          size_in_bits,
+          align_in_bits,
+          .Zero,
+          "",
+          0,
+        );
+
+        debug_type = temp_forward_declaration;
+        array_add(&self.debug.incomplete_types, Generator_Debug_Incomplete_Type{type, debug_type});
+      }
+
+      case .Any: {
+        scope := self.debug_get_runtime_package_scope();
+
+        elements: [2]LLVMMetadataRef;
+        elements[0] = self.debug_create_member(scope, "data", context.storage.type_rawptr, 0);
+        elements[1] = self.debug_create_member(scope, "typeid", context.storage.type_int, word_size_in_bits);
+        debug_type = self.debug_create_type_struct(scope, null, "any", size_in_bits, cast(u32) size_in_bits, elements[:]);
+      }
+      case .Typeid: debug_type = self.debug_create_type_basic("typeid", size_in_bits, .Unsigned);
+
+      case .None, .Void, .Interface, .Generic: fallthrough;
+      case .Untyped_Boolean, .Untyped_Integer, .Untyped_Float, .Untyped_Char, .Untyped_String, .Untyped_Null: fallthrough;
+      case: assert(false);
+    }
+
+    map_set(&self.debug.debug_types, type, debug_type);
+    return debug_type;
+  }
+
+  /**
+  * Create debug info for a basic type.
+  *
+  * @param name         The name of the type.
+  * @param size_in_bits The size of the type in bits.
+  * @param enconding    The encoding of the type.
+  * @return The debug info for the basic type.
+  */
+  private proc debug_create_type_basic(name: cstring, size_in_bits: u64, encoding: LLVMDWARFTypeEncoding) -> LLVMMetadataRef {
+    return LLVMDIBuilderCreateBasicType(self.debug.builder, name, cast(u64) libc.strlen(name), size_in_bits, encoding, .Zero);
+  }
+
+  /**
+  * Create debug info for an enumeration type.
+  *
+  * @param name          The name of the type.
+  * @param size_in_bits  The size of the type in bits.
+  * @param align_in_bits The alignment of the type in bits.
+  * @return The debug info for the enumeration type.
+  */
+  private proc debug_create_type_enumeration(type: *Type, size_in_bits: u64, align_in_bits: u32) -> LLVMMetadataRef {
+    symbol := type.symbol;
+    file, _ := map_get(&self.debug.metadata_files, symbol.package_file);
+    scope := file;
+
+    type_enumeration := cast(*Type_Enumeration) type;
+
+    enumerators: [dynamic]LLVMMetadataRef;
+    defer array_destroy(&enumerators);
+    foreach (item in type_enumeration.items) {
+      value: i64;
+      switch (type.base.kind) {
+        case .I8:   value = cast(i64) item.value.(i8);
+        case .I16:  value = cast(i64) item.value.(i16);
+        case .I32:  value = cast(i64) item.value.(i32);
+        case .I64:  value = cast(i64) item.value.(i64);
+        case .Int:  value = cast(i64) item.value.(int);
+        case .U8:   value = cast(i64) item.value.(u8);
+        case .U16:  value = cast(i64) item.value.(u16);
+        case .U32:  value = cast(i64) item.value.(u32);
+        case .U64:  value = cast(i64) item.value.(u64);
+        case .UInt: value = cast(i64) item.value.(uint);
+      }
+      
+      item_name := item.name;
+      enumerator := LLVMDIBuilderCreateEnumerator(
+        self.debug.builder,
+        to_cstring(item_name),
+        cast(u64) length(item_name),
+        value,
+        cast(LLVMBool) type.base.is_unsigned(),
+      );
+      array_add(&enumerators, enumerator);
+    }
+
+    return LLVMDIBuilderCreateEnumerationType(
+      self.debug.builder,
+      scope,
+      to_cstring(symbol.name),
+      cast(u64) length(symbol.name),
+      file,
+      self.debug_get_line_from_symbol(symbol),
+      size_in_bits,
+      align_in_bits,
+      data(enumerators),
+      cast(u32) length(enumerators),
+      self.debug_get_type(type.base),
+    );
+  }
+
+  /**
+  * Create debug info for a struct type.
+  *
+  * @param scope         The scope the type lives in.
+  * @param symbol        The symbol of the type.
+  * @param name          The name of the type.
+  * @param size_in_bits  The size of the type in bits.
+  * @param align_in_bits The alignment of the type in bits.
+  * @param elements      The elements of the struct type.
+  * @return The debug info for the struct type.
+  */
+  private proc debug_create_type_struct(
+    scope: LLVMMetadataRef,
+    symbol: *Symbol,
+    name: cstring,
+    size_in_bits: u64,
+    align_in_bits: u32,
+    elements: []LLVMMetadataRef,
+  ) -> LLVMMetadataRef {
+    file := scope;
+    return LLVMDIBuilderCreateStructType(
+      self.debug.builder,
+      scope,
+      name,
+      cast(u64) libc.strlen(name),
+      file,
+      self.debug_get_line_from_symbol(symbol),
+      size_in_bits,
+      align_in_bits,
+      .Zero,
+      null,
+      data(elements),
+      cast(u32) length(elements),
+      0,
+      null,
+      "",
+      0,
+    );
+  }
+
+  /**
+  * Create debug info for a member of a struct type.
+  *
+  * @param scope          The scope the member lives in.
+  * @param name           The name of the member.
+  * @param type           The type of the member.
+  * @param offset_in_bits The offset of the member in bits.
+  * @return The debug info for the struct member.
+  */
+  private proc debug_create_member(scope: LLVMMetadataRef, name: cstring, type: *Type, offset_in_bits: u64) -> LLVMMetadataRef {
+    file := scope;
+
+    size_in_bits := 8 * type.get_size();
+    align_in_bits := 8 * type.get_alignment();
+
+    return LLVMDIBuilderCreateMemberType(
+      self.debug.builder,
+      scope,
+      name,
+      cast(u64) libc.strlen(name),
+      file,
+      1,
+      cast(u64) size_in_bits,
+      cast(u32) align_in_bits,
+      offset_in_bits,
+      .Zero,
+      self.debug_get_type(type),
+    );
+  }
+
+  /**
+  * Create debug info for a layout struct type.
+  *
+  * @param scope         The scope the type lives in.
+  * @param type          The type of the layout struct.
+  * @param size_in_bits  The size of the type in bits.
+  * @return The debug info for the layout struct type.
+  */
+  private proc debug_create_type_layout_struct(scope: LLVMMetadataRef, type: *Type, size_in_bits: u64) -> LLVMMetadataRef {
+    assert(type.is_soa_or_aosoa());
+    assert(type.base.is_struct());
+
+    type_struct := cast(*Type_Struct) type.base;
+    elements := array_make!(LLVMMetadataRef)(0, length(type_struct.fields), context.temporary_allocator);
+    foreach (field in type_struct.fields) {
+      field_offset_in_bits := 8 * cast(u64) field.offset; 
+      array_add(&elements, self.debug_create_member(scope, to_cstring(field.name), field.type, field_offset_in_bits));
+    }
+    return self.debug_create_type_struct(scope, null, to_cstring(type.name), size_in_bits, cast(u32) size_in_bits, elements[:]);
+  }
+
+  /**
+  * Gets the scope of the runtime package.
+  * 
+  * @return The scope of the runtime package.
+  */
+  private proc debug_get_runtime_package_scope() -> LLVMMetadataRef {
+    package_file := package_get_first_package_file(context.compiler.runtime_package);
+    scope, _ := map_get(&self.debug.metadata_files, package_file);
+    return scope;
+  }
+
+  /**
+  * Gets the scope for the initializer function.
+  * 
+  * @return The scope for the initializer function.
+  */
+  internal proc debug_get_initializer_function_scope() -> LLVMMetadataRef {
+    if (!self.debug.build_debug) then return null;
+
+    name := "initializer";
+    line := 0;
+    file := self.debug_get_runtime_package_scope();
+    scope := file;
+    type := LLVMDIBuilderCreateSubroutineType(self.debug.builder, file, null, 0, .Zero);
+    flags := LLVMDIFlags.StaticMember;
+
+    debug_info := LLVMDIBuilderCreateFunction(
+      self.debug.builder,
+      scope,
+      cast(cstring) data(name),
+      cast(u64) length(name),
+      cast(cstring) data(name),
+      cast(u64) length(name),
+      file,
+      cast(u32) line,
+      type,
+      false,
+      true,
+      cast(u32) line,
+      flags,
+      false,
+    );
+
+    map_set(&self.debug.metadata_files, cast(rawptr) debug_info, file);
+    return debug_info;
+  }
+
+  /**
+  * Get the debug location for a position.
+  * 
+  * @param routine_context The context of the routine.
+  * @param position        The position to get the location of.
+  * @return The debug location.
+  */
+  private proc debug_get_location(routine_context: *Routine_Context, position: Source_Position) -> LLVMMetadataRef {
+    scope := self.debug_get_current_scope(routine_context);
+    return LLVMDIBuilderCreateDebugLocation(LLVMGetGlobalContext(), cast(u32) position.line, cast(u32) position.column, scope, null);
+  }
+
+  /**
+  * Gets the line from a symbol.
+  * 
+  * @param symbol The symbol to get the line of.
+  * @return The line of the symbol.
+  */
+  private proc debug_get_line_from_symbol(symbol: *Symbol) -> u32 {
+    if (symbol != null && symbol.declaration != null) {
+      return cast(u32) symbol.declaration.position.line;
+    } else {
+      return 1;
+    }
+  }
+
+  /**
+  * Get the current debug scope
+  * 
+  * @param routine_context The context of the routine.
+  * @return The debug location.
+  */
+  private proc debug_get_current_scope(routine_context: *Routine_Context) -> LLVMMetadataRef {
+    if (routine_context.local_scope == null) {
+      return routine_context.debug.scope;
+    } else {
+      return routine_context.local_scope.debug.scope;
+    }
+  }
+
+  /**
+  * Get the debug type for a routine symbol.
+  * 
+  * @param symbol    The routine symbol to get the debug type of
+  * @return The debug type of the routine symbol.
+  */
+  private proc debug_get_type_routine(symbol: *Symbol) -> LLVMMetadataRef {
+    file, found := map_get(&self.debug.metadata_files, symbol.package_file);
+    assert(found);
+
+    flags := LLVMDIFlags.Zero;
+
+    type_routine := cast(*Type_Routine) symbol.type;
+    
+    parameter_types: [dynamic]LLVMMetadataRef;
+    defer array_destroy(&parameter_types);
+    array_add(&parameter_types, type_routine.return_type.is_void() ? null : self.debug_get_type(type_routine.return_type));
+    foreach (parameter in type_routine.parameters) {
+      array_add(&parameter_types, self.debug_get_type(parameter.type));
+    }
+
+    return LLVMDIBuilderCreateSubroutineType(self.debug.builder, file, data(parameter_types), cast(u32) length(parameter_types), flags);
+  }
+
+  /**
+  * Finalize the creation of the debug info.
+  */
+  internal proc debug_finalize() {
+    if (!self.debug.build_debug) then return;
+
+    memory.free_all(context.temporary_allocator);
+    self.debug_complete_types();
+
+    LLVMDIBuilderFinalize(self.debug.builder);
+  }
+
+  /**
+  * Complete the incomplete debug types.
+  */
+  private proc debug_complete_types() {
+    // We iterate manually here as 'incomplete_types' gets populated inside the loop.
+    for (i := 0; i < length(self.debug.incomplete_types); i++) {
+      incomplete := self.debug.incomplete_types[i];
+      incomplete_type := incomplete.incomplete_type;
+
+      size_in_bits := 8 * cast(u64) incomplete_type.get_size();
+      align_in_bits := 8 * cast(u32) incomplete_type.get_alignment();
+
+      llvm_complete_type: LLVMMetadataRef;
+      switch (incomplete_type.kind) {
+        case .Struct: {
+          type_struct := cast(*Type_Struct) incomplete_type;
+
+          symbol := incomplete_type.symbol;
+          file, _ := map_get(&self.debug.metadata_files, symbol.package_file);
+          scope := file;
+
+          elements := array_make!(LLVMMetadataRef)(0, length(type_struct.fields), context.temporary_allocator);
+          foreach (field in type_struct.fields) {
+            field_offset_in_bits := 8 * cast(u64) field.offset;
+            array_add(&elements, self.debug_create_member(scope, to_cstring(field.name), field.type, field_offset_in_bits));
+          }
+
+          llvm_complete_type = self.debug_create_type_struct(scope, symbol, to_cstring(incomplete_type.name), size_in_bits, align_in_bits, elements[:]);
+        }
+        case .Union: {
+          type_union := cast(*Type_Union) incomplete_type;
+
+          symbol := incomplete_type.symbol;
+          file, _ := map_get(&self.debug.metadata_files, symbol.package_file);
+          scope := file;
+
+          elements := array_make!(LLVMMetadataRef)(0, length(type_union.variants), context.temporary_allocator);
+          array_add(&elements, self.debug_create_member(scope, "tag", context.storage.type_uint, 0));
+          variant_offset := 8 * cast(u64) context.storage.type_uint.get_size();
+          foreach (variant, i in type_union.variants) {
+            element := self.debug_create_member(scope, to_cstring_f("v%", i + 1), variant, variant_offset);
+            array_add(&elements, element);
+          }
+
+          llvm_complete_type = self.debug_create_type_struct(scope, symbol, to_cstring(incomplete_type.name), size_in_bits, align_in_bits, elements[:]);
+        }
+        case: assert(false);
+      }
+
+      map_set(&self.debug.debug_types, incomplete_type, llvm_complete_type);
+      LLVMMetadataReplaceAllUsesWith(incomplete.llvm_incomplete_type, llvm_complete_type);
+    }
+  }
+
+  /**
+  * Get the filename from a path.
+  * 
+  * @param path The path to get the filename of.
+  * @return The filename from the path.
+  */
+  private func debug_get_filename_from_path(path: string) -> string {
+    index := strings.last_index_of(path, system.PATH_SEPERATOR);
+    if (index < 0) {
+      return path;
+    } else {
+      return path[index + 1:];
+    }
+  }
+
+  /**
+  * Get the directory from a path.
+  * 
+  * @param path The path to get the directory of.
+  * @return The directory from the path.
+  */
+  private func debug_get_directory_from_path(path: string) -> string {
+    index := strings.last_index_of(path, system.PATH_SEPERATOR);
+    if (index < 0) {
+      return path;
+    } else {
+      return path[:index + 1];
+    }
+  }
+
+}

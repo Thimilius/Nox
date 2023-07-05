@@ -1,0 +1,441 @@
+import "std:libc"
+import "std:memory"
+
+/**
+* The following symbols are implicitly defined by the compiler:
+* 
+* public const NOX_OS: Operating_System_Kind = ... // Set to the 'Operating_System_Kind' the compiler is targeting.
+* public const NOX_DEBUG: bool = ...               // Set to 'true' if the '-debug' compiler flag is set.
+* public const NOX_RTTR_DISABLED: bool = ...       // Set to 'true' if the '-disable-rttr' compiler flag is set.
+* public const NOX_ASSERT_DISABLED: bool = ...     // Set to 'true' if the '-disable-assert' compiler flag is set.
+* 
+* public struct Context {
+*   // To be filled dynamically through the '#expand_context' directive.
+* }
+*/
+
+/**
+* Represents all possible operating system kinds. 
+*/
+public enum Operating_System_Kind {
+  Windows,
+  Linux,
+}
+
+/**
+* Gets the underlying data pointer of a given collection.
+*
+* @param collection The collection to get the data pointer of.
+* @return The data pointer of the collection.
+*/
+@intrinsic public pure func "nocontext" data!(T)(collection: T) -> rawptr
+/**
+* Gets the length of a given collection.
+*
+* @param collection The collection to get the length of.
+* @return The length of the collection.
+*/
+@intrinsic public pure func "nocontext" length!(T)(collection: T) -> int
+/**
+* Gets the capacity of a given collection.
+*
+* @param collection The collection to get the capacity of.
+* @return The capacity of the collection.
+*/
+@intrinsic public pure func "nocontext" capacity!(T)(collection: T) -> int
+
+/**
+* The type of a hash function for a given type.
+*
+* @param !T The type that gets hashed.
+* @param t The value of the given type to hash.
+* @return The hash of the value.
+*/
+public type_alias Hash_Function!(T) := pure func "nocontext" (t: T) -> uint;
+/**
+* The type of a compare function for a given type.
+*
+* @param !T The type that gets compared.
+* @param a First value of the given type.
+* @param b Second value of the given type.
+* @return True if the two values are the same otherwise false.
+*/
+public type_alias Compare_Function!(T) := pure func "nocontext" (a: T, b: T) -> bool;
+
+/**
+* Gets the pointer to a hash function for a given type.
+*
+* @param !T The type to get the hash function of.
+* @return The hash function for the given type.
+*/
+@intrinsic public pure func "nocontext" hash_function_of_type!(T)() -> Hash_Function!(T)
+/**
+* Gets the pointer to a compare function for a given type.
+*
+* @param !T The type to get the compare function of.
+* @return The compare function for the given type.
+*/
+@intrinsic public pure func "nocontext" compare_function_of_type!(T)() -> Compare_Function!(T)
+
+/**
+* Causes a system trap.
+*/
+@intrinsic internal proc "nocontext" trap()
+
+/**
+* The possible allocation modes.
+*/
+public enum Allocator_Mode {
+  Allocate,
+  Resize,
+  Free,
+  Free_All,
+}
+
+/**
+* The procedure type for an allocator.
+*
+* @param data       The data of the allocator.
+* @param mode       The allocation mode.
+* @param size       The size of the allocation.
+* @param alignment  The alignment for the allocation.
+* @param old_memory The old allocation (can be null).
+* @param old_size   The size of the old allocation.
+* @param location   The source location of the allocation.
+* @return The allocated data.
+*/
+public type_alias Allocator_Procedure := proc(
+  data: rawptr,
+  mode: Allocator_Mode,
+  size: uint,
+  alignment: uint,
+  old_memory: rawptr,
+  old_size: uint,
+  location: Source_Location,
+) -> []byte;
+
+/**
+* Represents an allocator.
+*/
+public struct Allocator {
+  public procedure: Allocator_Procedure, // The allocation procedure.
+  public data: rawptr,                   // The required data of the allocator.
+}
+
+/**
+* The procedure type for an assertion failure.
+*
+* @param prefix   The prefix of the assertion message.
+* @param message  The assertion message.
+* @param location The source location where the assertion failed.
+*/
+public type_alias Assert_Failed_Procedure := proc(prefix: string, message: string, location: Source_Location);
+
+/**
+* Represents a location in a source file.
+*/
+public struct Source_Location {
+  public line: int,       // The line of the location.
+  public routine: string, // The routine of the location.
+  public file: string,    // The file of the location.
+}
+
+/**
+* Asserts a given condition.
+*
+* @param condition The condition to assert.
+* @param message   The assertion message.
+* @param location  The source location of the assertion.
+*/
+@disabled(NOX_ASSERT_DISABLED) public proc assert(condition: bool, message: string = "", location: Source_Location = #location) {
+  if (!condition) {
+    procedure := context.assert_failed_procedure;
+    if (procedure == null) then procedure = default_assert_failed_procedure;
+    procedure("runtime assertion", message, location);
+  }
+}
+
+/**
+* Causes a runtime panic.
+*
+* @param message  The panic message.
+* @param location The source location of the panic.
+*/
+public proc panic(message: string, location: Source_Location = #location) {
+  procedure := context.assert_failed_procedure;
+  if (procedure == null) then procedure = default_assert_failed_procedure;
+  procedure("panic", message, location);
+}
+
+/**
+* Gets the minimum of two values.
+*
+* @param !T The type of the value (must be a scalar).
+* @param a  The first value.
+* @param b  The second value.
+* @return The minimum of the two values.
+*/
+public pure func min!(T)(a: T, b: T) -> T where (type_is_scalar!(T)()) {
+  return a < b ? a : b;
+}
+
+/**
+* Gets the maximum of two values.
+*
+* @param !T The type of the value (must be a scalar).
+* @param a  The first value.
+* @param b  The second value.
+* @return The maximum of the two values.
+*/
+public pure func max!(T)(a: T, b: T) -> T where (type_is_scalar!(T)()) {
+  return a > b ? a : b;
+}
+
+/**
+* Checks whether or not an enumeration value has a given flag.
+*
+* @param !T The type of the value (must be an enumeration).
+* @param value The enumeration value.
+* @param flag  The flag to check.
+* @return True if the value contains the given flag otherwise false.
+*/
+public pure func has_flag!(T)(value: T, flag: T) -> bool where (type_is_enum!(T)()) {
+  return value & flag == flag;
+}
+
+/**
+* Sets a given flag from an enumeration value.
+*
+* @param !T The type of the value (must be an enumeration).
+* @param value The enumeration value.
+* @param flag  The flag to set.
+*/
+public proc set_flag!(T)(value: *T, flag: T) where (type_is_enum!(T)()) {
+  *value = *value | flag;
+}
+
+/**
+* Removes a given flag from an enumeration value.
+*
+* @param !T The type of the value (must be an enumeration).
+* @param value The enumeration value.
+* @param flag  The flag to remove.
+*/
+public proc remove_flag!(T)(value: *T, flag: T) where (type_is_enum!(T)()) {
+  *value = *value & ~flag;
+}
+
+/**
+* Compares two strings with eachother and checks if they are the same.
+* 
+* @param a The first string.
+* @param b The second string.
+* @return True if the two strings are the same.
+*/
+@builtin public proc "nocontext" compare_string(a: string, b: string) -> bool {
+  a := a;
+  b := b;
+
+  p_a := cast(*memory.Raw_String) &a;
+  p_b := cast(*memory.Raw_String) &b;
+
+  // Strings with different lengths can't be the same.
+  if (p_a.length != p_b.length) then return false;
+
+  a_data := cast(*byte) p_a.data;
+  b_data := cast(*byte) p_b.data;
+
+  // Empty strings and strings with no data pointer are the same.
+  if (a_data == null && b_data == null) {
+    return true;
+  } else if (a_data == null) {
+    return p_b.length == 0;
+  } else if (b_data == null) {
+    return p_a.length == 0;
+  }
+
+  for (i := 0; i < p_a.length; i++) {
+    data_offset: ^*byte = i;
+    v_a := a_data[data_offset];
+    v_b := b_data[data_offset];
+    if (v_a != v_b) then return false;
+  }
+
+  return true;
+}
+
+/**
+* Compares two cstrings with eachother and checks if they are the same.
+* 
+* @param a The first cstring.
+* @param b The second cstring.
+* @return True if the two cstrings are the same.
+*/
+@builtin public proc "nocontext" compare_cstring(a: cstring, b: cstring) -> bool {
+  if (a == null && b == null) {
+    return true;
+  } else if (a == null || b == null) {
+    return false;
+  }
+
+  return libc.strcmp(a, b) == 0;
+}
+
+/**
+* Hashes generic data provided by pointer and associated length.
+*
+* @param data   The data to hash.
+* @param length The length of the data.
+* @return The hash of the data.
+*/
+@builtin public proc "nocontext" hash_data(data: rawptr, length: int) -> uint {
+  // This implements the 'FNV-1a' hash algorithm.
+  hash: uint = 0xcbf29ce484222325;
+  byte_data := cast(*byte) data;
+  for (i := 0; i < length; i++) {
+    offset: ^*byte = i;
+    hash ^= cast(uint) byte_data[offset];
+    hash *= 0x100000001b3;
+  }
+  return hash; 
+}
+
+/**
+* Makes a slices from a pointer of a given type and an associated length.
+*
+* @param !T     The type of the data.
+* @param data   The data pointer of the slice.
+* @param length The length of the slice.
+* @return The new slice.
+*/
+public proc slice_make!(T)(data: *T, length: int) -> []T {
+  slice: memory.Raw_Slice;
+  slice.data = data;
+  slice.length = length;
+  return *cast(*[]T) &slice;
+}
+
+/**
+* Destroys a string with a given allocator.
+* 
+* @param str       The string to destroy.
+* @param allocator The allocator to destroy the string with.
+*/
+public proc string_destroy(str: string, allocator: Allocator = context.allocator) {
+  memory.free(data(str), allocator);
+}
+
+/**
+* Destroys a cstring with a given allocator.
+* 
+* @param str       The cstring to destroy.
+* @param allocator The allocator to destroy the cstring with.
+*/
+public proc cstring_destroy(str: cstring, allocator: Allocator = context.allocator) {
+  memory.free(cast(rawptr) str, allocator);
+}
+
+#expand_context(assert_failed_procedure, Assert_Failed_Procedure)
+#expand_context(allocator, Allocator)
+#expand_context(temporary_allocator, Allocator)
+
+/**
+* Holds the thread local data for the default temporary allocator.
+*/
+@thread_local private global default_temporary_allocator_data: memory.Pool;
+
+/**
+* The block size for the default temporary allocator.
+*/
+private const DEFAULT_TEMPORARY_ALLOCATOR_BLOCK_SIZE: uint = 1024 * 1024 * 4; // 4 Mebibyte.
+
+/**
+* Initializes the default context.
+* 
+* @param ctx The default context to initialize.
+*/
+@builtin private proc runtime_init_default_context(ctx: *Context) {
+  ctx.assert_failed_procedure = default_assert_failed_procedure;
+  ctx.allocator = memory.general_allocator();
+
+  ctx.temporary_allocator.data = &default_temporary_allocator_data;
+  // We reset the pool here just to be sure that we start from scratch.
+  // Because the 'runtime_init_default_context' gets also used for global initializer expressions we might have already allocated temporary memory.
+  // We would leak that by just calling 'pool_init'.
+  memory.pool_reset(&default_temporary_allocator_data); 
+  memory.pool_init(&default_temporary_allocator_data, ctx.allocator, DEFAULT_TEMPORARY_ALLOCATOR_BLOCK_SIZE);
+  ctx.temporary_allocator = memory.pool_allocator(&default_temporary_allocator_data);
+}
+
+/**
+* Creates and initializes the default runtime context.
+* 
+* @return The default runtime context. 
+*/
+public proc "nocontext" runtime_default_context() -> Context {
+  dummy_context: Context;
+  push_context (dummy_context) {
+    ctx: Context;
+    runtime_init_default_context(&ctx);
+    return ctx;
+  }
+}
+
+/**
+* Destroys the data of the temporary allocator in the current context.
+*/
+public proc "nocontext" runtime_destroy_temporary_allocator() {
+  dummy_context: Context;
+  push_context (dummy_context) {
+    memory.pool_destroy(&default_temporary_allocator_data);
+  }
+}
+
+/**
+* The default procedure for an assertion failure.
+*
+* @param prefix   The prefix of the assertion message.
+* @param message  The assertion message.
+* @param location The source location where the assertion failed.
+*/
+private proc default_assert_failed_procedure(prefix: string, message: string, location: Source_Location) {
+  libc.printf("%.*s(%llu) ", length(location.file), data(location.file), location.line);
+  libc.printf("%.*s", length(prefix), data(prefix));
+  if (length(message) > 0) then libc.printf(": %.*s", length(message), data(message));
+  libc.printf("\n");
+  trap();
+}
+
+/**
+* Holds the arguments provided to the application.
+*/
+public global main_args: []cstring;
+
+/**
+* The user defined entry point of an application.
+*/
+@intrinsic private proc entry_point()
+
+/**
+* The main entry point of any application.
+*
+* @param argc The number of provided arguments.
+* @param argv An array of the provided arguments.
+* @return The exit code of the application.
+*/
+@builtin private proc "nocontext" main(argc: i32, argv: *cstring) -> i32 {
+  dummy_context: Context;
+  push_context (dummy_context) {
+    // For now we skip the first argument (aka the path used to run the program).
+    main_args = slice_make(argv, cast(int) argc)[1:];
+  }
+
+  default_context := runtime_default_context();
+  push_context (default_context) {
+    entry_point();
+  }
+
+  runtime_destroy_temporary_allocator();
+
+  return 0;
+}
