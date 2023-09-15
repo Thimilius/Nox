@@ -336,8 +336,8 @@ nox_parse_arguments :: proc(compiler: ^Compiler) {
 */
 nox_print_info :: proc() {
   fmt.printf("Usage:\n");
-  fmt.printf("         noxb [arguments] package\n");
-  fmt.printf("         noxb [arguments] file\n");
+  fmt.printf("         nox [arguments] package\n");
+  fmt.printf("         nox [arguments] file\n");
   fmt.printf("Arguments:\n");
   fmt.printf("         -debug                        Generate debug information.\n");
   fmt.printf("         -disable-assert               Disable all calls to 'assert'. Sets the 'NOX_ASSERT_DISABLED' constant to 'true'.\n");

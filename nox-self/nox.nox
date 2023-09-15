@@ -362,8 +362,8 @@ private proc nox_parse_arguments() {
 */
 private proc nox_print_info() {
   format.printf("Usage:\n");
-  format.printf("         noxb [arguments] package\n");
-  format.printf("         noxb [arguments] file\n");
+  format.printf("         nox [arguments] package\n");
+  format.printf("         nox [arguments] file\n");
   format.printf("Arguments:\n");
   format.printf("         -debug                        Generate debug information.\n");
   format.printf("         -disable-assert               Disable all calls to 'assert'. Sets the 'NOX_ASSERT_DISABLED' constant to 'true'.\n");
