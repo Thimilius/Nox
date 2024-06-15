@@ -2509,7 +2509,10 @@ implement strings.Builder {
   * @param relative_base The relative base of the relative pointer type.
   */
   internal proc write_type_name_pointer(kind: Type_Kind, base: *Type, relative_base: *Type) {
-    if (kind == .Self_Relative_Pointer || kind == .Offset_Relative_Pointer) {
+    if (kind == .Self_Relative_Pointer) {
+      self.write_string("~");
+      self.write_string(relative_base.name);
+    } else if (kind == .Offset_Relative_Pointer) {
       self.write_string("^");
       self.write_string(relative_base.name);
     } else if (kind == .Dynamic_Pointer) {
